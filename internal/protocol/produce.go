@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/issac1998/go-queue/internal/metadata"
+	"go-queue/internal/metadata"
 )
 
 const (
@@ -136,7 +136,7 @@ func HandleProduceRequest(conn io.ReadWriter) error {
 	}
 
 	// 3. 获取目标分区
-	partition := metadata.GetPartition(req.Topic, int(req.Partition))
+	partition := metadata.GetPartition(req.Topic, int32(req.Partition))
 	if partition == nil {
 		return writeErrorResponse(conn, 5) // 5=UNKNOWN_PARTITION
 	}
@@ -147,7 +147,7 @@ func HandleProduceRequest(conn io.ReadWriter) error {
 	defer partition.Mu.Unlock()
 
 	for _, msg := range req.Messages {
-		offset, err := partition.ActiveSegment.Append(msg)
+		offset, err := partition.Segment.Append(msg)
 		if err != nil {
 			return writeErrorResponse(conn, 7) // 7=MESSAGE_TOO_LARGE
 		}

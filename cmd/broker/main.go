@@ -4,14 +4,12 @@ import (
 	"encoding/binary"
 	"net"
 
-	"example.com/m/v2/go-queue/internal/protocol"
+	"go-queue/internal/protocol"
 )
 
 const (
-	PRODUCE_REQUEST        = 0x01    // 生产请求类型标识
-	MaxMessageSize         = 1 << 20 // 单条消息最大1MB
-	CompressionNone        = 0x00    // 无压缩
-	CurrentProtocolVersion = 1       // 协议版本
+	PRODUCE_REQUEST = 0 // 生产请求类型标识
+	FETCH_REQUEST   = 1
 )
 
 func main() {
@@ -31,10 +29,12 @@ func handleConnection(conn net.Conn) {
 
 		// 2. 根据请求类型分发处理
 		switch reqType {
+		case FETCH_REQUEST:
+			fallthrough
 		case PRODUCE_REQUEST:
 			protocol.HandleProduceRequest(conn)
-		case FETCH_REQUEST:
-			protocol.handleFetchRequest(conn)
+
+			// protocol.handleFetchRequest(conn)
 		}
 	}
 }
