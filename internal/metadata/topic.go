@@ -20,7 +20,7 @@ type Partition struct {
 	Leader   string   // Leader 节点地址
 	Replicas []string // 副本节点列表
 	Isr      []string // In-Sync Replicas
-	Mu       sync.Mutex
+	Mu       sync.RWMutex
 }
 
 // GetPartition defines

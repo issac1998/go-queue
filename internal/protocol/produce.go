@@ -11,10 +11,39 @@ import (
 )
 
 const (
-	ProduceRequestType     = 0x01    // 生产请求类型标识
-	MaxMessageSize         = 1 << 20 // 单条消息最大1MB
-	CompressionNone        = 0x00    // 无压缩
-	CurrentProtocolVersion = 1       // 协议版本
+	// MaxMessageSize defines max message size.
+	MaxMessageSize = 1 << 20 // 单条消息最大1MB
+	// CompressionNone decides compress or not
+	CompressionNone = 0x00
+	// CompressionNone decides compress or not
+	// --- 常量定义 ---
+	FetchRequestType     = 0x02    // 消费请求类型标识
+	DefaultMaxFetchBytes = 1 << 20 // 默认最大拉取1MB数据
+	MaxFetchBytesLimit   = 5 << 20 // 服务端限制单次拉取5MB
+
+	CurrentProtocolVersion = 1 // 协议版本
+)
+
+const (
+	// 成功
+	ErrorNone = 0
+
+	// 客户端请求错误 (1-99)
+	ErrorInvalidRequest   = 1 // 请求格式不合法
+	ErrorInvalidTopic     = 3 // Topic 名称无效
+	ErrorUnknownPartition = 5 // 分区不存在
+	ErrorInvalidMessage   = 6 // 消息内容非法（如空消息）
+	ErrorMessageTooLarge  = 7 // 消息超过大小限制
+	ErrorOffsetOutOfRange = 8 // 请求的 Offset 超出范围
+
+	// 服务端错误 (100-199)
+	ErrorBrokerNotAvailable = 100 // Broker 不可用
+	ErrorFetchFailed        = 101 // 拉取消息失败（如磁盘故障）
+	ErrorProduceFailed      = 102 // 写入消息失败
+
+	// 权限/配额错误 (200-299)
+	ErrorUnauthorized  = 200 // 客户端未授权
+	ErrorQuotaExceeded = 201 // 超出配额限制
 )
 
 // --- 请求/响应结构体 ---

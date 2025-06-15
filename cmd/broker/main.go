@@ -30,7 +30,8 @@ func handleConnection(conn net.Conn) {
 		// 2. 根据请求类型分发处理
 		switch reqType {
 		case FETCH_REQUEST:
-			fallthrough
+			// TODO
+			protocol.HandleFetchRequest(conn)
 		case PRODUCE_REQUEST:
 			protocol.HandleProduceRequest(conn)
 
