@@ -83,6 +83,7 @@ func (res *FetchResponse) Write(w io.Writer) error {
 	}
 
 	totalLen := int32(headerBuf.Len() + messagesBuf.Len())
+
 	if err := binary.Write(w, binary.BigEndian, totalLen); err != nil {
 		return err
 	}
@@ -106,8 +107,8 @@ func HandleFetchRequest(conn io.ReadWriteCloser) error {
 		return sendFetchError(conn, ErrorInvalidRequest, err.Error())
 	}
 
-	partition := metadata.GetPartition(req.Topic, req.Partition)
-	if partition == nil {
+	partition, err := metadata.GetPartition(req.Topic, req.Partition)
+	if err != nil {
 		return sendFetchError(conn, ErrorUnknownPartition,
 			fmt.Sprintf("partition %d not found", req.Partition))
 	}
