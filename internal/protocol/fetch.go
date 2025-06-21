@@ -13,20 +13,20 @@ import (
 type FetchRequest struct {
 	Topic     string
 	Partition int32
-	Offset    int64 
-	MaxBytes  int32 
+	Offset    int64
+	MaxBytes  int32
 }
 
-// FetchResponse 
+// FetchResponse
 type FetchResponse struct {
 	Topic      string
 	Partition  int32
-	ErrorCode  int16    
-	Messages   [][]byte 
-	NextOffset int64    
+	ErrorCode  int16
+	Messages   [][]byte
+	NextOffset int64
 }
 
-// ReadFetchRequest 
+// ReadFetchRequest
 func ReadFetchRequest(r io.Reader) (*FetchRequest, error) {
 	req := &FetchRequest{}
 
@@ -67,7 +67,7 @@ func ReadFetchRequest(r io.Reader) (*FetchRequest, error) {
 	return req, nil
 }
 
-// WriteFetchResponse 
+// WriteFetchResponse
 func (res *FetchResponse) Write(w io.Writer) error {
 	headerBuf := new(bytes.Buffer)
 	binary.Write(headerBuf, binary.BigEndian, int16(len(res.Topic)))
@@ -82,7 +82,7 @@ func (res *FetchResponse) Write(w io.Writer) error {
 		messagesBuf.Write(msg)
 	}
 
-	totalLen := int32(headerBuf.Len() + messagesBuf.Len() + 4) 
+	totalLen := int32(headerBuf.Len() + messagesBuf.Len() + 4)
 	if err := binary.Write(w, binary.BigEndian, totalLen); err != nil {
 		return err
 	}
@@ -97,7 +97,7 @@ func (res *FetchResponse) Write(w io.Writer) error {
 	return nil
 }
 
-// HandleFetchRequest 
+// HandleFetchRequest
 func HandleFetchRequest(conn io.ReadWriteCloser) error {
 	defer conn.Close()
 
@@ -106,8 +106,8 @@ func HandleFetchRequest(conn io.ReadWriteCloser) error {
 		return sendFetchError(conn, ErrorInvalidRequest, err.Error())
 	}
 
-	partition := metadata.GetPartition(req.Topic, req.Partition)
-	if partition == nil {
+	partition, err := metadata.GetPartition(req.Topic, req.Partition)
+	if err != nil {
 		return sendFetchError(conn, ErrorUnknownPartition,
 			fmt.Sprintf("partition %d not found", req.Partition))
 	}
@@ -139,8 +139,7 @@ func HandleFetchRequest(conn io.ReadWriteCloser) error {
 	return response.Write(conn)
 }
 
-
-// findSegmentAndPosition 
+// findSegmentAndPosition
 func findSegmentAndPosition(p *metadata.Partition, offset int64) (*storage.Segment, int64, error) {
 	for _, seg := range p.Segments {
 		if offset >= seg.BaseOffset && offset < seg.BaseOffset+seg.MaxBytes {
@@ -151,7 +150,7 @@ func findSegmentAndPosition(p *metadata.Partition, offset int64) (*storage.Segme
 	return nil, 0, errors.New("offset out of range")
 }
 
-// readMessagesFromSegment 
+// readMessagesFromSegment
 func readMessagesFromSegment(
 	seg *storage.Segment,
 	startPos int64,
@@ -160,7 +159,6 @@ func readMessagesFromSegment(
 	var messages [][]byte
 	currentPos := startPos
 	totalBytes := int64(0)
-
 
 	for totalBytes < maxBytes {
 		var msgSize int32
@@ -185,13 +183,13 @@ func readMessagesFromSegment(
 		}
 		messages = append(messages, msg)
 		currentPos += int64(msgSize)
-		totalBytes += int64(msgSize) + 4 
+		totalBytes += int64(msgSize) + 4
 	}
 
 	return messages, seg.BaseOffset + currentPos, nil
 }
 
-// sendFetchError 
+// sendFetchError
 func sendFetchError(w io.Writer, code int16, message string) error {
 	response := &FetchResponse{
 		ErrorCode: code,
