@@ -148,8 +148,8 @@ func HandleProduceRequest(conn io.ReadWriter) error {
 		return writeErrorResponse(conn, ErrorInvalidMessage)
 	}
 
-	partition := metadata.GetPartition(req.Topic, int32(req.Partition))
-	if partition == nil {
+	partition, err := metadata.GetPartition(req.Topic, int32(req.Partition))
+	if err != nil {
 		return writeErrorResponse(conn, ErrorUnknownPartition)
 	}
 
@@ -158,7 +158,7 @@ func HandleProduceRequest(conn io.ReadWriter) error {
 	defer partition.Mu.Unlock()
 
 	for _, msg := range req.Messages {
-		offset, err := partition.Segment.Append(msg)
+		offset, err := partition.Segments[0].Append(msg)
 		if err != nil {
 			return writeErrorResponse(conn, ErrorMessageTooLarge)
 		}
