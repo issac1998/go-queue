@@ -120,8 +120,8 @@ func HandleFetchRequest(conn io.ReadWriteCloser) error {
 	}
 
 	// 2. 获取分区
-	partition := metadata.GetPartition(req.Topic, req.Partition)
-	if partition == nil {
+	partition, err := metadata.GetPartition(req.Topic, req.Partition)
+	if err != nil {
 		return sendFetchError(conn, ErrorUnknownPartition,
 			fmt.Sprintf("partition %d not found", req.Partition))
 	}
