@@ -3,6 +3,7 @@ package client
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -71,8 +72,20 @@ func (c *Client) sendRequest(requestType int32, requestData []byte) ([]byte, err
 		return nil, fmt.Errorf("failed to read response length: %v", err)
 	}
 
-	responseData := make([]byte, responseLen)
-	if _, err := conn.Read(responseData); err != nil {
+
+	// Calculate actual data length based on protocol
+	actualDataLen := responseLen
+	if requestType == FetchRequestType {
+		// For fetch requests, response length includes the 4-byte length header itself
+		actualDataLen = responseLen - 4
+		if actualDataLen < 0 {
+			return nil, fmt.Errorf("invalid response length: %d", responseLen)
+		}
+	}
+
+	// Read response data
+	responseData := make([]byte, actualDataLen)
+	if _, err := io.ReadFull(conn, responseData); err != nil {
 		return nil, fmt.Errorf("failed to read response data: %v", err)
 	}
 

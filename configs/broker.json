@@ -18,5 +18,10 @@
     "max_entries": 100000,
     "ttl": "24h",
     "enabled": true
+  },
+
+  "server": {
+    "port": "9092",
+    "log_file": ""
   }
 } 

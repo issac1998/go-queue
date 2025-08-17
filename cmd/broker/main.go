@@ -6,61 +6,48 @@ import (
 	"log"
 	"net"
 	"os"
-	"time"
 
-	"github.com/issac1998/go-queue/internal/compression"
+	"github.com/issac1998/go-queue/internal/config"
 	"github.com/issac1998/go-queue/internal/metadata"
 	"github.com/issac1998/go-queue/internal/protocol"
 )
 
 const (
 	produceRequest     = 0
-	fetchRequest       = 1
-	createTopicRequest = 2
+	fetchRequest       = 1 // Match client FetchRequestType
+	createTopicRequest = 2 // Changed to avoid conflict with fetchRequest
 )
 
 var manager *metadata.Manager
 
 func main() {
 	var (
-		logFile = flag.String("log", "", "Log file path (default output to console)")
-		port    = flag.String("port", "9092", "Listen port")
-		dataDir = flag.String("data", "./data", "Data directory")
+		configFile = flag.String("config", "configs/broker.json", "Configuration file path")
 	)
 	flag.Parse()
 
-	if *logFile != "" {
-		file, err := os.OpenFile(*logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	// Load configuration from file
+	brokerConfig, err := config.LoadBrokerConfig(*configFile)
+	if err != nil {
+		log.Fatalf("Failed to load configuration: %v", err)
+	}
+
+	// Set log output
+	if brokerConfig.Server.LogFile != "" {
+		file, err := os.OpenFile(brokerConfig.Server.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 		if err != nil {
-			log.Fatalf("Failed to open log file %s: %v", *logFile, err)
+			log.Fatalf("Failed to open log file %s: %v", brokerConfig.Server.LogFile, err)
 		}
 		defer file.Close()
 		log.SetOutput(file)
-		log.Printf("Log output to file: %s", *logFile)
+		log.Printf("Log output to file: %s", brokerConfig.Server.LogFile)
 	}
 
-	log.Printf("Go Queue server starting - port:%s, data directory:%s", *port, *dataDir)
+	log.Printf("Go Queue server starting - port:%s, data directory:%s",
+		brokerConfig.Server.Port, brokerConfig.Config.DataDir)
 
-	config := &metadata.Config{
-		DataDir:            *dataDir,
-		MaxTopicPartitions: 16,
-		SegmentSize:        1 << 30, // 1GB
-		RetentionTime:      7 * 24 * time.Hour,
-		MaxStorageSize:     100 << 30, // 100GB
-		FlushInterval:      time.Second,
-		CleanupInterval:    time.Hour,
-		MaxMessageSize:     1 << 20, // 1MB
-
-		CompressionEnabled:   true,
-		CompressionType:      compression.Snappy, 
-		CompressionThreshold: 100,                
-
-		DeduplicationEnabled: true,
-		// DeduplicationConfig will use default configuration
-	}
-
-	var err error
-	manager, err = metadata.NewManager(config)
+	// Initialize Manager with loaded configuration
+	manager, err = metadata.NewManager(brokerConfig.Config)
 	if err != nil {
 		log.Fatalf("Failed to initialize Manager: %v", err)
 	}
@@ -70,11 +57,11 @@ func main() {
 	}
 
 	// Ensure data directory exists
-	os.MkdirAll(*dataDir, 0755)
+	os.MkdirAll(brokerConfig.Config.DataDir, 0755)
 
-	log.Printf("Go Queue server started on :%s", *port)
+	log.Printf("Go Queue server started on :%s", brokerConfig.Server.Port)
 
-	ln, err := net.Listen("tcp", ":"+*port)
+	ln, err := net.Listen("tcp", ":"+brokerConfig.Server.Port)
 	if err != nil {
 		log.Fatalf("Failed to listen on port: %v", err)
 	}

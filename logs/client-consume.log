@@ -1,0 +1,8 @@
+2025/08/18 01:21:21 Client log output to file: logs/client-consume.log
+2025/08/18 01:21:21 Go Queue client starting - Broker: localhost:9092, Command: consume
+2025/08/18 01:21:21 Starting to consume messages - Topic: test-topic-from-config, Partition: 0, Offset: 0
+2025/08/18 01:21:21 Failed to fetch messages: failed to parse response: failed to read message 0 content: unexpected EOF
+2025/08/18 01:30:08 Client log output to file: logs/client-consume.log
+2025/08/18 01:30:08 Go Queue client starting - Broker: localhost:9092, Command: consume
+2025/08/18 01:30:08 Starting to consume messages - Topic: test-topic-from-config, Partition: 0, Offset: 0
+2025/08/18 01:30:08 Failed to fetch messages: failed to parse response: failed to read message 0 content: unexpected EOF

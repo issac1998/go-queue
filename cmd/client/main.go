@@ -7,55 +7,99 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/issac1998/go-queue/client"
+	"github.com/issac1998/go-queue/internal/config"
 )
 
 func main() {
 	var (
-		broker    = flag.String("broker", "localhost:9092", "Broker address")
-		command   = flag.String("cmd", "", "Command: create-topic, produce, consume")
-		topic     = flag.String("topic", "", "Topic name")
-		partition = flag.Int("partition", 0, "Partition ID")
-		message   = flag.String("message", "", "Message to send")
-		offset    = flag.Int64("offset", 0, "Consume start offset")
-		count     = flag.Int("count", 1, "Message count")
-		logFile   = flag.String("log", "", "Log file path (default output to console)")
+		configFile = flag.String("config", "configs/client.json", "Configuration file path")
+		command    = flag.String("cmd", "", "Command: create-topic, produce, consume (overrides config)")
+		topic      = flag.String("topic", "", "Topic name (overrides config)")
+		partition  = flag.Int("partition", -1, "Partition ID (overrides config)")
+		message    = flag.String("message", "", "Message to send (overrides config)")
+		offset     = flag.Int64("offset", -1, "Consume start offset (overrides config)")
+		count      = flag.Int("count", -1, "Message count (overrides config)")
+		broker     = flag.String("broker", "", "Broker address (overrides config)")
+		logFile    = flag.String("log", "", "Log file path (overrides config)")
 	)
 	flag.Parse()
 
+	// Load configuration from file
+	clientConfig, err := config.LoadClientConfig(*configFile)
+	if err != nil {
+		log.Fatalf("Failed to load configuration: %v", err)
+	}
+
+	// Override config with command line arguments if provided
+	if *broker != "" {
+		clientConfig.Broker = *broker
+	}
 	if *logFile != "" {
-		file, err := os.OpenFile(*logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+		clientConfig.LogFile = *logFile
+	}
+	if *command != "" {
+		clientConfig.Command.Type = *command
+	}
+	if *topic != "" {
+		clientConfig.Command.Topic = *topic
+	}
+	if *partition >= 0 {
+		clientConfig.Command.Partition = *partition
+	}
+	if *message != "" {
+		clientConfig.Command.Message = *message
+	}
+	if *offset >= 0 {
+		clientConfig.Command.Offset = *offset
+	}
+	if *count >= 0 {
+		clientConfig.Command.Count = *count
+	}
+
+	// Set log output
+	if clientConfig.LogFile != "" {
+		file, err := os.OpenFile(clientConfig.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 		if err != nil {
-			log.Fatalf("Failed to open log file %s: %v", *logFile, err)
+			log.Fatalf("Failed to open log file %s: %v", clientConfig.LogFile, err)
 		}
 		defer file.Close()
 		log.SetOutput(file)
-		log.Printf("Client log output to file: %s", *logFile)
+		log.Printf("Client log output to file: %s", clientConfig.LogFile)
 	}
 
-	if *command == "" {
+	if clientConfig.Command.Type == "" {
 		printUsage()
 		os.Exit(1)
 	}
 
-	log.Printf("Go Queue client starting - Broker: %s, Command: %s", *broker, *command)
+	log.Printf("Go Queue client starting - Broker: %s, Command: %s",
+		clientConfig.Broker, clientConfig.Command.Type)
 
-	client := client.NewClient(client.ClientConfig{
-		BrokerAddr: *broker,
-		Timeout:    10 * time.Second,
+	// Parse timeout
+	timeout, err := clientConfig.GetTimeoutDuration()
+	if err != nil {
+		log.Fatalf("Invalid timeout configuration: %v", err)
+	}
+
+	// Create client
+	c := client.NewClient(client.ClientConfig{
+		BrokerAddr: clientConfig.Broker,
+		Timeout:    timeout,
 	})
 
-	switch *command {
+	switch clientConfig.Command.Type {
 	case "create-topic":
-		createTopic(client, *topic)
+		createTopic(c, clientConfig.Command.Topic)
 	case "produce":
-		produce(client, *topic, int32(*partition), *message, *count)
+		produce(c, clientConfig.Command.Topic, int32(clientConfig.Command.Partition),
+			clientConfig.Command.Message, clientConfig.Command.Count)
 	case "consume":
-		consume(client, *topic, int32(*partition), *offset)
+		consume(c, clientConfig.Command.Topic, int32(clientConfig.Command.Partition),
+			clientConfig.Command.Offset)
 	default:
-		fmt.Printf("Unknown command: %s\n", *command)
+		fmt.Printf("Unknown command: %s\n", clientConfig.Command.Type)
 		printUsage()
 		os.Exit(1)
 	}
@@ -65,10 +109,14 @@ func printUsage() {
 	fmt.Println("Go Queue Client Tool")
 	fmt.Println()
 	fmt.Println("Usage:")
-	fmt.Println("  Create topic: go run main.go -cmd=create-topic -topic=my-topic")
-	fmt.Println("  Send message: go run main.go -cmd=produce -topic=my-topic -partition=0 -message='Hello World'")
-	fmt.Println("  Batch send: go run main.go -cmd=produce -topic=my-topic -partition=0 -message='Hello' -count=5")
-	fmt.Println("  Consume message: go run main.go -cmd=consume -topic=my-topic -partition=0 -offset=0")
+	fmt.Println("  With config file: go run main.go -config=configs/client.json")
+	fmt.Println("  Override config: go run main.go -config=configs/client.json -cmd=produce -topic=my-topic")
+	fmt.Println("  Command line only: go run main.go -cmd=create-topic -topic=my-topic -broker=localhost:9092")
+	fmt.Println()
+	fmt.Println("Commands:")
+	fmt.Println("  create-topic: Create a new topic")
+	fmt.Println("  produce: Send messages to a topic")
+	fmt.Println("  consume: Consume messages from a topic")
 	fmt.Println()
 	fmt.Println("Parameters:")
 	flag.PrintDefaults()
