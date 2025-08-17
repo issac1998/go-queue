@@ -75,8 +75,9 @@ func (c *Client) sendRequest(requestType int32, requestData []byte) ([]byte, err
 	// Calculate actual data length based on protocol
 	actualDataLen := responseLen
 
-	responseData := make([]byte, responseLen)
-	if _, err := conn.Read(responseData); err != nil {
+	// Read response data
+	responseData := make([]byte, actualDataLen)
+	if _, err := io.ReadFull(conn, responseData); err != nil {
 		return nil, fmt.Errorf("failed to read response data: %v", err)
 	}
 
