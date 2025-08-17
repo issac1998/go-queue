@@ -17,7 +17,7 @@ const (
 	CompressionNone = 0x00
 	// CompressionNone decides compress or not
 	// --- 常量定义 ---
-	FetchRequestType     = 0x02    // 消费请求类型标识
+	FetchRequestType     = 0x01    // 消费请求类型标识
 	DefaultMaxFetchBytes = 1 << 20 // 默认最大拉取1MB数据
 	MaxFetchBytesLimit   = 5 << 20 // 服务端限制单次拉取5MB
 

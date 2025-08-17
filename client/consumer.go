@@ -57,14 +57,14 @@ func (c *Consumer) Fetch(req FetchRequest) (*FetchResult, error) {
 		return nil, fmt.Errorf("failed to build request: %v", err)
 	}
 
-	// Send request
+	// Send request with fetch-specific protocol handling
 	responseData, err := c.client.sendRequest(FetchRequestType, requestData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send request: %v", err)
 	}
 
 	// Parse response
-	result, err := c.parseFetchResponse(req.Topic, req.Partition, responseData)
+	result, err := c.parseFetchResponse(req.Topic, req.Partition, req.Offset, responseData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse response: %v", err)
 	}
@@ -118,7 +118,7 @@ func (c *Consumer) buildFetchRequest(req FetchRequest) ([]byte, error) {
 }
 
 // parseFetchResponse parses fetch response
-func (c *Consumer) parseFetchResponse(topic string, partition int32, data []byte) (*FetchResult, error) {
+func (c *Consumer) parseFetchResponse(topic string, partition int32, requestOffset int64, data []byte) (*FetchResult, error) {
 	buf := bytes.NewReader(data)
 
 	result := &FetchResult{
@@ -165,13 +165,18 @@ func (c *Consumer) parseFetchResponse(topic string, partition int32, data []byte
 		return nil, fmt.Errorf("failed to read message count: %v", err)
 	}
 
-	// 5. Read message content
-	currentOffset := int64(0) // This should get the actual starting offset from server
+	// 6. Read message content
+	currentOffset := requestOffset // Start from the requested offset
 	for i := int32(0); i < messageCount; i++ {
 		// Read message length
 		var msgLen int32
 		if err := binary.Read(buf, binary.BigEndian, &msgLen); err != nil {
 			return nil, fmt.Errorf("failed to read message %d length: %v", i, err)
+		}
+
+		// Validate message length
+		if msgLen < 0 || msgLen > 1024*1024 { // Max 1MB per message
+			return nil, fmt.Errorf("invalid message length: %d", msgLen)
 		}
 
 		// Read message content
@@ -189,8 +194,6 @@ func (c *Consumer) parseFetchResponse(topic string, partition int32, data []byte
 		result.Messages = append(result.Messages, message)
 		currentOffset++
 	}
-
-	// NextOffset was already read above
 
 	return result, nil
 }

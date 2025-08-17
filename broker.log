@@ -1,0 +1,40 @@
+2025/08/18 22:36:24 Go Queue server starting - port:9092, data directory:./data
+2025/08/18 22:36:24 Loading existing data from ./data
+2025/08/18 22:36:24 Loaded partition 0 with 1 segments
+2025/08/18 22:36:24 Loaded topic cmdline-topic with 1 partitions
+2025/08/18 22:36:24 Loaded partition 0 with 1 segments
+2025/08/18 22:36:24 Loaded topic consume-test-topic with 1 partitions
+2025/08/18 22:36:24 Loaded partition 0 with 1 segments
+2025/08/18 22:36:24 Loaded topic override-test with 1 partitions
+2025/08/18 22:36:24 Loaded partition 0 with 1 segments
+2025/08/18 22:36:24 Loaded topic override-test-topic with 1 partitions
+2025/08/18 22:36:24 Loaded partition 0 with 1 segments
+2025/08/18 22:36:24 Loaded partition 1 with 1 segments
+2025/08/18 22:36:24 Loaded partition 2 with 1 segments
+2025/08/18 22:36:24 Loaded topic test-topic with 3 partitions
+2025/08/18 22:36:24 Loaded partition 0 with 1 segments
+2025/08/18 22:36:24 Loaded topic test-topic-from-config with 1 partitions
+2025/08/18 22:36:24 Loaded 6 topics
+2025/08/18 22:36:24 Go Queue server started on :9092
+2025/08/18 22:36:27 Received request type: 2
+2025/08/18 22:36:27 Handling createTopic request
+2025/08/18 22:36:27 Received request type: 0
+2025/08/18 22:36:27 Handling produce request
+2025/08/18 22:36:27 Received request type: 0
+2025/08/18 22:36:27 Handling produce request
+2025/08/18 22:36:27 Received request type: 0
+2025/08/18 22:36:27 Handling produce request
+2025/08/18 22:36:27 Received request type: 1
+2025/08/18 22:36:27 Handling fetch request
+2025/08/18 22:36:27 Received request type: 1
+2025/08/18 22:36:27 Handling fetch request
+2025/08/18 22:36:27 Received request type: 1
+2025/08/18 22:36:27 Handling fetch request
+2025/08/18 22:36:27 Received request type: 0
+2025/08/18 22:36:27 Handling produce request
+2025/08/18 22:36:27 Received request type: 1
+2025/08/18 22:36:27 Handling fetch request
+2025/08/18 22:36:27 Received request type: 1
+2025/08/18 22:36:27 Handling fetch request
+2025/08/18 22:36:27 Received request type: 1
+2025/08/18 22:36:27 Handling fetch request
