@@ -3,10 +3,12 @@ package metadata
 import (
 	"encoding/binary"
 	"fmt"
-	"go-queue/internal/storage"
-	"io"
+	"os"
 	"path/filepath"
 	"sync"
+	"time"
+
+	"github.com/issac1998/go-queue/internal/storage"
 )
 
 const (
@@ -14,22 +16,47 @@ const (
 	DefaultPartitions  = 1
 )
 
-// Topic defines
+// Topic defines a topic
 type Topic struct {
 	Name       string
-	Partitions []*Partition
+	Partitions map[int32]*Partition
+	Config     *TopicConfig
+	mu         sync.RWMutex
 }
 
-// Partition defines
+// Partition defines a partition
 type Partition struct {
-	ID       int32
-	Topic    string
-	Segments []*storage.Segment
-	Leader   string   
-	Replicas []string 
-	Isr      []string 
-	Mu       sync.RWMutex
-	DataDir  string
+	ID         int32
+	Topic      string
+	DataDir    string
+	Segments   map[int]*storage.Segment
+	ActiveSeg  *storage.Segment
+	MaxSegSize int64
+	Mu         sync.RWMutex
+}
+
+// NewPartition creates a new partition
+func NewPartition(id int32, topic string, sysConfig *Config) (*Partition, error) {
+	dataDir := filepath.Join(sysConfig.DataDir, topic, fmt.Sprintf("partition-%d", id))
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return nil, fmt.Errorf("create partition dir failed: %v", err)
+	}
+
+	seg, err := storage.NewSegment(dataDir, 0, sysConfig.SegmentSize)
+	if err != nil {
+		return nil, fmt.Errorf("create segment failed: %v", err)
+	}
+
+	p := &Partition{
+		ID:         id,
+		Topic:      topic,
+		DataDir:    dataDir,
+		Segments:   map[int]*storage.Segment{0: seg},
+		ActiveSeg:  seg,
+		MaxSegSize: sysConfig.SegmentSize,
+		Mu:         sync.RWMutex{},
+	}
+	return p, nil
 }
 
 var (
@@ -37,7 +64,7 @@ var (
 	topicsLock sync.RWMutex
 )
 
-// CreateTopic defines
+// CreateTopic creates a new topic
 func CreateTopic(name string, numPartitions int32, dataDir string) (*Topic, error) {
 	topicsLock.Lock()
 	defer topicsLock.Unlock()
@@ -48,7 +75,7 @@ func CreateTopic(name string, numPartitions int32, dataDir string) (*Topic, erro
 
 	topic := &Topic{
 		Name:       name,
-		Partitions: make([]*Partition, numPartitions),
+		Partitions: make(map[int32]*Partition),
 	}
 
 	for i := int32(0); i < numPartitions; i++ {
@@ -63,7 +90,7 @@ func CreateTopic(name string, numPartitions int32, dataDir string) (*Topic, erro
 	return topic, nil
 }
 
-// GetTopic defines
+// GetTopic retrieves a topic by name
 func GetTopic(name string) (*Topic, error) {
 	topicsLock.RLock()
 	defer topicsLock.RUnlock()
@@ -86,7 +113,7 @@ func createPartition(topic string, id int32, dataDir string) (*Partition, error)
 	return &Partition{
 		ID:       id,
 		Topic:    topic,
-		Segments: []*storage.Segment{segment},
+		Segments: map[int]*storage.Segment{0: segment},
 		DataDir:  partitionDir,
 	}, nil
 }
@@ -123,17 +150,21 @@ func (p *Partition) Close() error {
 	return nil
 }
 
-// Append 
+// Append appends a message to the partition
 func (p *Partition) Append(msg []byte) (int64, error) {
 	p.Mu.Lock()
 	defer p.Mu.Unlock()
 
-	activeSegment := p.Segments[len(p.Segments)-1]
+	var activeSegment *storage.Segment
+	for _, seg := range p.Segments {
+		activeSegment = seg
+		break
+		// TODO:decide to write into the last or random segment
+	}
 
-	offset, err := activeSegment.Append(msg)
+	offset, err := activeSegment.Append(msg, time.Now())
 	if err != nil {
 		if err.Error() == "segment is full" {
-			
 			newSegment, err := storage.NewSegment(
 				p.DataDir,
 				activeSegment.BaseOffset+activeSegment.CurrentSize,
@@ -143,11 +174,11 @@ func (p *Partition) Append(msg []byte) (int64, error) {
 				return 0, fmt.Errorf("create new segment failed: %v", err)
 			}
 
-			p.Segments = append(p.Segments, newSegment)
+			p.Segments[len(p.Segments)] = newSegment
 			activeSegment = newSegment
 
 			// retry
-			offset, err = activeSegment.Append(msg)
+			offset, err = activeSegment.Append(msg, time.Now())
 			if err != nil {
 				return 0, fmt.Errorf("append to new segment failed: %v", err)
 			}
@@ -159,14 +190,14 @@ func (p *Partition) Append(msg []byte) (int64, error) {
 	return offset, nil
 }
 
-// Read 
+// Read
 func (p *Partition) Read(offset int64, maxBytes int32) ([][]byte, int64, error) {
 	p.Mu.RLock()
 	defer p.Mu.RUnlock()
 
 	var targetSegment *storage.Segment
 	for _, segment := range p.Segments {
-		if offset >= segment.BaseOffset && offset < segment.BaseOffset+segment.CurrentSize {
+		if offset >= segment.BaseOffset && offset < segment.BaseOffset+segment.WriteCount {
 			targetSegment = segment
 			break
 		}
@@ -194,30 +225,56 @@ func readMessagesFromSegment(segment *storage.Segment, startPos int64, maxBytes 
 	var messages [][]byte
 	currentPos := startPos
 	totalBytes := int64(0)
-
+	messageCount := int64(0)
+	// read unitils maxBytes or EOF
 	for totalBytes < maxBytes {
 		lenBuf := make([]byte, 4)
-		if _, err := segment.ReadAt(currentPos, lenBuf); err != nil {
-			if err == io.EOF {
-				break
-			}
-			return nil, 0, err
+		n, err := segment.ReadAt(currentPos, lenBuf)
+		if err != nil || n < 4 {
+			break
 		}
+
 		msgSize := int64(binary.BigEndian.Uint32(lenBuf))
 		currentPos += 4
 
 		if msgSize <= 0 || msgSize > maxBytes-totalBytes {
-			return nil, 0, fmt.Errorf("invalid message length: %d", msgSize)
+			break
 		}
 
 		msgBuf := make([]byte, msgSize)
-		if _, err := segment.ReadAt(currentPos, msgBuf); err != nil {
-			return nil, 0, err
+		n, err = segment.ReadAt(currentPos, msgBuf)
+		if err != nil || int64(n) < msgSize {
+			break
 		}
+
 		messages = append(messages, msgBuf)
-		currentPos += int64(msgSize)
-		totalBytes += int64(msgSize) + 4
+		currentPos += msgSize
+		totalBytes += msgSize + 4
+		messageCount++
 	}
 
-	return messages, segment.BaseOffset + currentPos, nil
+	// TODO:Test logic below
+	var nextOffset int64
+	if messageCount > 0 {
+		// 找到起始offset，然后加上读取的消息数量
+		startOffset := int64(-1)
+		for _, entry := range segment.IndexEntries {
+			if entry.Position == startPos {
+				startOffset = entry.Offset
+				break
+			}
+		}
+
+		if startOffset >= 0 {
+			nextOffset = startOffset + messageCount
+		} else {
+			// 如果找不到精确的起始位置，基于segment基础offset计算
+			nextOffset = segment.BaseOffset + messageCount
+		}
+	} else {
+		// 没有读取到消息，返回末尾offset
+		nextOffset = segment.BaseOffset + segment.WriteCount
+	}
+
+	return messages, nextOffset, nil
 }

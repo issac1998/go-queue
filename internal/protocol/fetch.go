@@ -5,9 +5,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"go-queue/internal/metadata"
-	"go-queue/internal/storage"
 	"io"
+
+	"github.com/issac1998/go-queue/internal/metadata"
+	"github.com/issac1998/go-queue/internal/storage"
 )
 
 type FetchRequest struct {
@@ -48,6 +49,7 @@ func ReadFetchRequest(r io.Reader) (*FetchRequest, error) {
 	}
 	req.Topic = string(topicBytes)
 
+
 	if err := binary.Read(r, binary.BigEndian, &req.Partition); err != nil {
 		return nil, fmt.Errorf("failed to read partition: %v", err)
 	}
@@ -75,6 +77,7 @@ func (res *FetchResponse) Write(w io.Writer) error {
 	binary.Write(headerBuf, binary.BigEndian, res.Partition)
 	binary.Write(headerBuf, binary.BigEndian, res.ErrorCode)
 	binary.Write(headerBuf, binary.BigEndian, res.NextOffset)
+	binary.Write(headerBuf, binary.BigEndian, int32(len(res.Messages))) // 添加消息数量
 
 	var messagesBuf bytes.Buffer
 	for _, msg := range res.Messages {
@@ -99,7 +102,7 @@ func (res *FetchResponse) Write(w io.Writer) error {
 }
 
 // HandleFetchRequest
-func HandleFetchRequest(conn io.ReadWriteCloser) error {
+func HandleFetchRequest(conn io.ReadWriteCloser, manager *metadata.Manager) error {
 	defer conn.Close()
 
 	req, err := ReadFetchRequest(conn)
@@ -107,27 +110,9 @@ func HandleFetchRequest(conn io.ReadWriteCloser) error {
 		return sendFetchError(conn, ErrorInvalidRequest, err.Error())
 	}
 
-	partition, err := metadata.GetPartition(req.Topic, req.Partition)
-	if err != nil {
-		return sendFetchError(conn, ErrorUnknownPartition,
-			fmt.Sprintf("partition %d not found", req.Partition))
-	}
-
-	partition.Mu.RLock()
-	defer partition.Mu.RUnlock()
-
-	segment, startPos, err := findSegmentAndPosition(partition, req.Offset)
+	messages, nextOffset, err := manager.ReadMessage(req.Topic, req.Partition, req.Offset, req.MaxBytes)
 	if err != nil {
 		return sendFetchError(conn, ErrorOffsetOutOfRange, err.Error())
-	}
-
-	messages, nextOffset, err := readMessagesFromSegment(
-		segment,
-		startPos,
-		int64(req.MaxBytes),
-	)
-	if err != nil {
-		return sendFetchError(conn, ErrorFetchFailed, err.Error())
 	}
 
 	response := &FetchResponse{

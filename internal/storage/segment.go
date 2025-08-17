@@ -13,7 +13,7 @@ import (
 
 const (
 	IndexEntrySize = 16   // 8 bytes offset + 8 bytes position
-	IndexInterval  = 1024 // 每1KB写入一个索引条目
+	IndexInterval  = 1024 // Write one index entry per 1KB
 )
 
 // Segment
@@ -40,6 +40,9 @@ type Segment struct {
 	ReadCount     int64
 	LastWriteTime time.Time
 	LastReadTime  time.Time
+
+	MinTimestamp time.Time
+	MaxTimestamp time.Time
 }
 
 // IndexEntry
@@ -49,7 +52,7 @@ type IndexEntry struct {
 	TimeMs   int64
 }
 
-// Append
+// NewSegment creates a new segment
 func NewSegment(dir string, baseOffset int64, maxBytes int64) (*Segment, error) {
 	// make or create dir and open file
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -106,6 +109,15 @@ func NewSegment(dir string, baseOffset int64, maxBytes int64) (*Segment, error) 
 		return nil, fmt.Errorf("load index failed: %v", err)
 	}
 
+	// Update WriteCount based on loaded index entries
+	if len(segment.IndexEntries) > 0 {
+		// WriteCount should be equal to the number of index entries
+		segment.WriteCount = int64(len(segment.IndexEntries))
+		// Update EndOffset
+		lastEntry := segment.IndexEntries[len(segment.IndexEntries)-1]
+		segment.EndOffset = lastEntry.Offset
+	}
+
 	return segment, nil
 
 }
@@ -120,30 +132,52 @@ func (s *Segment) loadIndex() error {
 	numEntries := stat.Size() / IndexEntrySize
 	s.IndexEntries = make([]IndexEntry, 0, numEntries)
 
+	// If the file is empty, return directly
+	if stat.Size() == 0 {
+		return nil
+	}
+
+	// Reset file pointer to the beginning
+	if _, err := s.IndexFile.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("seek index file failed: %v", err)
+	}
+
+	// Read all index entries (only read offset and position)
 	for i := int64(0); i < numEntries; i++ {
 		var entry IndexEntry
 		if err := binary.Read(s.IndexFile, binary.BigEndian, &entry.Offset); err != nil {
-			return err
+			return fmt.Errorf("read offset failed at entry %d: %v", i, err)
 		}
 		if err := binary.Read(s.IndexFile, binary.BigEndian, &entry.Position); err != nil {
-			return err
+			return fmt.Errorf("read position failed at entry %d: %v", i, err)
 		}
+		// TimeMs field is not read from the index file during loading because it was not stored in old versions
+		entry.TimeMs = 0
 		s.IndexEntries = append(s.IndexEntries, entry)
+
 	}
 
 	return nil
 }
 
-// Append
-func (s *Segment) Append(msg []byte) (offset int64, err error) {
+// Append appends a message to the segment
+func (s *Segment) Append(msg []byte, timestamp time.Time) (offset int64, err error) {
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
 
 	if s.CurrentSize+int64(len(msg)+4) > s.MaxBytes {
 		return 0, errors.New("segment is full")
 	}
-	offset = s.BaseOffset + s.CurrentSize
 
+	offset = s.BaseOffset + s.WriteCount
+
+	// Get current file position
+	currentFilePos, err := s.LogFile.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return 0, fmt.Errorf("get file position failed: %v", err)
+	}
+
+	// Write message length and content
 	if err := binary.Write(s.LogFile, binary.BigEndian, int32(len(msg))); err != nil {
 		return 0, fmt.Errorf("write message length failed: %v", err)
 	}
@@ -151,28 +185,34 @@ func (s *Segment) Append(msg []byte) (offset int64, err error) {
 		return 0, fmt.Errorf("write message content failed: %v", err)
 	}
 
-	s.CurrentSize += int64(len(msg) + 4)
-	s.WriteCount++
-
-	// 每隔一定间隔写入索引条目
-	if s.CurrentSize%IndexInterval == 0 {
-		pos, err := s.LogFile.Seek(0, io.SeekCurrent)
-		if err != nil {
-			return 0, fmt.Errorf("get current position failed: %v", err)
-		}
-
-		if err := binary.Write(s.IndexFile, binary.BigEndian, offset); err != nil {
-			return 0, fmt.Errorf("write index offset failed: %v", err)
-		}
-		if err := binary.Write(s.IndexFile, binary.BigEndian, pos); err != nil {
-			return 0, fmt.Errorf("write index position failed: %v", err)
-		}
-
-		s.IndexEntries = append(s.IndexEntries, IndexEntry{
-			Offset:   offset,
-			Position: pos,
-		})
+	// Force write index entry (index is established for each message)
+	if err := binary.Write(s.IndexFile, binary.BigEndian, offset); err != nil {
+		return 0, fmt.Errorf("write index offset failed: %v", err)
 	}
+	if err := binary.Write(s.IndexFile, binary.BigEndian, currentFilePos); err != nil {
+		return 0, fmt.Errorf("write index position failed: %v", err)
+	}
+
+	// Add to memory index
+	entry := IndexEntry{
+		Offset:   offset,
+		Position: currentFilePos,
+		TimeMs:   timestamp.UnixMilli(),
+	}
+	s.IndexEntries = append(s.IndexEntries, entry)
+
+	// Update timestamp range
+	if s.MinTimestamp.IsZero() || timestamp.Before(s.MinTimestamp) {
+		s.MinTimestamp = timestamp
+	}
+	if timestamp.After(s.MaxTimestamp) {
+		s.MaxTimestamp = timestamp
+	}
+
+	// Update counters and size
+	s.WriteCount++
+	s.CurrentSize += int64(len(msg) + 4)
+	s.EndOffset = offset
 
 	return offset, nil
 }
@@ -220,6 +260,7 @@ func (s *Segment) FindPosition(offset int64) (int64, error) {
 	currentOffset := s.BaseOffset
 	if nearestEntry.Offset != 0 {
 		currentOffset = nearestEntry.Offset
+
 	}
 
 	for currentOffset < offset {
@@ -249,12 +290,12 @@ func (s *Segment) FindPosition(offset int64) (int64, error) {
 	return 0, fmt.Errorf("offset %d not found in segment", offset)
 }
 
-// ReadAt
+// ReadAt reads data from a specified position
 func (s *Segment) ReadAt(pos int64, buf []byte) (int, error) {
 	s.Mu.RLock()
 	defer s.Mu.RUnlock()
 
-	if pos < 0 || pos >= s.CurrentSize {
+	if pos < 0 {
 		return 0, errors.New("invalid position")
 	}
 
@@ -262,7 +303,8 @@ func (s *Segment) ReadAt(pos int64, buf []byte) (int, error) {
 		return 0, fmt.Errorf("seek failed: %v", err)
 	}
 
-	n, err := io.ReadFull(s.LogFile, buf)
+	// Read is better to use io.ReadFull to ensure full read
+	n, err := s.LogFile.Read(buf)
 	if err != nil && err != io.EOF {
 		return n, fmt.Errorf("read failed: %v", err)
 	}
@@ -270,7 +312,7 @@ func (s *Segment) ReadAt(pos int64, buf []byte) (int, error) {
 	return n, nil
 }
 
-// Close
+// Close closes the Segment
 func (s *Segment) Close() error {
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
@@ -299,7 +341,7 @@ func (s *Segment) Close() error {
 	return nil
 }
 
-// Sync
+// Sync synchronizes data to disk
 func (s *Segment) Sync() error {
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
@@ -312,4 +354,24 @@ func (s *Segment) Sync() error {
 	}
 	s.LastSynced = s.CurrentSize
 	return nil
+}
+
+// PurgeBefore removes index entries and (optionally) data before the given time.
+// This is a minimal stub; you should implement actual data deletion as needed.
+func (s *Segment) PurgeBefore(expireBefore time.Time) {
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+	newEntries := s.IndexEntries[:0]
+	for _, entry := range s.IndexEntries {
+		if time.UnixMilli(entry.TimeMs).After(expireBefore) {
+			newEntries = append(newEntries, entry)
+		}
+	}
+	s.IndexEntries = newEntries
+	// Optionally, update MinTimestamp
+	if len(s.IndexEntries) > 0 {
+		s.MinTimestamp = time.UnixMilli(s.IndexEntries[0].TimeMs)
+	} else {
+		s.MinTimestamp = time.Time{}
+	}
 }
