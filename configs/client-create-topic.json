@@ -1,0 +1,13 @@
+{
+  "broker": "localhost:9092",
+  "timeout": "10s",
+  "log_file": "logs/client-create.log",
+  "command": {
+    "type": "create-topic",
+    "topic": "test-topic-from-config",
+    "partition": 0,
+    "message": "",
+    "offset": 0,
+    "count": 1
+  }
+} 
