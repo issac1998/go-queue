@@ -1,13 +1,13 @@
 package protocol
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 
-	"go-queue/internal/metadata"
+	"github.com/issac1998/go-queue/internal/metadata"
 )
 
 const (
@@ -89,7 +89,6 @@ func ReadProduceRequest(r io.Reader) (*ProduceRequest, error) {
 		return nil, fmt.Errorf("read message set size failed: %v", err)
 	}
 
-	// 限制读取大小防止内存耗尽
 	limitedReader := io.LimitReader(r, int64(msgSetSize))
 	for {
 		var msgSize int32
@@ -116,26 +115,24 @@ func ReadProduceRequest(r io.Reader) (*ProduceRequest, error) {
 
 // WriteProduceResponse
 func (res *ProduceResponse) Write(w io.Writer) error {
-	buf := new(bytes.Buffer)
-
-	if err := binary.Write(buf, binary.BigEndian, res.BaseOffset); err != nil {
-		return err
-	}
-	if err := binary.Write(buf, binary.BigEndian, res.ErrorCode); err != nil {
+	// 先写入总长度前缀 (8 + 2 = 10 bytes)
+	responseLen := int32(8 + 2) // BaseOffset(8) + ErrorCode(2)
+	if err := binary.Write(w, binary.BigEndian, responseLen); err != nil {
 		return err
 	}
 
-	totalLen := int32(buf.Len())
-	if err := binary.Write(w, binary.BigEndian, totalLen); err != nil {
+	if err := binary.Write(w, binary.BigEndian, res.BaseOffset); err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.BigEndian, res.ErrorCode); err != nil {
 		return err
 	}
 
-	_, err := w.Write(buf.Bytes())
-	return err
+	return nil
 }
 
 // HandleProduceRequest
-func HandleProduceRequest(conn io.ReadWriter) error {
+func HandleProduceRequest(conn io.ReadWriter, manager *metadata.Manager) error {
 	req, err := ReadProduceRequest(conn)
 	if err != nil {
 		return fmt.Errorf("invalid produce request: %v", err)
@@ -148,17 +145,9 @@ func HandleProduceRequest(conn io.ReadWriter) error {
 		return writeErrorResponse(conn, ErrorInvalidMessage)
 	}
 
-	partition, err := metadata.GetPartition(req.Topic, int32(req.Partition))
-	if err != nil {
-		return writeErrorResponse(conn, ErrorUnknownPartition)
-	}
-
 	var firstOffset int64 = -1
-	partition.Mu.Lock()
-	defer partition.Mu.Unlock()
-
 	for _, msg := range req.Messages {
-		offset, err := partition.Segments[0].Append(msg)
+		offset, err := manager.WriteMessage(req.Topic, req.Partition, msg)
 		if err != nil {
 			return writeErrorResponse(conn, ErrorMessageTooLarge)
 		}
@@ -180,4 +169,49 @@ func writeErrorResponse(w io.Writer, errorCode int16) error {
 		ErrorCode: errorCode,
 	}
 	return response.Write(w)
+}
+
+func HandleCreateTopicRequest(conn net.Conn, manager *metadata.Manager) {
+	var version int16
+	if err := binary.Read(conn, binary.BigEndian, &version); err != nil {
+		writeErrorResponse(conn, ErrorInvalidRequest)
+		return
+	}
+
+	var nameLen int16
+	if err := binary.Read(conn, binary.BigEndian, &nameLen); err != nil {
+		writeErrorResponse(conn, ErrorInvalidRequest)
+		return
+	}
+
+	nameBuf := make([]byte, nameLen)
+	if _, err := io.ReadFull(conn, nameBuf); err != nil {
+		writeErrorResponse(conn, ErrorInvalidRequest)
+		return
+	}
+	topicName := string(nameBuf)
+
+	var partitions int32
+	if err := binary.Read(conn, binary.BigEndian, &partitions); err != nil {
+		writeErrorResponse(conn, ErrorInvalidRequest)
+		return
+	}
+
+	var replicas int32 = 1
+	binary.Read(conn, binary.BigEndian, &replicas)
+
+	_, err := manager.CreateTopic(topicName, &metadata.TopicConfig{
+		Partitions: partitions,
+		Replicas:   replicas,
+	})
+	if err != nil {
+		writeErrorResponse(conn, ErrorInvalidRequest)
+		return
+	}
+
+	writeSuccessResponse(conn)
+}
+
+func writeSuccessResponse(conn net.Conn) {
+	writeErrorResponse(conn, 0)
 }

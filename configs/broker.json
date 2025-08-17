@@ -1,0 +1,22 @@
+{
+  "data_dir": "./data",
+  "max_topic_partitions": 16,
+  "segment_size": 1073741824,
+  "retention_time": "168h",
+  "max_storage_size": 107374182400,
+  "flush_interval": "1s",
+  "cleanup_interval": "1h",
+  "max_message_size": 1048576,
+  
+  "compression_enabled": true,
+  "compression_type": 3,
+  "compression_threshold": 100,
+  
+  "deduplication_enabled": true,
+  "deduplication_config": {
+    "hash_type": 1,
+    "max_entries": 100000,
+    "ttl": "24h",
+    "enabled": true
+  }
+} 

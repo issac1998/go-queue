@@ -1,0 +1,118 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        
+        {
+            "name": "Debug Broker",
+            "type": "go",
+            "request": "launch",
+            "mode": "auto",
+            "program": "${workspaceFolder}/cmd/broker/main.go",
+            "args": [
+                "-log=debug_broker.log",
+                "-port=9092",
+                "-data=data"
+            ],
+            "env": {
+                "GO_ENV": "development"
+            },
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "showLog": true,
+            "trace": "verbose"
+        },
+        {
+            "name": "Debug Client - Create Topic",
+            "type": "go",
+            "request": "launch",
+            "mode": "auto",
+            "program": "${workspaceFolder}/cmd/client/main.go",
+            "args": [
+                "-cmd=create-topic",
+                "-topic=debug-topic",
+                "-log=debug_client_create.log"
+            ],
+            "env": {},
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "showLog": true
+        },
+        {
+            "name": "Debug Client - Produce",
+            "type": "go",
+            "request": "launch",
+            "mode": "auto",
+            "program": "${workspaceFolder}/cmd/client/main.go",
+            "args": [
+                "-cmd=produce",
+                "-topic=debug-topic",
+                "-partition=0",
+                "-message=Hello Debug",
+                "-log=debug_client_produce.log"
+            ],
+            "env": {},
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "showLog": true
+        },
+        {
+            "name": "Debug Client - Consume",
+            "type": "go",
+            "request": "launch",
+            "mode": "auto",
+            "program": "${workspaceFolder}/cmd/client/main.go",
+            "args": [
+                "-cmd=consume",
+                "-topic=debug-topic",
+                "-partition=0",
+                "-offset=0",
+                "-log=debug_client_consume.log"
+            ],
+            "env": {},
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "showLog": true
+        },
+        {
+            "name": "Debug Message Reading Test",
+            "type": "go",
+            "request": "launch",
+            "mode": "auto",
+            "program": "${workspaceFolder}/test_message_reading.go",
+            "env": {},
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "showLog": true
+        },
+        {
+            "name": "Debug Example",
+            "type": "go",
+            "request": "launch",
+            "mode": "auto",
+            "program": "${workspaceFolder}/examples/simple/main.go",
+            "env": {},
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "showLog": true
+        },
+        {
+            "name": "Debug Compression & Dedup Example",
+            "type": "go",
+            "request": "launch",
+            "mode": "auto",
+            "program": "${workspaceFolder}/examples/compression_dedup/main.go",
+            "env": {},
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "showLog": true
+        }
+    ],
+    "compounds": [
+        {
+            "name": "Debug Broker + Client",
+            "configurations": [
+                "Debug Broker"
+            ]
+        }
+    ]
+}
