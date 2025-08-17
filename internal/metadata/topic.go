@@ -3,10 +3,12 @@ package metadata
 import (
 	"encoding/binary"
 	"fmt"
-	"go-queue/internal/storage"
-	"io"
+	"os"
 	"path/filepath"
 	"sync"
+	"time"
+
+	"github.com/issac1998/go-queue/internal/storage"
 )
 
 const (
@@ -14,22 +16,48 @@ const (
 	DefaultPartitions  = 1
 )
 
-// Topic defines
+// Topic defines a topic
 type Topic struct {
 	Name       string
-	Partitions []*Partition
+	Partitions map[int32]*Partition
+	Config     *TopicConfig
+	mu         sync.RWMutex
 }
 
-// Partition defines
+// Partition defines a partition
 type Partition struct {
-	ID       int32
-	Topic    string
-	Segments []*storage.Segment
-	Leader   string   // Leader 节点地址
-	Replicas []string // 副本节点列表
-	Isr      []string // In-Sync Replicas
-	Mu       sync.RWMutex
-	DataDir  string
+	ID         int32
+	Topic      string
+	DataDir    string
+	Segments   map[int]*storage.Segment
+	ActiveSeg  *storage.Segment
+	MaxSegSize int64
+	Mu         sync.RWMutex
+}
+
+func NewPartition(id int32, topic string, sysConfig *Config) (*Partition, error) {
+	// 构建分区数据目录
+	dataDir := filepath.Join(sysConfig.DataDir, topic, fmt.Sprintf("partition-%d", id))
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return nil, fmt.Errorf("create partition dir failed: %v", err)
+	}
+
+	// 创建第一个 segment
+	seg, err := storage.NewSegment(dataDir, 0, sysConfig.SegmentSize)
+	if err != nil {
+		return nil, fmt.Errorf("create segment failed: %v", err)
+	}
+
+	p := &Partition{
+		ID:         id,
+		Topic:      topic,
+		DataDir:    dataDir,
+		Segments:   map[int]*storage.Segment{0: seg},
+		ActiveSeg:  seg,
+		MaxSegSize: sysConfig.SegmentSize,
+		Mu:         sync.RWMutex{},
+	}
+	return p, nil
 }
 
 var (
@@ -37,7 +65,7 @@ var (
 	topicsLock sync.RWMutex
 )
 
-// CreateTopic defines
+// CreateTopic creates a new topic
 func CreateTopic(name string, numPartitions int32, dataDir string) (*Topic, error) {
 	topicsLock.Lock()
 	defer topicsLock.Unlock()
@@ -48,7 +76,7 @@ func CreateTopic(name string, numPartitions int32, dataDir string) (*Topic, erro
 
 	topic := &Topic{
 		Name:       name,
-		Partitions: make([]*Partition, numPartitions),
+		Partitions: make(map[int32]*Partition),
 	}
 
 	for i := int32(0); i < numPartitions; i++ {
@@ -89,7 +117,7 @@ func createPartition(topic string, id int32, dataDir string) (*Partition, error)
 	return &Partition{
 		ID:       id,
 		Topic:    topic,
-		Segments: []*storage.Segment{segment},
+		Segments: map[int]*storage.Segment{0: segment},
 		DataDir:  partitionDir,
 	}, nil
 }
@@ -134,10 +162,14 @@ func (p *Partition) Append(msg []byte) (int64, error) {
 	defer p.Mu.Unlock()
 
 	// 获取当前活跃的 Segment
-	activeSegment := p.Segments[len(p.Segments)-1]
+	var activeSegment *storage.Segment
+	for _, seg := range p.Segments {
+		activeSegment = seg
+		break // 取第一个，简化实现
+	}
 
 	// 尝试追加消息
-	offset, err := activeSegment.Append(msg)
+	offset, err := activeSegment.Append(msg, time.Now())
 	if err != nil {
 		if err.Error() == "segment is full" {
 			// 创建新的 Segment
@@ -151,11 +183,12 @@ func (p *Partition) Append(msg []byte) (int64, error) {
 			}
 
 			// 添加到分区
-			p.Segments = append(p.Segments, newSegment)
+			nextID := len(p.Segments)
+			p.Segments[nextID] = newSegment
 			activeSegment = newSegment
 
 			// 重试追加
-			offset, err = activeSegment.Append(msg)
+			offset, err = activeSegment.Append(msg, time.Now())
 			if err != nil {
 				return 0, fmt.Errorf("append to new segment failed: %v", err)
 			}
@@ -172,10 +205,10 @@ func (p *Partition) Read(offset int64, maxBytes int32) ([][]byte, int64, error) 
 	p.Mu.RLock()
 	defer p.Mu.RUnlock()
 
-	// 查找包含目标 offset 的 Segment
+	// 查找包含目标 offset 的 Segment (使用消息计数范围)
 	var targetSegment *storage.Segment
 	for _, segment := range p.Segments {
-		if offset >= segment.BaseOffset && offset < segment.BaseOffset+segment.CurrentSize {
+		if offset >= segment.BaseOffset && offset < segment.BaseOffset+segment.WriteCount {
 			targetSegment = segment
 			break
 		}
@@ -205,33 +238,68 @@ func readMessagesFromSegment(segment *storage.Segment, startPos int64, maxBytes 
 	var messages [][]byte
 	currentPos := startPos
 	totalBytes := int64(0)
+	messageCount := int64(0)
 
 	for totalBytes < maxBytes {
 		// 读取消息长度
 		lenBuf := make([]byte, 4)
-		if _, err := segment.ReadAt(currentPos, lenBuf); err != nil {
-			if err == io.EOF {
-				break
-			}
-			return nil, 0, err
+		n, err := segment.ReadAt(currentPos, lenBuf)
+		if err != nil || n < 4 {
+			// 到达文件末尾或者读取不足
+			break
 		}
+
 		msgSize := int64(binary.BigEndian.Uint32(lenBuf))
 		currentPos += 4
 
 		// 检查消息长度是否有效
-		if msgSize <= 0 || msgSize > maxBytes-totalBytes {
-			return nil, 0, fmt.Errorf("invalid message length: %d", msgSize)
+		if msgSize <= 0 {
+			// 遇到无效消息长度，停止读取
+			break
+		}
+		if msgSize > maxBytes-totalBytes {
+			// 剩余空间不足，停止读取
+			break
 		}
 
 		// 读取消息内容
 		msgBuf := make([]byte, msgSize)
-		if _, err := segment.ReadAt(currentPos, msgBuf); err != nil {
-			return nil, 0, err
+		n, err = segment.ReadAt(currentPos, msgBuf)
+		if err != nil || int64(n) < msgSize {
+			// 读取失败或不足，停止读取
+			break
 		}
+
 		messages = append(messages, msgBuf)
-		currentPos += int64(msgSize)
-		totalBytes += int64(msgSize) + 4
+		currentPos += msgSize
+		totalBytes += msgSize + 4
+		messageCount++
 	}
 
-	return messages, segment.BaseOffset + currentPos, nil
+	// 返回下一个消息的offset
+	// 如果读取到了消息，nextOffset应该是最后一条消息的offset + 1
+	// 如果没有读取到消息，返回当前的segment末尾offset
+	var nextOffset int64
+	if messageCount > 0 {
+		// 找到起始offset，然后加上读取的消息数量
+		startOffset := int64(-1)
+		for _, entry := range segment.IndexEntries {
+			if entry.Position == startPos {
+				startOffset = entry.Offset
+				break
+			}
+		}
+
+		if startOffset >= 0 {
+			nextOffset = startOffset + messageCount
+		} else {
+			// 如果找不到精确的起始位置，基于segment基础offset计算
+			nextOffset = segment.BaseOffset + messageCount
+		}
+	} else {
+		// 没有读取到消息，返回当前的写入位置
+		nextOffset = segment.BaseOffset + segment.WriteCount
+	}
+
+	return messages, nextOffset, nil
 }

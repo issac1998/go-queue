@@ -1,5 +1,7 @@
-module go-queue
+module github.com/issac1998/go-queue
 
-go 1.22.5
+go 1.24.2
 
-require github.com/gorilla/mux v1.8.1 // indirect
+toolchain go1.24.6
+
+require github.com/klauspost/compress v1.18.0
