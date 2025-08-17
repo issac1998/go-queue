@@ -1,13 +1,13 @@
 package protocol
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 
-	"go-queue/internal/metadata"
+	"github.com/issac1998/go-queue/internal/metadata"
 )
 
 const (
@@ -25,56 +25,55 @@ const (
 )
 
 const (
-	// 成功
+	// Success
 	ErrorNone = 0
 
-	// 客户端请求错误 (1-99)
-	ErrorInvalidRequest   = 1 // 请求格式不合法
-	ErrorInvalidTopic     = 3 // Topic 名称无效
-	ErrorUnknownPartition = 5 // 分区不存在
-	ErrorInvalidMessage   = 6 // 消息内容非法（如空消息）
-	ErrorMessageTooLarge  = 7 // 消息超过大小限制
-	ErrorOffsetOutOfRange = 8 // 请求的 Offset 超出范围
+	// Client request errors (1-99)
+	ErrorInvalidRequest   = 1 // Invalid request format
+	ErrorInvalidTopic     = 3 // Invalid topic name
+	ErrorUnknownPartition = 5 // Partition does not exist
+	ErrorInvalidMessage   = 6 // Invalid message content (e.g., empty message)
+	ErrorMessageTooLarge  = 7 // Message exceeds size limit
+	ErrorOffsetOutOfRange = 8 // Requested offset is out of range
 
-	// 服务端错误 (100-199)
-	ErrorBrokerNotAvailable = 100 // Broker 不可用
-	ErrorFetchFailed        = 101 // 拉取消息失败（如磁盘故障）
-	ErrorProduceFailed      = 102 // 写入消息失败
+	// Server errors (100-199)
+	ErrorBrokerNotAvailable = 100 // Broker is unavailable
+	ErrorFetchFailed        = 101 // Failed to fetch messages (e.g., disk failure)
+	ErrorProduceFailed      = 102 // Failed to write messages
 
-	// 权限/配额错误 (200-299)
-	ErrorUnauthorized  = 200 // 客户端未授权
-	ErrorQuotaExceeded = 201 // 超出配额限制
+	// Permission/quota errors (200-299)
+	ErrorUnauthorized  = 200 // Client is unauthorized
+	ErrorQuotaExceeded = 201 // Quota limit exceeded
 )
 
-// --- 请求/响应结构体 ---
+// --- Request/Response structures ---
 
-// ProduceRequest 生产请求结构
+// ProduceRequest produce request structure
 type ProduceRequest struct {
 	Topic       string
 	Partition   int32
-	Compression int8 // 压缩类型
+	Compression int8 // Compression type
 	Messages    [][]byte
 }
 
-// ProduceResponse 生产响应结构
+// ProduceResponse produce response structure
 type ProduceResponse struct {
-	BaseOffset int64 // 首条消息的Offset
-	ErrorCode  int16 // 错误码 (0=成功)
+	BaseOffset int64 // Offset of the first message
+	ErrorCode  int16 // Error code (0=success)
 }
 
-// --- 编码解码方法 ---
+// --- Encoding/Decoding methods ---
 
-// ReadProduceRequest 从网络连接解码请求
+// ReadProduceRequest decodes request from network connection
 func ReadProduceRequest(r io.Reader) (*ProduceRequest, error) {
 	var req ProduceRequest
 
-	// 读取协议版本
 	var version int16
 	if err := binary.Read(r, binary.BigEndian, &version); err != nil {
 		return nil, fmt.Errorf("read version failed: %v", err)
 	}
 
-	// 读取Topic长度和内容
+	// Read topic length and content
 	var topicLen int16
 	if err := binary.Read(r, binary.BigEndian, &topicLen); err != nil {
 		return nil, fmt.Errorf("read topic length failed: %v", err)
@@ -85,7 +84,7 @@ func ReadProduceRequest(r io.Reader) (*ProduceRequest, error) {
 	}
 	req.Topic = string(topicBytes)
 
-	// 读取Partition和Compression
+	// Read partition and compression
 	if err := binary.Read(r, binary.BigEndian, &req.Partition); err != nil {
 		return nil, fmt.Errorf("read partition failed: %v", err)
 	}
@@ -93,7 +92,7 @@ func ReadProduceRequest(r io.Reader) (*ProduceRequest, error) {
 		return nil, fmt.Errorf("read compression failed: %v", err)
 	}
 
-	// 读取消息集合
+	// Read message set
 	var msgSetSize int32
 	if err := binary.Read(r, binary.BigEndian, &msgSetSize); err != nil {
 		return nil, fmt.Errorf("read message set size failed: %v", err)
@@ -126,30 +125,27 @@ func ReadProduceRequest(r io.Reader) (*ProduceRequest, error) {
 
 // WriteProduceResponse 将响应编码到网络连接
 func (res *ProduceResponse) Write(w io.Writer) error {
-	buf := new(bytes.Buffer)
+	// 先写入总长度前缀 (8 + 2 = 10 bytes)
+	responseLen := int32(8 + 2) // BaseOffset(8) + ErrorCode(2)
+	if err := binary.Write(w, binary.BigEndian, responseLen); err != nil {
+		return err
+	}
 
 	// 写入BaseOffset和ErrorCode
-	if err := binary.Write(buf, binary.BigEndian, res.BaseOffset); err != nil {
+	if err := binary.Write(w, binary.BigEndian, res.BaseOffset); err != nil {
 		return err
 	}
-	if err := binary.Write(buf, binary.BigEndian, res.ErrorCode); err != nil {
-		return err
-	}
-
-	// 写入总长度前缀
-	totalLen := int32(buf.Len())
-	if err := binary.Write(w, binary.BigEndian, totalLen); err != nil {
+	if err := binary.Write(w, binary.BigEndian, res.ErrorCode); err != nil {
 		return err
 	}
 
-	_, err := w.Write(buf.Bytes())
-	return err
+	return nil
 }
 
 // --- 请求处理逻辑 ---
 
 // HandleProduceRequest 处理生产请求的入口函数
-func HandleProduceRequest(conn io.ReadWriter) error {
+func HandleProduceRequest(conn io.ReadWriter, manager *metadata.Manager) error {
 	// 1. 读取并解码请求
 	req, err := ReadProduceRequest(conn)
 	if err != nil {
@@ -164,28 +160,19 @@ func HandleProduceRequest(conn io.ReadWriter) error {
 		return writeErrorResponse(conn, 6) // 6=INVALID_MESSAGE
 	}
 
-	// 3. 获取目标分区
-	partition, err := metadata.GetPartition(req.Topic, int32(req.Partition))
-	if err != nil {
-		return writeErrorResponse(conn, 5) // 5=UNKNOWN_PARTITION
-	}
-
-	// 4. 追加消息到存储（加锁保证线程安全）
+	// 3. 批量写入消息到Manager
 	var firstOffset int64 = -1
-	partition.Mu.Lock()
-	defer partition.Mu.Unlock()
-
 	for _, msg := range req.Messages {
-		offset, err := partition.Segments[0].Append(msg)
+		offset, err := manager.WriteMessage(req.Topic, req.Partition, msg)
 		if err != nil {
-			return writeErrorResponse(conn, 7) // 7=MESSAGE_TOO_LARGE
+			return writeErrorResponse(conn, 7) // 7=MESSAGE_TOO_LARGE或其他错误
 		}
 		if firstOffset == -1 {
 			firstOffset = offset
 		}
 	}
 
-	// 5. 返回成功响应
+	// 4. 返回成功响应
 	response := &ProduceResponse{
 		BaseOffset: firstOffset,
 		ErrorCode:  0,
@@ -199,4 +186,56 @@ func writeErrorResponse(w io.Writer, errorCode int16) error {
 		ErrorCode: errorCode,
 	}
 	return response.Write(w)
+}
+
+func HandleCreateTopicRequest(conn net.Conn, manager *metadata.Manager) {
+	// 1. 读取协议版本
+	var version int16
+	if err := binary.Read(conn, binary.BigEndian, &version); err != nil {
+		writeErrorResponse(conn, 1) // 1为自定义错误码
+		return
+	}
+
+	// 2. 读取 topic 名长度
+	var nameLen int16
+	if err := binary.Read(conn, binary.BigEndian, &nameLen); err != nil {
+		writeErrorResponse(conn, 1) // 1为自定义错误码
+		return
+	}
+
+	// 3. 读取 topic 名
+	nameBuf := make([]byte, nameLen)
+	if _, err := io.ReadFull(conn, nameBuf); err != nil {
+		writeErrorResponse(conn, 1) // 1为自定义错误码
+		return
+	}
+	topicName := string(nameBuf)
+
+	// 4. 读取分区数
+	var partitions int32
+	if err := binary.Read(conn, binary.BigEndian, &partitions); err != nil {
+		writeErrorResponse(conn, 1) // 1为自定义错误码
+		return
+	}
+
+	// 5. 读取副本数（可选）
+	var replicas int32 = 1
+	binary.Read(conn, binary.BigEndian, &replicas) // 忽略错误，默认1
+
+	// 6. 创建 topic
+	_, err := manager.CreateTopic(topicName, &metadata.TopicConfig{
+		Partitions: partitions,
+		Replicas:   replicas,
+	})
+	if err != nil {
+		writeErrorResponse(conn, 1) // 1为自定义错误码
+		return
+	}
+
+	// 7. 返回成功响应
+	writeSuccessResponse(conn)
+}
+
+func writeSuccessResponse(conn net.Conn) {
+	writeErrorResponse(conn, 0) // 0 表示成功
 }

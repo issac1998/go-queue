@@ -5,9 +5,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"go-queue/internal/metadata"
-	"go-queue/internal/storage"
 	"io"
+
+	"github.com/issac1998/go-queue/internal/metadata"
+	"github.com/issac1998/go-queue/internal/storage"
 )
 
 type FetchRequest struct {
@@ -32,7 +33,7 @@ type FetchResponse struct {
 func ReadFetchRequest(r io.Reader) (*FetchRequest, error) {
 	req := &FetchRequest{}
 
-	// 1. 读取协议版本
+	// 1. Read protocol version
 	var version int16
 	if err := binary.Read(r, binary.BigEndian, &version); err != nil {
 		return nil, fmt.Errorf("failed to read protocol version: %v", err)
@@ -41,7 +42,7 @@ func ReadFetchRequest(r io.Reader) (*FetchRequest, error) {
 		return nil, fmt.Errorf("unsupported protocol version: %d", version)
 	}
 
-	// 2. 读取Topic
+	// 2. Read topic
 	var topicLen int16
 	if err := binary.Read(r, binary.BigEndian, &topicLen); err != nil {
 		return nil, fmt.Errorf("failed to read topic length: %v", err)
@@ -52,7 +53,7 @@ func ReadFetchRequest(r io.Reader) (*FetchRequest, error) {
 	}
 	req.Topic = string(topicBytes)
 
-	// 3. 读取Partition、Offset、MaxBytes
+	// 3. Read Partition, Offset, MaxBytes
 	if err := binary.Read(r, binary.BigEndian, &req.Partition); err != nil {
 		return nil, fmt.Errorf("failed to read partition: %v", err)
 	}
@@ -63,7 +64,7 @@ func ReadFetchRequest(r io.Reader) (*FetchRequest, error) {
 		return nil, fmt.Errorf("failed to read max bytes: %v", err)
 	}
 
-	// 4. 验证MaxBytes限制
+	// 4. Validate MaxBytes limit
 	if req.MaxBytes > MaxFetchBytesLimit {
 		req.MaxBytes = MaxFetchBytesLimit
 	} else if req.MaxBytes <= 0 {
@@ -82,6 +83,7 @@ func (res *FetchResponse) Write(w io.Writer) error {
 	binary.Write(headerBuf, binary.BigEndian, res.Partition)
 	binary.Write(headerBuf, binary.BigEndian, res.ErrorCode)
 	binary.Write(headerBuf, binary.BigEndian, res.NextOffset)
+	binary.Write(headerBuf, binary.BigEndian, int32(len(res.Messages))) // 添加消息数量
 
 	// 2. 写入消息集合
 	var messagesBuf bytes.Buffer
@@ -110,43 +112,20 @@ func (res *FetchResponse) Write(w io.Writer) error {
 // --- 核心消费逻辑 ---
 
 // HandleFetchRequest 处理消费请求
-func HandleFetchRequest(conn io.ReadWriteCloser) error {
-	defer conn.Close()
-
+func HandleFetchRequest(conn io.ReadWriteCloser, manager *metadata.Manager) error {
 	// 1. 解析请求
 	req, err := ReadFetchRequest(conn)
 	if err != nil {
 		return sendFetchError(conn, ErrorInvalidRequest, err.Error())
 	}
 
-	// 2. 获取分区
-	partition, err := metadata.GetPartition(req.Topic, req.Partition)
-	if err != nil {
-		return sendFetchError(conn, ErrorUnknownPartition,
-			fmt.Sprintf("partition %d not found", req.Partition))
-	}
-
-	// 3. 获取分区读锁
-	partition.Mu.RLock()
-	defer partition.Mu.RUnlock()
-
-	// 4. 定位到指定偏移量
-	segment, startPos, err := findSegmentAndPosition(partition, req.Offset)
+	// 2. 从Manager读取消息
+	messages, nextOffset, err := manager.ReadMessage(req.Topic, req.Partition, req.Offset, req.MaxBytes)
 	if err != nil {
 		return sendFetchError(conn, ErrorOffsetOutOfRange, err.Error())
 	}
 
-	// 5. 读取消息
-	messages, nextOffset, err := readMessagesFromSegment(
-		segment,
-		startPos,
-		int64(req.MaxBytes),
-	)
-	if err != nil {
-		return sendFetchError(conn, ErrorFetchFailed, err.Error())
-	}
-
-	// 6. 构造响应
+	// 3. 构造响应
 	response := &FetchResponse{
 		Topic:      req.Topic,
 		Partition:  req.Partition,

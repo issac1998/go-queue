@@ -13,49 +13,52 @@ import (
 
 const (
 	IndexEntrySize = 16   // 8 bytes offset + 8 bytes position
-	IndexInterval  = 1024 // 每1KB写入一个索引条目
+	IndexInterval  = 1024 // Write one index entry per 1KB
 )
 
-// Segment 表示一个日志段，包含消息数据和索引
+// Segment represents a log segment containing message data and indexes
 type Segment struct {
-	// --- 基础元数据 ---
-	BaseOffset int64 // 当前 Segment 的起始 Offset
-	EndOffset  int64 // 当前 Segment 的结束 Offset
-	MaxBytes   int64 // Segment 的最大容量
-	IsActive   bool  // 是否为活跃 Segment
+	// --- Basic metadata ---
+	BaseOffset int64 // Starting offset of current Segment
+	EndOffset  int64 // Ending offset of current Segment
+	MaxBytes   int64 // Maximum capacity of Segment
+	IsActive   bool  // Whether this is an active Segment
 
-	// --- 文件句柄 ---
-	LogFile       *os.File // 日志文件
-	IndexFile     *os.File // 索引文件
-	TimeIndexFile *os.File // 时间索引文件
+	// --- File handles ---
+	LogFile       *os.File // Log file
+	IndexFile     *os.File // Index file
+	TimeIndexFile *os.File // Time index file
 
-	DataDir string // 数据目录
+	DataDir string // Data directory
 
-	// --- 并发控制 ---
+	// --- Concurrency control ---
 	Mu sync.RWMutex
 
-	// --- 内存缓存 ---
-	IndexEntries []IndexEntry // 内存中的索引条目
-	CurrentSize  int64        // 当前日志文件大小
-	LastSynced   int64        // 最后持久化的位置
+	// --- Memory cache ---
+	IndexEntries []IndexEntry // Index entries in memory
+	CurrentSize  int64        // Current log file size
+	LastSynced   int64        // Last persisted position
 
-	// --- 统计信息 ---
-	WriteCount    int64     // 写入次数
-	ReadCount     int64     // 读取次数
-	LastWriteTime time.Time // 最后写入时间
-	LastReadTime  time.Time // 最后读取时间
+	// --- Statistics ---
+	WriteCount    int64     // Write count
+	ReadCount     int64     // Read count
+	LastWriteTime time.Time // Last write time
+	LastReadTime  time.Time // Last read time
+
+	MinTimestamp time.Time
+	MaxTimestamp time.Time
 }
 
-// IndexEntry 索引条目
+// IndexEntry index entry
 type IndexEntry struct {
-	Offset   int64 // 消息Offset
-	Position int64 // 在日志文件中的位置
-	TimeMs   int64 // 消息时间戳（毫秒）
+	Offset   int64 // Message offset
+	Position int64 // Position in log file
+	TimeMs   int64 // Message timestamp (milliseconds)
 }
 
-// Append
+// NewSegment creates a new segment
 func NewSegment(dir string, baseOffset int64, maxBytes int64) (*Segment, error) {
-	// 创建目录（如果不存在）
+	// Create directory (if not exists)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("create directory failed: %v", err)
 	}
@@ -64,20 +67,20 @@ func NewSegment(dir string, baseOffset int64, maxBytes int64) (*Segment, error) 
 	indexPath := filepath.Join(dir, fmt.Sprintf("%020d.index", baseOffset))
 	timeIndexPath := filepath.Join(dir, fmt.Sprintf("%020d.timeindex", baseOffset))
 
-	// 打开日志文件
+	// Open log file
 	logFile, err := os.OpenFile(logPath, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("open log file failed: %v", err)
 	}
 
-	// 打开索引文件
+	// Open index file
 	indexFile, err := os.OpenFile(indexPath, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		logFile.Close()
 		return nil, fmt.Errorf("open index file failed: %v", err)
 	}
 
-	// 打开时间索引文件
+	// Open time index file
 	timeIndexFile, err := os.OpenFile(timeIndexPath, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		logFile.Close()
@@ -85,7 +88,7 @@ func NewSegment(dir string, baseOffset int64, maxBytes int64) (*Segment, error) 
 		return nil, fmt.Errorf("open time index file failed: %v", err)
 	}
 
-	// 获取当前日志文件大小
+	// Get current log file size
 	stat, err := logFile.Stat()
 	if err != nil {
 		logFile.Close()
@@ -108,56 +111,84 @@ func NewSegment(dir string, baseOffset int64, maxBytes int64) (*Segment, error) 
 		LastReadTime:  time.Now(),
 	}
 
-	// 加载现有索引
+	// Load existing index
 	if err := segment.loadIndex(); err != nil {
 		segment.Close()
 		return nil, fmt.Errorf("load index failed: %v", err)
+	}
+
+	// Update WriteCount based on loaded index entries
+	if len(segment.IndexEntries) > 0 {
+		// WriteCount should be equal to the number of index entries
+		segment.WriteCount = int64(len(segment.IndexEntries))
+		// Update EndOffset
+		lastEntry := segment.IndexEntries[len(segment.IndexEntries)-1]
+		segment.EndOffset = lastEntry.Offset
 	}
 
 	return segment, nil
 
 }
 
-// loadIndex 从索引文件加载索引条目到内存
+// loadIndex loads index entries from the index file into memory
 func (s *Segment) loadIndex() error {
 	stat, err := s.IndexFile.Stat()
 	if err != nil {
 		return err
 	}
 
-	// 计算索引条目数量
+	// Calculate the number of index entries (each entry is 16 bytes: offset+position)
 	numEntries := stat.Size() / IndexEntrySize
 	s.IndexEntries = make([]IndexEntry, 0, numEntries)
 
-	// 读取所有索引条目
+	// If the file is empty, return directly
+	if stat.Size() == 0 {
+		return nil
+	}
+
+	// Reset file pointer to the beginning
+	if _, err := s.IndexFile.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("seek index file failed: %v", err)
+	}
+
+	// Read all index entries (only read offset and position)
 	for i := int64(0); i < numEntries; i++ {
 		var entry IndexEntry
 		if err := binary.Read(s.IndexFile, binary.BigEndian, &entry.Offset); err != nil {
-			return err
+			return fmt.Errorf("read offset failed at entry %d: %v", i, err)
 		}
 		if err := binary.Read(s.IndexFile, binary.BigEndian, &entry.Position); err != nil {
-			return err
+			return fmt.Errorf("read position failed at entry %d: %v", i, err)
 		}
+		// TimeMs field is not read from the index file during loading because it was not stored in old versions
+		entry.TimeMs = 0
 		s.IndexEntries = append(s.IndexEntries, entry)
+
 	}
 
 	return nil
 }
 
-// Append 追加消息到日志段
-func (s *Segment) Append(msg []byte) (offset int64, err error) {
+// Append appends a message to the segment
+func (s *Segment) Append(msg []byte, timestamp time.Time) (offset int64, err error) {
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
 
-	// 检查是否超过最大容量
+	// Check if exceeding maximum capacity
 	if s.CurrentSize+int64(len(msg)+4) > s.MaxBytes {
 		return 0, errors.New("segment is full")
 	}
 
-	// 计算消息的offset
-	offset = s.BaseOffset + s.CurrentSize
+	// Calculate message offset (using message count, not byte count)
+	offset = s.BaseOffset + s.WriteCount
 
-	// 写入消息长度和内容
+	// Get current file position
+	currentFilePos, err := s.LogFile.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return 0, fmt.Errorf("get file position failed: %v", err)
+	}
+
+	// Write message length and content
 	if err := binary.Write(s.LogFile, binary.BigEndian, int32(len(msg))); err != nil {
 		return 0, fmt.Errorf("write message length failed: %v", err)
 	}
@@ -165,87 +196,94 @@ func (s *Segment) Append(msg []byte) (offset int64, err error) {
 		return 0, fmt.Errorf("write message content failed: %v", err)
 	}
 
-	// 更新当前大小
-	s.CurrentSize += int64(len(msg) + 4)
-	s.WriteCount++
-
-	// 每隔一定间隔写入索引条目
-	if s.CurrentSize%IndexInterval == 0 {
-		pos, err := s.LogFile.Seek(0, io.SeekCurrent)
-		if err != nil {
-			return 0, fmt.Errorf("get current position failed: %v", err)
-		}
-
-		// 写入索引条目
-		if err := binary.Write(s.IndexFile, binary.BigEndian, offset); err != nil {
-			return 0, fmt.Errorf("write index offset failed: %v", err)
-		}
-		if err := binary.Write(s.IndexFile, binary.BigEndian, pos); err != nil {
-			return 0, fmt.Errorf("write index position failed: %v", err)
-		}
-
-		// 添加到内存索引
-		s.IndexEntries = append(s.IndexEntries, IndexEntry{
-			Offset:   offset,
-			Position: pos,
-		})
+	// Force write index entry (index is established for each message)
+	if err := binary.Write(s.IndexFile, binary.BigEndian, offset); err != nil {
+		return 0, fmt.Errorf("write index offset failed: %v", err)
 	}
+	if err := binary.Write(s.IndexFile, binary.BigEndian, currentFilePos); err != nil {
+		return 0, fmt.Errorf("write index position failed: %v", err)
+	}
+
+	// Add to memory index
+	entry := IndexEntry{
+		Offset:   offset,
+		Position: currentFilePos,
+		TimeMs:   timestamp.UnixMilli(),
+	}
+	s.IndexEntries = append(s.IndexEntries, entry)
+
+	// Update timestamp range
+	if s.MinTimestamp.IsZero() || timestamp.Before(s.MinTimestamp) {
+		s.MinTimestamp = timestamp
+	}
+	if timestamp.After(s.MaxTimestamp) {
+		s.MaxTimestamp = timestamp
+	}
+
+	// Update counters and size
+	s.WriteCount++
+	s.CurrentSize += int64(len(msg) + 4)
+	s.EndOffset = offset
 
 	return offset, nil
 }
 
-// FindPosition 通过Offset查找文件位置
+// FindPosition finds the file position by offset
 func (s *Segment) FindPosition(offset int64) (int64, error) {
 	s.Mu.RLock()
 	defer s.Mu.RUnlock()
 
-	// 检查offset是否在范围内
-	if offset < s.BaseOffset || offset >= s.BaseOffset+s.CurrentSize {
+	// Check if offset is within range (using message count range)
+	if offset < s.BaseOffset || offset > s.BaseOffset+s.WriteCount {
 		return 0, errors.New("offset out of range")
 	}
 
-	// 二分查找最近的索引条目
-	left := 0
-	right := len(s.IndexEntries) - 1
-	var nearestEntry IndexEntry
+	// If no index entries, start from the beginning of the file
+	if len(s.IndexEntries) == 0 {
+		return 0, nil
+	}
 
-	for left <= right {
-		mid := left + (right-left)/2
-		if s.IndexEntries[mid].Offset == offset {
-			return s.IndexEntries[mid].Position, nil
-		} else if s.IndexEntries[mid].Offset < offset {
-			nearestEntry = s.IndexEntries[mid]
-			left = mid + 1
-		} else {
-			right = mid - 1
+	// Precise index entry lookup
+	for _, entry := range s.IndexEntries {
+		if entry.Offset == offset {
+			return entry.Position, nil
 		}
 	}
 
-	// 如果没有找到精确匹配，从最近的索引条目开始扫描
-	if nearestEntry.Offset == 0 {
-		return s.BaseOffset, nil
+	// If no exact match found, find the index entry closest to and less than the target offset
+	var bestEntry *IndexEntry
+	for i := len(s.IndexEntries) - 1; i >= 0; i-- {
+		if s.IndexEntries[i].Offset <= offset {
+			bestEntry = &s.IndexEntries[i]
+			break
+		}
 	}
 
-	return nearestEntry.Position, nil
+	if bestEntry != nil {
+		return bestEntry.Position, nil
+	}
+
+	// If no suitable index entry, start from the beginning of the file
+	return 0, nil
 }
 
-// ReadAt 从指定位置读取数据
+// ReadAt reads data from a specified position
 func (s *Segment) ReadAt(pos int64, buf []byte) (int, error) {
 	s.Mu.RLock()
 	defer s.Mu.RUnlock()
 
-	// 检查位置是否有效
-	if pos < 0 || pos >= s.CurrentSize {
+	// Check if position is valid (pos should be file position, not compared to CurrentSize)
+	if pos < 0 {
 		return 0, errors.New("invalid position")
 	}
 
-	// 定位到指定位置
+	// Seek to the specified position
 	if _, err := s.LogFile.Seek(pos, io.SeekStart); err != nil {
 		return 0, fmt.Errorf("seek failed: %v", err)
 	}
 
-	// 读取数据
-	n, err := io.ReadFull(s.LogFile, buf)
+	// Read data
+	n, err := s.LogFile.Read(buf)
 	if err != nil && err != io.EOF {
 		return n, fmt.Errorf("read failed: %v", err)
 	}
@@ -253,14 +291,14 @@ func (s *Segment) ReadAt(pos int64, buf []byte) (int, error) {
 	return n, nil
 }
 
-// Close 关闭Segment
+// Close closes the Segment
 func (s *Segment) Close() error {
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
 
 	var errs []error
 
-	// 关闭所有文件
+	// Close all files
 	if s.LogFile != nil {
 		if err := s.LogFile.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("close log file failed: %v", err))
@@ -283,7 +321,7 @@ func (s *Segment) Close() error {
 	return nil
 }
 
-// Sync 将数据同步到磁盘
+// Sync synchronizes data to disk
 func (s *Segment) Sync() error {
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
@@ -296,4 +334,24 @@ func (s *Segment) Sync() error {
 	}
 	s.LastSynced = s.CurrentSize
 	return nil
+}
+
+// PurgeBefore removes index entries and (optionally) data before the given time.
+// This is a minimal stub; you should implement actual data deletion as needed.
+func (s *Segment) PurgeBefore(expireBefore time.Time) {
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+	newEntries := s.IndexEntries[:0]
+	for _, entry := range s.IndexEntries {
+		if time.UnixMilli(entry.TimeMs).After(expireBefore) {
+			newEntries = append(newEntries, entry)
+		}
+	}
+	s.IndexEntries = newEntries
+	// Optionally, update MinTimestamp
+	if len(s.IndexEntries) > 0 {
+		s.MinTimestamp = time.UnixMilli(s.IndexEntries[0].TimeMs)
+	} else {
+		s.MinTimestamp = time.Time{}
+	}
 }
