@@ -1,0 +1,13 @@
+{
+  "broker": "localhost:9092",
+  "timeout": "10s",
+  "log_file": "",
+  "command": {
+    "type": "",
+    "topic": "",
+    "partition": 0,
+    "message": "",
+    "offset": 0,
+    "count": 1
+  }
+} 
