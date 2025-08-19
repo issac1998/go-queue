@@ -40,6 +40,9 @@ type Manager struct {
 	Deduplicator         *deduplication.Deduplicator
 	CompressionEnabled   bool
 	DeduplicationEnabled bool
+
+	// Consumer Groups
+	ConsumerGroups *ConsumerGroupManager
 }
 
 type TopicConfig struct {
@@ -158,6 +161,9 @@ func NewManager(config *Config) (*Manager, error) {
 		Deduplicator:         deduplicator,
 		CompressionEnabled:   config.CompressionEnabled,
 		DeduplicationEnabled: config.DeduplicationEnabled,
+
+		// 消费者组管理
+		ConsumerGroups: NewConsumerGroupManager(),
 	}
 
 	// 初始化统计信息
@@ -464,6 +470,8 @@ func (m *Manager) startBackgroundTasks() {
 	go m.cleanupTask()
 
 	go m.statsUpdateTask()
+
+	go m.consumerGroupCleanupTask()
 
 }
 
@@ -793,5 +801,20 @@ func (p *Partition) Flush() {
 	defer p.Mu.RUnlock()
 	for _, segment := range p.Segments {
 		segment.Sync()
+	}
+}
+
+// consumerGroupCleanupTask 消费者组清理任务
+func (m *Manager) consumerGroupCleanupTask() {
+	ticker := time.NewTicker(30 * time.Second) // 每30秒检查一次
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			m.ConsumerGroups.CleanupExpiredConsumers()
+		case <-m.ctx.Done():
+			return
+		}
 	}
 }

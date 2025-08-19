@@ -16,7 +16,8 @@ const (
 	// CompressionNone decides compress or not
 	CompressionNone = 0x00
 	// CompressionNone decides compress or not
-	FetchRequestType     = 0x01
+	FetchRequestType = 0x01
+
 	DefaultMaxFetchBytes = 1 << 20
 	MaxFetchBytesLimit   = 5 << 20
 
