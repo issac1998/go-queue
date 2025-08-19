@@ -11,6 +11,8 @@ import (
 	"github.com/issac1998/go-queue/internal/storage"
 )
 
+const FetchRequestType = 0x01
+
 type FetchRequest struct {
 	Topic     string
 	Partition int32
@@ -48,7 +50,6 @@ func ReadFetchRequest(r io.Reader) (*FetchRequest, error) {
 		return nil, fmt.Errorf("failed to read topic: %v", err)
 	}
 	req.Topic = string(topicBytes)
-
 
 	if err := binary.Read(r, binary.BigEndian, &req.Partition); err != nil {
 		return nil, fmt.Errorf("failed to read partition: %v", err)

@@ -13,9 +13,14 @@ import (
 )
 
 const (
-	produceRequest     = 0
-	fetchRequest       = 1 
-	createTopicRequest = 2 
+	produceRequest      = 0
+	fetchRequest        = 1
+	createTopicRequest  = 2
+	joinGroupRequest    = 3
+	leaveGroupRequest   = 4
+	heartbeatRequest    = 5
+	commitOffsetRequest = 6
+	fetchOffsetRequest  = 7
 )
 
 var manager *metadata.Manager
@@ -104,6 +109,31 @@ func handleConnection(conn net.Conn) {
 	case createTopicRequest:
 		log.Printf("Handling createTopic request")
 		protocol.HandleCreateTopicRequest(conn, manager)
+	case joinGroupRequest:
+		log.Printf("Handling joinGroup request")
+		if err := protocol.HandleJoinGroupRequest(conn, manager); err != nil {
+			log.Printf("Failed to handle joinGroup request: %v", err)
+		}
+	case leaveGroupRequest:
+		log.Printf("Handling leaveGroup request")
+		if err := protocol.HandleLeaveGroupRequest(conn, manager); err != nil {
+			log.Printf("Failed to handle leaveGroup request: %v", err)
+		}
+	case heartbeatRequest:
+		log.Printf("Handling heartbeat request")
+		if err := protocol.HandleHeartbeatRequest(conn, manager); err != nil {
+			log.Printf("Failed to handle heartbeat request: %v", err)
+		}
+	case commitOffsetRequest:
+		log.Printf("Handling commitOffset request")
+		if err := protocol.HandleCommitOffsetRequest(conn, manager); err != nil {
+			log.Printf("Failed to handle commitOffset request: %v", err)
+		}
+	case fetchOffsetRequest:
+		log.Printf("Handling fetchOffset request")
+		if err := protocol.HandleFetchOffsetRequest(conn, manager); err != nil {
+			log.Printf("Failed to handle fetchOffset request: %v", err)
+		}
 	default:
 		log.Printf("Unknown request type: %d", reqType)
 	}

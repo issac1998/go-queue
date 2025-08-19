@@ -250,13 +250,47 @@ func NewAdmin(client *Client) *Admin
 func (a *Admin) CreateTopic(req CreateTopicRequest) (*CreateTopicResult, error)
 ```
 
+### Consumer Groups (消费者组)
+
+```go
+// 创建消费者组消费者
+groupConsumer := client.NewGroupConsumer(c, client.GroupConsumerConfig{
+    GroupID:        "my-consumer-group",
+    ConsumerID:     "consumer-1", 
+    Topics:         []string{"my-topic"},
+    SessionTimeout: 30 * time.Second,
+})
+
+// 加入消费者组
+err := groupConsumer.JoinGroup()
+if err != nil {
+    log.Fatal(err)
+}
+
+// 查看分区分配
+assignment := groupConsumer.GetAssignment()
+fmt.Printf("Assigned partitions: %v\n", assignment)
+
+// 提交offset
+err = groupConsumer.CommitOffset("my-topic", 0, 100, "")
+if err != nil {
+    log.Fatal(err)
+}
+
+// 离开消费者组
+defer groupConsumer.LeaveGroup()
+```
+
 ## 🎯 完整示例
 
-查看 `examples/simple/main.go` 获取完整的使用示例。
+查看示例获取完整的使用示例：
 
 ```bash
-# 运行示例
+# 基础功能示例
 go run examples/simple/main.go
+
+# Consumer Groups示例
+go run examples/consumer_groups/main.go
 ```
 
 ## 🔮 架构说明
@@ -279,14 +313,17 @@ go run examples/simple/main.go
 - ✅ 持久化存储
 - ✅ 客户端SDK
 - ✅ 命令行工具
+- ✅ 消费者组（Consumer Groups）
+- ✅ 自动分区分配和重平衡
+- ✅ Offset管理和提交
+- ✅ 心跳和故障检测
 
 计划实现的功能：
-- ⏳ 消费者组（Consumer Group）
 - ⏳ 多Broker集群支持
 - ⏳ 数据副本和故障恢复
-- ⏳ 消息压缩
 - ⏳ HTTP API接口
 - ⏳ 监控和度量指标
+- ⏳ 更多分区分配策略
 
 ## 🤝 贡献
 

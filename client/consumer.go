@@ -2,9 +2,11 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
+	"time"
 )
 
 // Consumer message consumer
@@ -187,10 +189,16 @@ func (c *Consumer) parseFetchResponse(topic string, partition int32, requestOffs
 }
 
 // Subscribe simple consumer subscription (starting from latest position)
-func (c *Consumer) Subscribe(topic string, partition int32, handler func(Message) error) error {
-	offset := int64(0) // Start from beginning, in actual applications offset should be saved
+func (c *Consumer) Subscribe(ctx context.Context, topic string, partition int32, handler func(Message) error) error {
+	offset := int64(0)
 
 	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		result, err := c.FetchFrom(topic, partition, offset)
 		if err != nil {
 			return fmt.Errorf("failed to fetch messages: %v", err)
@@ -208,15 +216,10 @@ func (c *Consumer) Subscribe(topic string, partition int32, handler func(Message
 		}
 
 		if len(result.Messages) == 0 {
-			// TODO: waiting new message.
-			break
-		}
-
-		// Update offset to next position
+			time.Sleep(100 * time.Millisecond)
+		} // Update offset to next position
 		if result.NextOffset > offset {
 			offset = result.NextOffset
 		}
 	}
-
-	return nil
 }
