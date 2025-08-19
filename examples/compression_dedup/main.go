@@ -6,14 +6,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/issac1998/go-queue/pkg/client"
+	"github.com/issac1998/go-queue/client"
 )
 
 func main() {
 	fmt.Println("🔧 Go Queue 压缩和去重功能演示")
 	fmt.Println(strings.Repeat("=", 60))
 
-	client := client.NewClient(client.ClientConfig{
+	c := client.NewClient(client.ClientConfig{
 		BrokerAddr: "localhost:9092",
 		Timeout:    10 * time.Second,
 	})
@@ -22,7 +22,7 @@ func main() {
 
 	// 1. 创建主题
 	fmt.Println("\n📝 1. 创建演示主题")
-	admin := client.NewAdmin(client)
+	admin := client.NewAdmin(c)
 	result, err := admin.CreateTopic(client.CreateTopicRequest{
 		Name:       testTopicName,
 		Partitions: 1,
@@ -38,8 +38,8 @@ func main() {
 	}
 
 	time.Sleep(1 * time.Second)
-	producer := client.NewProducer(client)
-	consumer := client.NewConsumer(client)
+	producer := client.NewProducer(c)
+	consumer := client.NewConsumer(c)
 
 	// 2. 测试压缩功能
 	fmt.Println("\n🗜️ 2. 测试消息压缩功能")
