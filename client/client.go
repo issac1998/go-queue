@@ -76,7 +76,7 @@ func (c *Client) sendRequest(requestType int32, requestData []byte) ([]byte, err
 	// Calculate actual data length based on protocol
 	actualDataLen := responseLen
 	if requestType == FetchRequestType {
-		// For fetch requests, response length includes the 4-byte length header itself
+		// For fetch requests, response length includes the 4-byte 
 		actualDataLen = responseLen - 4
 		if actualDataLen < 0 {
 			return nil, fmt.Errorf("invalid response length: %d", responseLen)
