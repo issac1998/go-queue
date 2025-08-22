@@ -17,10 +17,10 @@ import (
 	"github.com/issac1998/go-queue/internal/storage"
 )
 
-// Manager defines the manager of the message queue system
+// Manager defines the manager of the message queue system that coordinates
+// all operations including topic management, message storage, and consumer groups
 type Manager struct {
 	Config *Config
-	// preserver for cluster
 	IsRunning bool
 
 	Topics map[string]*Topic
@@ -41,26 +41,27 @@ type Manager struct {
 	CompressionEnabled   bool
 	DeduplicationEnabled bool
 
-	// Consumer Groups
 	ConsumerGroups *ConsumerGroupManager
-
 }
 
+// TopicConfig contains configuration parameters for creating a topic
 type TopicConfig struct {
 	Partitions int32
-	Replicas   int32
+	// Replicas is the number of replicas per partition (for future cluster support)
+	Replicas int32
 }
 
+// Config contains all system configuration parameters
 type Config struct {
-	DataDir            string        `json:"data_dir"`
-	MaxTopicPartitions int           `json:"max_topic_partitions"`
-	SegmentSize        int64         `json:"segment_size"`
-	RetentionTime      time.Duration `json:"retention_time"`
-	MaxStorageSize     int64         `json:"max_storage_size"`
+	DataDir string `json:"data_dir"`
+	MaxTopicPartitions int `json:"max_topic_partitions"`
+	SegmentSize int64 `json:"segment_size"`
+	RetentionTime time.Duration `json:"retention_time"`
+	MaxStorageSize int64 `json:"max_storage_size"`
 
-	FlushInterval   time.Duration `json:"flush_interval"`
+	FlushInterval time.Duration `json:"flush_interval"`
 	CleanupInterval time.Duration `json:"cleanup_interval"`
-	MaxMessageSize  int           `json:"max_message_size"`
+	MaxMessageSize int `json:"max_message_size"`
 
 	// Compression configuration
 	CompressionEnabled   bool                        `json:"compression_enabled"`
@@ -72,7 +73,7 @@ type Config struct {
 	DeduplicationConfig  *deduplication.Config `json:"deduplication_config"`
 }
 
-// SystemStats system statistics
+// SystemStats contains system-wide statistics
 type SystemStats struct {
 	mu sync.RWMutex
 
@@ -94,7 +95,7 @@ type SystemStats struct {
 	Uptime         time.Duration `json:"uptime"`
 }
 
-// Metrics monitoring metrics
+// Metrics contains monitoring and performance metrics
 type Metrics struct {
 	mu sync.RWMutex
 
@@ -113,20 +114,49 @@ type Metrics struct {
 	CPUUsage    float64 `json:"cpu_usage"`
 }
 
-// NewManager
+// TopicInfo contains detailed information about a topic
+type TopicInfo struct {
+	Name             string
+	Partitions       int32
+	Replicas         int32
+	CreatedAt        time.Time
+	Size             int64
+	MessageCount     int64
+	PartitionDetails []PartitionInfo
+}
+
+// PartitionInfo contains detailed information about a partition
+type PartitionInfo struct {
+	ID           int32
+	Leader       int32
+	Replicas     []int32
+	ISR          []int32
+	Size         int64
+	MessageCount int64
+	StartOffset  int64
+	EndOffset    int64
+}
+
+// SimpleTopicInfo contains basic information about a topic
+type SimpleTopicInfo struct {
+	TopicName    string
+	Partitions   int32
+	MessageCount int64
+	Size         int64
+}
+
+// NewManager creates a new Manager instance with the given configuration
 func NewManager(config *Config) (*Manager, error) {
 	if err := validateConfig(config); err != nil {
 		return nil, fmt.Errorf("invalid config: %v", err)
 	}
 
-	// 创建数据目录
 	if err := os.MkdirAll(config.DataDir, 0755); err != nil {
 		return nil, fmt.Errorf("create data directory failed: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// 初始化压缩器
 	var compressor compression.Compressor
 	if config.CompressionEnabled {
 		var err error
@@ -138,7 +168,6 @@ func NewManager(config *Config) (*Manager, error) {
 		compressor, _ = compression.GetCompressor(compression.None)
 	}
 
-	// 初始化去重器
 	var deduplicator *deduplication.Deduplicator
 	if config.DeduplicationEnabled {
 		if config.DeduplicationConfig == nil {
@@ -157,24 +186,21 @@ func NewManager(config *Config) (*Manager, error) {
 			ErrorsByType: make(map[string]int64),
 		},
 
-		// 压缩和去重功能
 		Compressor:           compressor,
 		Deduplicator:         deduplicator,
 		CompressionEnabled:   config.CompressionEnabled,
 		DeduplicationEnabled: config.DeduplicationEnabled,
 
-		// 消费者组管理
 		ConsumerGroups: NewConsumerGroupManager(),
 	}
 
-	// 初始化统计信息
 	manager.Stats.StartTime = time.Now()
 	manager.Stats.LastUpdateTime = time.Now()
 
 	return manager, nil
 }
 
-// Start 启动管理器
+// Start initializes and starts the manager, loading existing data and starting background tasks
 func (m *Manager) Start() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -188,15 +214,13 @@ func (m *Manager) Start() error {
 	return nil
 }
 
-// Stop 停止管理器
+// Stop gracefully shuts down the manager, stopping background tasks and closing resources
 func (m *Manager) Stop() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// 停止后台任务
 	m.stopBackgroundTasks()
 
-	// 关闭所有资源
 	if err := m.closeAllResources(); err != nil {
 		return fmt.Errorf("close resources failed: %v", err)
 	}
@@ -205,7 +229,7 @@ func (m *Manager) Stop() error {
 	return nil
 }
 
-// CreateTopic creat topic
+// CreateTopic creates a new topic with the specified name and configuration
 func (m *Manager) CreateTopic(name string, config *TopicConfig) (*Topic, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -232,13 +256,14 @@ func (m *Manager) CreateTopic(name string, config *TopicConfig) (*Topic, error) 
 	return topic, nil
 }
 
+// NewTopic creates a new Topic instance with the given parameters
 func NewTopic(name string, config *TopicConfig, sysConfig *Config) (*Topic, error) {
 	topic := &Topic{
 		Name:       name,
 		Config:     config,
 		Partitions: make(map[int32]*Partition),
 	}
-	// 创建分区
+
 	for i := int32(0); i < config.Partitions; i++ {
 		partition, err := NewPartition(i, name, sysConfig)
 		if err != nil {
@@ -249,7 +274,7 @@ func NewTopic(name string, config *TopicConfig, sysConfig *Config) (*Topic, erro
 	return topic, nil
 }
 
-// GetPartition 获取分区
+// GetPartition returns a specific partition for a topic
 func (t *Topic) GetPartition(id int32) (*Partition, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -260,7 +285,7 @@ func (t *Topic) GetPartition(id int32) (*Partition, error) {
 	return p, nil
 }
 
-// Close 关闭主题（关闭所有分区）
+// Close closes all partitions in the topic
 func (t *Topic) Close() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -272,7 +297,7 @@ func (t *Topic) Close() error {
 	return nil
 }
 
-// GetTopic 获取主题
+// GetTopic retrieves a topic by name
 func (m *Manager) GetTopic(name string) (*Topic, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -285,7 +310,7 @@ func (m *Manager) GetTopic(name string) (*Topic, error) {
 	return topic, nil
 }
 
-// DeleteTopic 删除主题
+// DeleteTopic removes a topic and all its associated data
 func (m *Manager) DeleteTopic(name string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -295,22 +320,25 @@ func (m *Manager) DeleteTopic(name string) error {
 		return fmt.Errorf("topic %s not found", name)
 	}
 
-	// 关闭主题
 	if err := topic.Close(); err != nil {
-		return fmt.Errorf("close topic failed: %v", err)
+		log.Printf("Warning: failed to close topic %s properly: %v", name, err)
+	}
+
+	topicDataDir := filepath.Join(m.Config.DataDir, name)
+	if err := os.RemoveAll(topicDataDir); err != nil {
+		log.Printf("Warning: failed to remove topic data directory %s: %v", topicDataDir, err)
 	}
 
 	delete(m.Topics, name)
 	m.Stats.TotalTopics--
 
-	// 更新统计信息
 	m.updateStats()
 
 	log.Printf("Topic %s deleted successfully", name)
 	return nil
 }
 
-// ListTopics 列出所有主题
+// ListTopics returns a list of all topic names
 func (m *Manager) ListTopics() []string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -323,7 +351,70 @@ func (m *Manager) ListTopics() []string {
 	return topics
 }
 
-// GetPartition 获取分区
+// ListTopicsDetailed returns detailed information about all topics
+func (m *Manager) ListTopicsDetailed() ([]TopicInfo, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var topicInfos []TopicInfo
+
+	for _, topic := range m.Topics {
+		topic.mu.RLock()
+
+		topicInfo := TopicInfo{
+			Name:             topic.Name,
+			Partitions:       topic.Config.Partitions,
+			Replicas:         topic.Config.Replicas,
+			CreatedAt:        time.Now(),
+			Size:             0,
+			MessageCount:     0,
+			PartitionDetails: make([]PartitionInfo, 0, len(topic.Partitions)),
+		}
+
+		for partitionID, partition := range topic.Partitions {
+			partition.Mu.RLock()
+
+			partitionSize := int64(0)
+			partitionMsgCount := int64(0)
+			startOffset := int64(0)
+			endOffset := int64(0)
+
+			for _, segment := range partition.Segments {
+				if segment != nil {
+					partitionSize += segment.CurrentSize
+					partitionMsgCount += segment.WriteCount
+					if endOffset < segment.BaseOffset+segment.WriteCount {
+						endOffset = segment.BaseOffset + segment.WriteCount
+					}
+				}
+			}
+
+			partitionInfo := PartitionInfo{
+				ID:           partitionID,
+				Leader:       0,
+				Replicas:     []int32{0},
+				ISR:          []int32{0},
+				Size:         partitionSize,
+				MessageCount: partitionMsgCount,
+				StartOffset:  startOffset,
+				EndOffset:    endOffset,
+			}
+
+			topicInfo.PartitionDetails = append(topicInfo.PartitionDetails, partitionInfo)
+			topicInfo.Size += partitionSize
+			topicInfo.MessageCount += partitionMsgCount
+
+			partition.Mu.RUnlock()
+		}
+
+		topicInfos = append(topicInfos, topicInfo)
+		topic.mu.RUnlock()
+	}
+
+	return topicInfos, nil
+}
+
+// GetPartition retrieves a specific partition from a topic
 func (m *Manager) GetPartition(topicName string, partitionID int32) (*Partition, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -341,22 +432,18 @@ func (m *Manager) GetPartition(topicName string, partitionID int32) (*Partition,
 	return partition, nil
 }
 
-// WriteMessage 写入消息
+// WriteMessage writes a message to the specified topic and partition
 func (m *Manager) WriteMessage(topicName string, partitionID int32, message []byte) (int64, error) {
-	// 验证消息大小
 	if len(message) > m.Config.MaxMessageSize {
 		return 0, fmt.Errorf("message too large: %d bytes", len(message))
 	}
 
-	// 检查去重
 	if m.DeduplicationEnabled && m.Deduplicator != nil {
-		// 先获取分区以便获取下一个offset
 		partition, err := m.GetPartition(topicName, partitionID)
 		if err != nil {
 			return 0, err
 		}
 
-		// 计算下一个offset
 		var nextOffset int64
 		if partition.ActiveSeg != nil {
 			nextOffset = partition.ActiveSeg.BaseOffset + partition.ActiveSeg.WriteCount
@@ -364,25 +451,22 @@ func (m *Manager) WriteMessage(topicName string, partitionID int32, message []by
 
 		isDupe, originalOffset, err := m.Deduplicator.IsDuplicate(message, nextOffset)
 		if err != nil {
-			log.Printf("去重检查失败: %v", err)
+			log.Printf("Deduplication check failed: %v", err)
 		} else if isDupe {
-			log.Printf("发现重复消息，返回原始offset: %d", originalOffset)
+			log.Printf("Duplicate message found, returning original offset: %d", originalOffset)
 			return originalOffset, nil
 		}
 	}
 
-	// 处理压缩
 	processedMessage := message
 	if m.CompressionEnabled && len(message) >= m.Config.CompressionThreshold {
 		compressed, err := compression.CompressMessage(message, m.Config.CompressionType)
 		if err != nil {
-			log.Printf("压缩消息失败: %v", err)
-			// 压缩失败时使用原始消息
+			log.Printf("Message compression failed: %v", err)
 		} else {
-			// 只有在压缩效果明显时才使用压缩版本
-			if len(compressed) < len(message)*8/10 { // 压缩率超过20%才使用
+			if len(compressed) < len(message)*8/10 {
 				processedMessage = compressed
-				log.Printf("消息压缩成功: %d -> %d 字节 (压缩率: %.2f%%)",
+				log.Printf("Message compressed: %d -> %d bytes (ratio: %.2f%%)",
 					len(message), len(compressed),
 					float64(len(compressed))/float64(len(message))*100)
 			}
@@ -394,21 +478,19 @@ func (m *Manager) WriteMessage(topicName string, partitionID int32, message []by
 		return 0, err
 	}
 
-	// 写入消息
 	offset, err := partition.Append(processedMessage)
 	if err != nil {
 		m.recordError("write_failed")
 		return 0, fmt.Errorf("write message failed: %v", err)
 	}
 
-	// 更新统计信息
 	m.recordSuccess()
 	m.updateStats()
 
 	return offset, nil
 }
 
-// ReadMessage 读取消息
+// ReadMessage reads messages from the specified topic, partition and offset
 func (m *Manager) ReadMessage(topicName string, partitionID int32, offset int64, maxBytes int32) ([][]byte, int64, error) {
 	partition, err := m.GetPartition(topicName, partitionID)
 	if err != nil {
@@ -420,21 +502,20 @@ func (m *Manager) ReadMessage(topicName string, partitionID int32, offset int64,
 		return nil, 0, err
 	}
 
-	// 解压缩消息
 	if m.CompressionEnabled {
 		decompressedMessages := make([][]byte, 0, len(rawMessages))
 		for _, rawMsg := range rawMessages {
-			// 检查是否是压缩消息（通过查看前5字节的格式）
+
 			if len(rawMsg) >= 5 {
 				decompressed, err := compression.DecompressMessage(rawMsg)
 				if err != nil {
-					// 如果解压失败，可能是未压缩的消息，直接使用原始数据
+
 					decompressedMessages = append(decompressedMessages, rawMsg)
 				} else {
 					decompressedMessages = append(decompressedMessages, decompressed)
 				}
 			} else {
-				// 太短的消息直接使用原始数据
+
 				decompressedMessages = append(decompressedMessages, rawMsg)
 			}
 		}
@@ -444,19 +525,18 @@ func (m *Manager) ReadMessage(topicName string, partitionID int32, offset int64,
 	return rawMessages, nextOffset, nil
 }
 
-// GetStats 获取系统统计信息
+// GetStats returns the current system statistics
 func (m *Manager) GetStats() *SystemStats {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	// 计算运行时间
 	m.Stats.Uptime = time.Since(m.Stats.StartTime)
 	m.Stats.LastUpdateTime = time.Now()
 
 	return m.Stats
 }
 
-// GetMetrics 获取监控指标
+// GetMetrics returns the current system metrics
 func (m *Manager) GetMetrics() *Metrics {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -464,7 +544,103 @@ func (m *Manager) GetMetrics() *Metrics {
 	return m.Metrics
 }
 
-// 后台任务相关方法
+// DescribeTopic returns detailed information about a specific topic
+func (m *Manager) DescribeTopic(topicName string) (*TopicInfo, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	topic, exists := m.Topics[topicName]
+	if !exists {
+		return nil, fmt.Errorf("topic '%s' not found", topicName)
+	}
+
+	topic.mu.RLock()
+	defer topic.mu.RUnlock()
+
+	topicInfo := &TopicInfo{
+		Name:             topic.Name,
+		Partitions:       topic.Config.Partitions,
+		Replicas:         topic.Config.Replicas,
+		CreatedAt:        time.Now(),
+		Size:             0,
+		MessageCount:     0,
+		PartitionDetails: make([]PartitionInfo, 0, len(topic.Partitions)),
+	}
+
+	for partitionID, partition := range topic.Partitions {
+		partition.Mu.RLock()
+
+		partitionSize := int64(0)
+		partitionMsgCount := int64(0)
+		startOffset := int64(0)
+		endOffset := int64(0)
+
+		for _, segment := range partition.Segments {
+			if segment != nil {
+				partitionSize += segment.CurrentSize
+				partitionMsgCount += segment.WriteCount
+				if endOffset < segment.BaseOffset+segment.WriteCount {
+					endOffset = segment.BaseOffset + segment.WriteCount
+				}
+			}
+		}
+
+		partitionInfo := PartitionInfo{
+			ID:           partitionID,
+			Leader:       0,
+			Replicas:     []int32{0},
+			ISR:          []int32{0},
+			Size:         partitionSize,
+			MessageCount: partitionMsgCount,
+			StartOffset:  startOffset,
+			EndOffset:    endOffset,
+		}
+
+		topicInfo.PartitionDetails = append(topicInfo.PartitionDetails, partitionInfo)
+		topicInfo.Size += partitionSize
+		topicInfo.MessageCount += partitionMsgCount
+
+		partition.Mu.RUnlock()
+	}
+
+	return topicInfo, nil
+}
+
+// GetTopicInfo returns basic information about a specific topic
+func (m *Manager) GetTopicInfo(topicName string) (*SimpleTopicInfo, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	topic, exists := m.Topics[topicName]
+	if !exists {
+		return nil, fmt.Errorf("topic '%s' not found", topicName)
+	}
+
+	topic.mu.RLock()
+	defer topic.mu.RUnlock()
+
+	var totalSize int64
+	var totalMessages int64
+
+	for _, partition := range topic.Partitions {
+		partition.Mu.RLock()
+		for _, segment := range partition.Segments {
+			if segment != nil {
+				totalSize += segment.CurrentSize
+				totalMessages += segment.WriteCount
+			}
+		}
+		partition.Mu.RUnlock()
+	}
+
+	return &SimpleTopicInfo{
+		TopicName:    topicName,
+		Partitions:   topic.Config.Partitions,
+		MessageCount: totalMessages,
+		Size:         totalSize,
+	}, nil
+}
+
 func (m *Manager) startBackgroundTasks() {
 	go m.flushTask()
 
@@ -598,7 +774,6 @@ func (m *Manager) loadTopic(topicName, topicPath string) error {
 	return nil
 }
 
-// loadPartition 加载单个分区及其段
 func (m *Manager) loadPartition(partitionID int32, topicName, partitionPath string) (*Partition, error) {
 	entries, err := os.ReadDir(partitionPath)
 	if err != nil {
@@ -684,7 +859,7 @@ func (m *Manager) cleanupExpiredMessages() error {
 					segment.Close() // 先关闭
 					delete(partition.Segments, segID)
 				} else if segment.MinTimestamp.Before(expireBefore) {
-					// 部分过期，清理 segment 内部的过期消息
+
 					segment.PurgeBefore(expireBefore)
 				}
 			}
@@ -805,9 +980,8 @@ func (p *Partition) Flush() {
 	}
 }
 
-// consumerGroupCleanupTask 消费者组清理任务
 func (m *Manager) consumerGroupCleanupTask() {
-	ticker := time.NewTicker(30 * time.Second) // 每30秒检查一次
+	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for {

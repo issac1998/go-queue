@@ -1,0 +1,14 @@
+{
+  "broker": "localhost:9092",
+  "timeout": "10s",
+  "log_file": "",
+  
+  "command": {
+    "type": "delete-topic",
+    "topic": "topic-to-delete",
+    "partition": 0,
+    "message": "",
+    "offset": 0,
+    "count": 1
+  }
+} 

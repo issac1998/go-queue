@@ -12,18 +12,18 @@ import (
 func main() {
 	fmt.Println("=== Go Queue Consumer Groups Demo ===")
 
-	// 创建客户端
+	
 	c := client.NewClient(client.ClientConfig{
 		BrokerAddr: "localhost:9092",
 		Timeout:    5 * time.Second,
 	})
 
-	// 1. 创建测试topic
+	
 	fmt.Println("\n1. Creating test topic...")
 	admin := client.NewAdmin(c)
 	createResult, err := admin.CreateTopic(client.CreateTopicRequest{
 		Name:       "consumer-group-topic",
-		Partitions: 4, // 创建4个分区用于演示
+		Partitions: 4, 
 		Replicas:   1,
 	})
 	if err != nil {
@@ -34,11 +34,11 @@ func main() {
 		fmt.Printf("✓ Topic '%s' created successfully with 4 partitions!\n", createResult.Name)
 	}
 
-	// 2. 发送一些测试消息
+	
 	fmt.Println("\n2. Producing test messages...")
 	producer := client.NewProducer(c)
 
-	// 发送20条消息到不同分区
+	
 	for i := 0; i < 20; i++ {
 		partition := int32(i % 4) // 轮询分配到4个分区
 		message := fmt.Sprintf("Message %d for consumer groups", i+1)
@@ -60,13 +60,13 @@ func main() {
 		fmt.Printf("  ✓ Sent message %d to partition %d (offset: %d)\n", i+1, partition, result.Offset)
 	}
 
-	// 3. 创建消费者组
+	
 	fmt.Println("\n3. Creating consumer group with multiple consumers...")
 
 	groupID := "demo-consumer-group"
 	topics := []string{"consumer-group-topic"}
 
-	// 创建3个消费者
+	
 	var wg sync.WaitGroup
 	consumers := make([]*client.GroupConsumer, 3)
 
@@ -86,18 +86,18 @@ func main() {
 			continue
 		}
 
-		// 查看分区分配
+		
 		assignment := consumers[i].GetAssignment()
 		fmt.Printf("  ✓ Consumer %s joined! Assignment: %v\n", consumerID, assignment)
 	}
 
-	// 等待一下让分区分配稳定
+	
 	time.Sleep(2 * time.Second)
 
-	// 4. 每个消费者开始消费消息
+	
 	fmt.Println("\n4. Starting message consumption...")
 
-	// 用于统计消费的消息
+	
 	consumedMessages := make(map[string][]string) // consumerID -> messages
 	var mu sync.Mutex
 
@@ -108,7 +108,7 @@ func main() {
 		go func(gc *client.GroupConsumer, cid string) {
 			defer wg.Done()
 
-			// 消息处理函数
+			
 			messageHandler := func(msg client.Message) error {
 				mu.Lock()
 				if consumedMessages[cid] == nil {
@@ -122,10 +122,10 @@ func main() {
 				return nil
 			}
 
-			// 开始订阅消费（这是阻塞的，在实际应用中可能需要更复杂的控制）
+			
 			fmt.Printf("  %s starting subscription...\n", cid)
 
-			// 由于Subscribe是阻塞的，我们需要用goroutine控制消费时间
+			
 			done := make(chan struct{})
 			go func() {
 				time.Sleep(10 * time.Second) // 消费10秒
@@ -138,7 +138,7 @@ func main() {
 			for topic, partitions := range assignment {
 				for _, partition := range partitions {
 					go func(t string, p int32) {
-						// 获取已提交的offset
+						
 						startOffset, err := gc.FetchCommittedOffset(t, p)
 						if err != nil {
 							startOffset = 0 // 如果没有提交的offset，从头开始
@@ -150,7 +150,7 @@ func main() {
 							case <-done:
 								return
 							default:
-								// 拉取消息
+								
 								result, err := regularConsumer.FetchFrom(t, p, offset)
 								if err != nil {
 									log.Printf("Error fetching from %s:%d: %v", t, p, err)
@@ -164,12 +164,12 @@ func main() {
 									continue
 								}
 
-								// 处理消息
+								
 								for _, msg := range result.Messages {
 									messageHandler(msg)
 									offset = msg.Offset + 1
 
-									// 提交offset
+									
 									gc.CommitOffset(t, p, offset, "")
 								}
 
@@ -179,16 +179,16 @@ func main() {
 				}
 			}
 
-			// 等待消费完成
+			
 			<-done
 		}(consumer, consumerID)
 	}
 
-	// 5. 等待消费一段时间
+	
 	fmt.Println("\n  Consuming messages for 10 seconds...")
 	wg.Wait()
 
-	// 6. 显示消费统计
+	
 	fmt.Println("\n5. Consumption statistics:")
 	totalConsumed := 0
 	for consumerID, messages := range consumedMessages {
@@ -197,7 +197,7 @@ func main() {
 	}
 	fmt.Printf("  Total messages consumed: %d\n", totalConsumed)
 
-	// 7. 模拟一个消费者离开
+	
 	fmt.Println("\n6. Simulating consumer leave and rebalance...")
 	if len(consumers) > 0 {
 		leavingConsumer := consumers[0]
@@ -209,10 +209,10 @@ func main() {
 			fmt.Printf("  ✓ Consumer consumer-1 left group successfully\n")
 		}
 
-		// 等待其他消费者重新平衡
+		
 		time.Sleep(2 * time.Second)
 
-		// 显示剩余消费者的新分配
+		
 		for i := 1; i < len(consumers); i++ {
 			consumerID := fmt.Sprintf("consumer-%d", i+1)
 			assignment := consumers[i].GetAssignment()
@@ -220,7 +220,7 @@ func main() {
 		}
 	}
 
-	// 8. 清理剩余消费者
+	
 	fmt.Println("\n7. Cleaning up remaining consumers...")
 	for i := 1; i < len(consumers); i++ {
 		consumerID := fmt.Sprintf("consumer-%d", i+1)

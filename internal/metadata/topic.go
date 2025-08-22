@@ -12,30 +12,33 @@ import (
 )
 
 const (
+	// DefaultSegmentSize defines the default size for segment files (1GB)
 	DefaultSegmentSize = 1 << 30
-	DefaultPartitions  = 1
+	// DefaultPartitions defines the default number of partitions for a topic
+	DefaultPartitions = 1
 )
 
-// Topic defines a topic
+// Topic defines a topic which contains multiple partitions for message storage
 type Topic struct {
-	Name       string
+	Name string
 	Partitions map[int32]*Partition
 	Config     *TopicConfig
 	mu         sync.RWMutex
 }
 
-// Partition defines a partition
+// Partition defines a partition which is a unit of parallelism for message storage
 type Partition struct {
-	ID         int32
-	Topic      string
-	DataDir    string
-	Segments   map[int]*storage.Segment
-	ActiveSeg  *storage.Segment
+	ID int32
+	Topic string
+	DataDir string
+	Segments map[int]*storage.Segment
+	// ActiveSeg is the currently active segment for writing(TODO:Last or Random?)
+	ActiveSeg *storage.Segment
 	MaxSegSize int64
-	Mu         sync.RWMutex
+	Mu sync.RWMutex
 }
 
-// NewPartition creates a new partition
+// NewPartition creates a new partition with the specified ID for the given topic
 func NewPartition(id int32, topic string, sysConfig *Config) (*Partition, error) {
 	dataDir := filepath.Join(sysConfig.DataDir, topic, fmt.Sprintf("partition-%d", id))
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
@@ -64,7 +67,7 @@ var (
 	topicsLock sync.RWMutex
 )
 
-// CreateTopic creates a new topic
+// CreateTopic creates a new topic with the specified name and number of partitions
 func CreateTopic(name string, numPartitions int32, dataDir string) (*Topic, error) {
 	topicsLock.Lock()
 	defer topicsLock.Unlock()
@@ -90,7 +93,7 @@ func CreateTopic(name string, numPartitions int32, dataDir string) (*Topic, erro
 	return topic, nil
 }
 
-// GetTopic retrieves a topic by name
+// GetTopic retrieves a topic by name from the global topic registry
 func GetTopic(name string) (*Topic, error) {
 	topicsLock.RLock()
 	defer topicsLock.RUnlock()
@@ -118,7 +121,7 @@ func createPartition(topic string, id int32, dataDir string) (*Partition, error)
 	}, nil
 }
 
-// GetPartition defins
+// GetPartition retrieves a specific partition from a topic
 func GetPartition(topic string, partitionID int32) (*Partition, error) {
 	t, err := GetTopic(topic)
 	if err != nil {
@@ -132,7 +135,7 @@ func GetPartition(topic string, partitionID int32) (*Partition, error) {
 	return t.Partitions[partitionID], nil
 }
 
-// Close closes the partition and its segments
+// Close closes the partition and all its segments
 func (p *Partition) Close() error {
 	p.Mu.Lock()
 	defer p.Mu.Unlock()
@@ -150,7 +153,7 @@ func (p *Partition) Close() error {
 	return nil
 }
 
-// Append appends a message to the partition
+// Append appends a message to the partition and returns the assigned offset
 func (p *Partition) Append(msg []byte) (int64, error) {
 	p.Mu.Lock()
 	defer p.Mu.Unlock()
@@ -190,7 +193,7 @@ func (p *Partition) Append(msg []byte) (int64, error) {
 	return offset, nil
 }
 
-// Read
+// Read reads messages from the partition starting at the specified offset
 func (p *Partition) Read(offset int64, maxBytes int32) ([][]byte, int64, error) {
 	p.Mu.RLock()
 	defer p.Mu.RUnlock()
@@ -256,7 +259,7 @@ func readMessagesFromSegment(segment *storage.Segment, startPos int64, maxBytes 
 	// TODO:Test logic below
 	var nextOffset int64
 	if messageCount > 0 {
-		// 找到起始offset，然后加上读取的消息数量
+
 		startOffset := int64(-1)
 		for _, entry := range segment.IndexEntries {
 			if entry.Position == startPos {
@@ -268,11 +271,11 @@ func readMessagesFromSegment(segment *storage.Segment, startPos int64, maxBytes 
 		if startOffset >= 0 {
 			nextOffset = startOffset + messageCount
 		} else {
-			// 如果找不到精确的起始位置，基于segment基础offset计算
+
 			nextOffset = segment.BaseOffset + messageCount
 		}
 	} else {
-		// 没有读取到消息，返回末尾offset
+
 		nextOffset = segment.BaseOffset + segment.WriteCount
 	}
 

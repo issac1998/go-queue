@@ -232,7 +232,7 @@ func (s *Segment) FindPosition(offset int64) (int64, error) {
 	var nearestEntry IndexEntry
 	var startPos int64
 
-	// 如果没有索引条目，从头开始扫描
+	
 	if len(s.IndexEntries) == 0 {
 		startPos = 0
 	} else {
@@ -255,7 +255,7 @@ func (s *Segment) FindPosition(offset int64) (int64, error) {
 		}
 	}
 
-	// 从最近的索引位置开始线性扫描找到确切的 offset
+	
 	currentPos := startPos
 	currentOffset := s.BaseOffset
 	if nearestEntry.Offset != 0 {

@@ -12,16 +12,6 @@ import (
 	"github.com/issac1998/go-queue/internal/protocol"
 )
 
-const (
-	produceRequest      = 0
-	fetchRequest        = 1
-	createTopicRequest  = 2
-	joinGroupRequest    = 3
-	leaveGroupRequest   = 4
-	heartbeatRequest    = 5
-	commitOffsetRequest = 6
-	fetchOffsetRequest  = 7
-)
 
 var manager *metadata.Manager
 
@@ -93,46 +83,66 @@ func handleConnection(conn net.Conn) {
 		return
 	}
 
-	log.Printf("Received request type: %d", reqType)
+	log.Printf("Received request type: %d (%s)", reqType, protocol.GetRequestTypeName(reqType))
 
 	switch reqType {
-	case fetchRequest:
+	case protocol.FetchRequestType:
 		log.Printf("Handling fetch request")
 		if err := protocol.HandleFetchRequest(conn, manager); err != nil {
 			log.Printf("Failed to handle fetch request: %v", err)
 		}
-	case produceRequest:
+	case protocol.ProduceRequestType:
 		log.Printf("Handling produce request")
 		if err := protocol.HandleProduceRequest(conn, manager); err != nil {
 			log.Printf("Failed to handle produce request: %v", err)
 		}
-	case createTopicRequest:
+	case protocol.CreateTopicRequestType:
 		log.Printf("Handling createTopic request")
 		protocol.HandleCreateTopicRequest(conn, manager)
-	case joinGroupRequest:
+	case protocol.JoinGroupRequestType:
 		log.Printf("Handling joinGroup request")
 		if err := protocol.HandleJoinGroupRequest(conn, manager); err != nil {
 			log.Printf("Failed to handle joinGroup request: %v", err)
 		}
-	case leaveGroupRequest:
+	case protocol.LeaveGroupRequestType:
 		log.Printf("Handling leaveGroup request")
 		if err := protocol.HandleLeaveGroupRequest(conn, manager); err != nil {
 			log.Printf("Failed to handle leaveGroup request: %v", err)
 		}
-	case heartbeatRequest:
+	case protocol.HeartbeatRequestType:
 		log.Printf("Handling heartbeat request")
 		if err := protocol.HandleHeartbeatRequest(conn, manager); err != nil {
 			log.Printf("Failed to handle heartbeat request: %v", err)
 		}
-	case commitOffsetRequest:
+	case protocol.CommitOffsetRequestType:
 		log.Printf("Handling commitOffset request")
 		if err := protocol.HandleCommitOffsetRequest(conn, manager); err != nil {
 			log.Printf("Failed to handle commitOffset request: %v", err)
 		}
-	case fetchOffsetRequest:
+	case protocol.FetchOffsetRequestType:
 		log.Printf("Handling fetchOffset request")
 		if err := protocol.HandleFetchOffsetRequest(conn, manager); err != nil {
 			log.Printf("Failed to handle fetchOffset request: %v", err)
+		}
+	case protocol.ListTopicsRequestType:
+		log.Printf("Handling listTopics request")
+		if err := protocol.HandleListTopicsRequest(conn, manager); err != nil {
+			log.Printf("Failed to handle listTopics request: %v", err)
+		}
+	case protocol.DescribeTopicRequestType:
+		log.Printf("Handling describeTopic request")
+		if err := protocol.HandleDescribeTopicRequest(conn, manager); err != nil {
+			log.Printf("Failed to handle describeTopic request: %v", err)
+		}
+	case protocol.DeleteTopicRequestType:
+		log.Printf("Handling deleteTopic request")
+		if err := protocol.HandleDeleteTopicRequest(conn, manager); err != nil {
+			log.Printf("Failed to handle deleteTopic request: %v", err)
+		}
+	case protocol.GetTopicInfoRequestType:
+		log.Printf("Handling getTopicInfo request")
+		if err := protocol.HandleGetTopicInfoRequest(conn, manager); err != nil {
+			log.Printf("Failed to handle getTopicInfo request: %v", err)
 		}
 	default:
 		log.Printf("Unknown request type: %d", reqType)

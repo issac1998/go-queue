@@ -88,6 +88,14 @@ func main() {
 	switch clientConfig.Command.Type {
 	case "create-topic":
 		createTopic(c, clientConfig.Command.Topic)
+	case "list-topics":
+		listTopics(c)
+	case "describe-topic":
+		describeTopic(c, clientConfig.Command.Topic)
+	case "delete-topic":
+		deleteTopic(c, clientConfig.Command.Topic)
+	case "topic-info":
+		getTopicInfo(c, clientConfig.Command.Topic)
 	case "produce":
 		produce(c, clientConfig.Command.Topic, int32(clientConfig.Command.Partition),
 			clientConfig.Command.Message, clientConfig.Command.Count)
@@ -110,9 +118,15 @@ func printUsage() {
 	fmt.Println("  Command line only: go run main.go -cmd=create-topic -topic=my-topic -broker=localhost:9092")
 	fmt.Println()
 	fmt.Println("Commands:")
-	fmt.Println("  create-topic: Create a new topic")
-	fmt.Println("  produce: Send messages to a topic")
-	fmt.Println("  consume: Consume messages from a topic")
+	fmt.Println("  Topic Management:")
+	fmt.Println("    create-topic: Create a new topic")
+	fmt.Println("    list-topics: List all topics")
+	fmt.Println("    describe-topic: Get detailed topic information")
+	fmt.Println("    delete-topic: Delete a topic")
+	fmt.Println("    topic-info: Get basic topic information")
+	fmt.Println("  Message Operations:")
+	fmt.Println("    produce: Send messages to a topic")
+	fmt.Println("    consume: Consume messages from a topic")
 	fmt.Println()
 	fmt.Println("Parameters:")
 	flag.PrintDefaults()
@@ -244,6 +258,117 @@ func consume(c *client.Client, topicName string, partition int32, offset int64) 
 	fmt.Println(strings.Repeat("-", 60))
 	fmt.Printf("Next Offset: %d\n", result.NextOffset)
 	log.Printf("Consumption completed, next Offset: %d", result.NextOffset)
+}
+
+func listTopics(c *client.Client) {
+	log.Printf("Listing all topics...")
+	admin := client.NewAdmin(c)
+
+	topics, err := admin.ListTopics()
+	if err != nil {
+		log.Fatalf("Failed to list topics: %v", err)
+	}
+
+	if len(topics) == 0 {
+		fmt.Println("No topics found")
+		return
+	}
+
+	fmt.Printf("Found %d topics:\n", len(topics))
+	fmt.Println(strings.Repeat("=", 80))
+
+	for i, topic := range topics {
+		fmt.Printf("Topic %d: %s\n", i+1, topic.Name)
+		fmt.Printf("  Partitions: %d\n", topic.Partitions)
+		fmt.Printf("  Replicas: %d\n", topic.Replicas)
+		fmt.Printf("  Messages: %d\n", topic.MessageCount)
+		fmt.Printf("  Size: %.2f KB\n", float64(topic.Size)/1024)
+		fmt.Printf("  Created: %s\n", topic.CreatedAt.Format("2006-01-02 15:04:05"))
+		if i < len(topics)-1 {
+			fmt.Println(strings.Repeat("-", 40))
+		}
+	}
+	fmt.Println(strings.Repeat("=", 80))
+	log.Printf("Listed %d topics successfully", len(topics))
+}
+
+func describeTopic(c *client.Client, topicName string) {
+	if topicName == "" {
+		log.Fatal("Please specify topic name")
+	}
+
+	log.Printf("Describing topic: %s", topicName)
+	admin := client.NewAdmin(c)
+
+	topic, err := admin.DescribeTopic(topicName)
+	if err != nil {
+		log.Fatalf("Failed to describe topic: %v", err)
+	}
+
+	fmt.Printf("Topic Details: %s\n", topic.Name)
+	fmt.Println(strings.Repeat("=", 80))
+	fmt.Printf("Basic Information:\n")
+	fmt.Printf("  Name: %s\n", topic.Name)
+	fmt.Printf("  Partitions: %d\n", topic.Partitions)
+	fmt.Printf("  Replicas: %d\n", topic.Replicas)
+	fmt.Printf("  Total Messages: %d\n", topic.MessageCount)
+	fmt.Printf("  Total Size: %.2f KB\n", float64(topic.Size)/1024)
+	fmt.Printf("  Created At: %s\n", topic.CreatedAt.Format("2006-01-02 15:04:05"))
+
+	fmt.Printf("\nPartition Details:\n")
+	fmt.Println(strings.Repeat("-", 80))
+	for _, partition := range topic.PartitionDetails {
+		fmt.Printf("Partition %d:\n", partition.ID)
+		fmt.Printf("  Leader: %d\n", partition.Leader)
+		fmt.Printf("  Messages: %d\n", partition.MessageCount)
+		fmt.Printf("  Size: %.2f KB\n", float64(partition.Size)/1024)
+		fmt.Printf("  Offset Range: %d - %d\n", partition.StartOffset, partition.EndOffset)
+		fmt.Printf("  Replicas: %v\n", partition.Replicas)
+		fmt.Printf("  ISR: %v\n", partition.ISR)
+		fmt.Println()
+	}
+	fmt.Println(strings.Repeat("=", 80))
+	log.Printf("Topic %s described successfully", topicName)
+}
+
+func deleteTopic(c *client.Client, topicName string) {
+	if topicName == "" {
+		log.Fatal("Please specify topic name")
+	}
+
+	log.Printf("Deleting topic: %s", topicName)
+	admin := client.NewAdmin(c)
+
+	err := admin.DeleteTopic(topicName)
+	if err != nil {
+		log.Fatalf("Failed to delete topic: %v", err)
+	}
+
+	fmt.Printf("Topic '%s' deleted successfully!\n", topicName)
+	log.Printf("Topic %s deleted successfully", topicName)
+}
+
+func getTopicInfo(c *client.Client, topicName string) {
+	if topicName == "" {
+		log.Fatal("Please specify topic name")
+	}
+
+	log.Printf("Getting topic info: %s", topicName)
+	admin := client.NewAdmin(c)
+
+	info, err := admin.GetTopicInfo(topicName)
+	if err != nil {
+		log.Fatalf("Failed to get topic info: %v", err)
+	}
+
+	fmt.Printf("Topic Information: %s\n", info.Name)
+	fmt.Println(strings.Repeat("=", 50))
+	fmt.Printf("  Name: %s\n", info.Name)
+	fmt.Printf("  Partitions: %d\n", info.Partitions)
+	fmt.Printf("  Messages: %d\n", info.MessageCount)
+	fmt.Printf("  Size: %.2f KB\n", float64(info.Size)/1024)
+	fmt.Println(strings.Repeat("=", 50))
+	log.Printf("Topic info for %s retrieved successfully", topicName)
 }
 
 func parseTopicPartition(topicPartition string) (string, int32, error) {

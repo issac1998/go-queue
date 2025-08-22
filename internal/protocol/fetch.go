@@ -11,25 +11,33 @@ import (
 	"github.com/issac1998/go-queue/internal/storage"
 )
 
-const FetchRequestType = 0x01
-
+// FetchRequest represents a request to fetch messages from a topic partition
 type FetchRequest struct {
-	Topic     string
+	// Topic is the name of the topic to fetch messages from
+	Topic string
+	// Partition is the partition ID to fetch messages from
 	Partition int32
-	Offset    int64
-	MaxBytes  int32
+	// Offset is the starting offset to fetch messages from
+	Offset int64
+	// MaxBytes is the maximum number of bytes to fetch
+	MaxBytes int32
 }
 
-// FetchResponse
+// FetchResponse represents the response from a fetch operation
 type FetchResponse struct {
-	Topic      string
-	Partition  int32
-	ErrorCode  int16
-	Messages   [][]byte
+	// Topic is the name of the topic that was fetched from
+	Topic string
+	// Partition is the partition ID that was fetched from
+	Partition int32
+	// ErrorCode indicates whether the operation succeeded (0) or failed (non-zero)
+	ErrorCode int16
+	// Messages contains the fetched message data
+	Messages [][]byte
+	// NextOffset is the offset to use for the next fetch request
 	NextOffset int64
 }
 
-// ReadFetchRequest
+// ReadFetchRequest reads and parses a fetch request from the given reader
 func ReadFetchRequest(r io.Reader) (*FetchRequest, error) {
 	req := &FetchRequest{}
 
@@ -37,7 +45,7 @@ func ReadFetchRequest(r io.Reader) (*FetchRequest, error) {
 	if err := binary.Read(r, binary.BigEndian, &version); err != nil {
 		return nil, fmt.Errorf("failed to read protocol version: %v", err)
 	}
-	if version != CurrentProtocolVersion {
+	if version != ProtocolVersion {
 		return nil, fmt.Errorf("unsupported protocol version: %d", version)
 	}
 
@@ -70,7 +78,7 @@ func ReadFetchRequest(r io.Reader) (*FetchRequest, error) {
 	return req, nil
 }
 
-// WriteFetchResponse
+// Write serializes and writes the fetch response to the given writer
 func (res *FetchResponse) Write(w io.Writer) error {
 	headerBuf := new(bytes.Buffer)
 	binary.Write(headerBuf, binary.BigEndian, int16(len(res.Topic)))
@@ -102,9 +110,8 @@ func (res *FetchResponse) Write(w io.Writer) error {
 	return nil
 }
 
-// HandleFetchRequest
-func HandleFetchRequest(conn io.ReadWriteCloser, manager *metadata.Manager) error {
-	defer conn.Close()
+// HandleFetchRequest processes a fetch request and writes the response
+func HandleFetchRequest(conn io.ReadWriter, manager *metadata.Manager) error {
 
 	req, err := ReadFetchRequest(conn)
 	if err != nil {

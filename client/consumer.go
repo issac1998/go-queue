@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"time"
+
+	"github.com/issac1998/go-queue/internal/protocol"
 )
 
 // Consumer message consumer
@@ -49,7 +51,7 @@ type FetchResult struct {
 // Fetch fetches messages
 func (c *Consumer) Fetch(req FetchRequest) (*FetchResult, error) {
 	if req.MaxBytes <= 0 {
-		req.MaxBytes = 1024 * 1024 // default 1MB
+		req.MaxBytes = 1024 * 1024 
 	}
 
 	requestData, err := c.buildFetchRequest(req)
@@ -57,7 +59,7 @@ func (c *Consumer) Fetch(req FetchRequest) (*FetchResult, error) {
 		return nil, fmt.Errorf("failed to build request: %v", err)
 	}
 
-	responseData, err := c.client.sendRequest(FetchRequestType, requestData)
+	responseData, err := c.client.sendRequest(protocol.FetchRequestType, requestData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send request: %v", err)
 	}
@@ -84,7 +86,7 @@ func (c *Consumer) FetchFrom(topic string, partition int32, offset int64) (*Fetc
 func (c *Consumer) buildFetchRequest(req FetchRequest) ([]byte, error) {
 	buf := new(bytes.Buffer)
 
-	if err := binary.Write(buf, binary.BigEndian, int16(ProtocolVersion)); err != nil {
+	if err := binary.Write(buf, binary.BigEndian, int16(protocol.ProtocolVersion)); err != nil {
 		return nil, err
 	}
 
@@ -120,7 +122,6 @@ func (c *Consumer) parseFetchResponse(topic string, partition int32, requestOffs
 		Messages:  make([]Message, 0),
 	}
 
-	// 1. Read Topic (confirmation)
 	var topicLen int16
 	if err := binary.Read(buf, binary.BigEndian, &topicLen); err != nil {
 		return nil, fmt.Errorf("failed to read topic length: %v", err)
@@ -130,13 +131,11 @@ func (c *Consumer) parseFetchResponse(topic string, partition int32, requestOffs
 		return nil, fmt.Errorf("failed to read topic: %v", err)
 	}
 
-	// 2. Read Partition
 	var responsePartition int32
 	if err := binary.Read(buf, binary.BigEndian, &responsePartition); err != nil {
 		return nil, fmt.Errorf("failed to read partition: %v", err)
 	}
 
-	// 3. Read ErrorCode
 	var errorCode int16
 	if err := binary.Read(buf, binary.BigEndian, &errorCode); err != nil {
 		return nil, fmt.Errorf("failed to read error code: %v", err)
@@ -147,18 +146,15 @@ func (c *Consumer) parseFetchResponse(topic string, partition int32, requestOffs
 		return result, nil
 	}
 
-	// 4. Read NextOffset
 	if err := binary.Read(buf, binary.BigEndian, &result.NextOffset); err != nil {
 		return nil, fmt.Errorf("failed to read next offset: %v", err)
 	}
 
-	// 5. Read message count
 	var messageCount int32
 	if err := binary.Read(buf, binary.BigEndian, &messageCount); err != nil {
 		return nil, fmt.Errorf("failed to read message count: %v", err)
 	}
 
-	// 6. Read message content
 	currentOffset := requestOffset // Start from the requested offset
 	for i := int32(0); i < messageCount; i++ {
 		var msgLen int32

@@ -10,52 +10,27 @@ import (
 	"github.com/issac1998/go-queue/internal/metadata"
 )
 
-const (
-	// MaxMessageSize defines max message size.
-	MaxMessageSize = 1 << 20
-	// CompressionNone decides compress or not
-	CompressionNone    = 0x00
-	ProduceRequestType = 0x00
-
-	DefaultMaxFetchBytes = 1 << 20
-	MaxFetchBytesLimit   = 5 << 20
-
-	CurrentProtocolVersion = 1
-)
-
-const (
-	ErrorNone = 0
-
-	ErrorInvalidRequest   = 1
-	ErrorInvalidTopic     = 2
-	ErrorUnknownPartition = 3
-	ErrorInvalidMessage   = 4
-	ErrorMessageTooLarge  = 5
-	ErrorOffsetOutOfRange = 6
-
-	ErrorBrokerNotAvailable = 100
-	ErrorFetchFailed        = 101
-	ErrorProduceFailed      = 102
-
-	ErrorUnauthorized  = 200
-	ErrorQuotaExceeded = 201
-)
-
-// ProduceRequest
+// ProduceRequest represents a request to produce messages to a topic partition
 type ProduceRequest struct {
-	Topic       string
-	Partition   int32
+	// Topic is the name of the topic to produce messages to
+	Topic string
+	// Partition is the partition ID to produce messages to
+	Partition int32
+	// Compression indicates the compression type used for messages
 	Compression int8
-	Messages    [][]byte
+	// Messages contains the raw message data to be produced
+	Messages [][]byte
 }
 
-// ProduceResponse
+// ProduceResponse represents the response from a produce operation
 type ProduceResponse struct {
+	// BaseOffset is the offset of the first message that was written
 	BaseOffset int64
-	ErrorCode  int16
+	// ErrorCode indicates whether the operation succeeded (0) or failed (non-zero)
+	ErrorCode int16
 }
 
-// ReadProduceRequest decodes request from network connection
+// ReadProduceRequest reads and parses a produce request from the given reader
 func ReadProduceRequest(r io.Reader) (*ProduceRequest, error) {
 	var req ProduceRequest
 
@@ -113,9 +88,9 @@ func ReadProduceRequest(r io.Reader) (*ProduceRequest, error) {
 	return &req, nil
 }
 
-// WriteProduceResponse
+// Write serializes and writes the produce response to the given writer
 func (res *ProduceResponse) Write(w io.Writer) error {
-	// 先写入总长度前缀 (8 + 2 = 10 bytes)
+
 	responseLen := int32(8 + 2) // BaseOffset(8) + ErrorCode(2)
 	if err := binary.Write(w, binary.BigEndian, responseLen); err != nil {
 		return err
@@ -131,7 +106,7 @@ func (res *ProduceResponse) Write(w io.Writer) error {
 	return nil
 }
 
-// HandleProduceRequest
+// HandleProduceRequest processes a produce request and writes the response
 func HandleProduceRequest(conn io.ReadWriter, manager *metadata.Manager) error {
 	req, err := ReadProduceRequest(conn)
 	if err != nil {
@@ -163,7 +138,7 @@ func HandleProduceRequest(conn io.ReadWriter, manager *metadata.Manager) error {
 	return response.Write(conn)
 }
 
-// writeErrorResponse
+// writeErrorResponse is a helper function to write an error response
 func writeErrorResponse(w io.Writer, errorCode int16) error {
 	response := &ProduceResponse{
 		ErrorCode: errorCode,
@@ -171,6 +146,7 @@ func writeErrorResponse(w io.Writer, errorCode int16) error {
 	return response.Write(w)
 }
 
+// HandleCreateTopicRequest processes a create topic request
 func HandleCreateTopicRequest(conn net.Conn, manager *metadata.Manager) {
 	var version int16
 	if err := binary.Read(conn, binary.BigEndian, &version); err != nil {
@@ -212,6 +188,7 @@ func HandleCreateTopicRequest(conn net.Conn, manager *metadata.Manager) {
 	writeSuccessResponse(conn)
 }
 
+// writeSuccessResponse is a helper function to write a success response
 func writeSuccessResponse(conn net.Conn) {
 	writeErrorResponse(conn, 0)
 }

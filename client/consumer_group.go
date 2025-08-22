@@ -62,7 +62,6 @@ func NewGroupConsumer(client *Client, config GroupConsumerConfig) *GroupConsumer
 	}
 }
 
-// JoinGroup 加入消费者组
 func (gc *GroupConsumer) JoinGroup() error {
 	gc.mu.Lock()
 	defer gc.mu.Unlock()
@@ -92,29 +91,28 @@ func (gc *GroupConsumer) JoinGroup() error {
 	return nil
 }
 
-// LeaveGroup 离开消费者组
 func (gc *GroupConsumer) LeaveGroup() error {
 	gc.mu.Lock()
 	defer gc.mu.Unlock()
 
 	log.Printf("Leaving consumer group: %s", gc.GroupID)
 
-	// 停止心跳
+	
 	gc.stopHeartbeatInternal()
 
-	// 构建请求
+	
 	requestData, err := gc.buildLeaveGroupRequest()
 	if err != nil {
 		return fmt.Errorf("failed to build leave group request: %v", err)
 	}
 
-	// 发送请求
+	
 	responseData, err := gc.client.sendRequest(protocol.LeaveGroupRequestType, requestData)
 	if err != nil {
 		return fmt.Errorf("failed to send leave group request: %v", err)
 	}
 
-	// 解析响应
+	
 	err = gc.parseLeaveGroupResponse(responseData)
 	if err != nil {
 		return fmt.Errorf("failed to parse leave group response: %v", err)
@@ -124,24 +122,23 @@ func (gc *GroupConsumer) LeaveGroup() error {
 	return nil
 }
 
-// CommitOffset 提交offset
 func (gc *GroupConsumer) CommitOffset(topic string, partition int32, offset int64, metadata string) error {
 	log.Printf("Committing offset: group=%s, topic=%s, partition=%d, offset=%d",
 		gc.GroupID, topic, partition, offset)
 
-	// 构建请求
+	
 	requestData, err := gc.buildCommitOffsetRequest(topic, partition, offset, metadata)
 	if err != nil {
 		return fmt.Errorf("failed to build commit offset request: %v", err)
 	}
 
-	// 发送请求
+	
 	responseData, err := gc.client.sendRequest(protocol.CommitOffsetRequestType, requestData)
 	if err != nil {
 		return fmt.Errorf("failed to send commit offset request: %v", err)
 	}
 
-	// 解析响应
+	
 	err = gc.parseCommitOffsetResponse(responseData)
 	if err != nil {
 		return fmt.Errorf("failed to parse commit offset response: %v", err)
@@ -150,21 +147,20 @@ func (gc *GroupConsumer) CommitOffset(topic string, partition int32, offset int6
 	return nil
 }
 
-// FetchCommittedOffset 获取已提交的offset
 func (gc *GroupConsumer) FetchCommittedOffset(topic string, partition int32) (int64, error) {
-	// 构建请求
+	
 	requestData, err := gc.buildFetchOffsetRequest(topic, partition)
 	if err != nil {
 		return -1, fmt.Errorf("failed to build fetch offset request: %v", err)
 	}
 
-	// 发送请求
+	
 	responseData, err := gc.client.sendRequest(protocol.FetchOffsetRequestType, requestData)
 	if err != nil {
 		return -1, fmt.Errorf("failed to send fetch offset request: %v", err)
 	}
 
-	// 解析响应
+	
 	offset, err := gc.parseFetchOffsetResponse(responseData)
 	if err != nil {
 		return -1, fmt.Errorf("failed to parse fetch offset response: %v", err)
@@ -173,12 +169,11 @@ func (gc *GroupConsumer) FetchCommittedOffset(topic string, partition int32) (in
 	return offset, nil
 }
 
-// GetAssignment 获取分区分配
 func (gc *GroupConsumer) GetAssignment() map[string][]int32 {
 	gc.mu.RLock()
 	defer gc.mu.RUnlock()
 
-	// 返回副本以避免外部修改
+	
 	assignment := make(map[string][]int32)
 	for topic, partitions := range gc.assignment {
 		partitionsCopy := make([]int32, len(partitions))
@@ -188,7 +183,7 @@ func (gc *GroupConsumer) GetAssignment() map[string][]int32 {
 	return assignment
 }
 
-// 内部方法
+
 
 func (gc *GroupConsumer) startHeartbeat() {
 	//tolerate 3 times.
@@ -227,14 +222,14 @@ func (gc *GroupConsumer) sendHeartbeat() error {
 		return fmt.Errorf("failed to send heartbeat request: %v", err)
 	}
 
-	// 解析响应
+	
 	return gc.parseHeartbeatResponse(responseData)
 }
 
 func (gc *GroupConsumer) buildJoinGroupRequest() ([]byte, error) {
 	buf := new(bytes.Buffer)
 
-	// 协议版本
+	
 	binary.Write(buf, binary.BigEndian, int16(1))
 
 	// GroupID

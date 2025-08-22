@@ -9,7 +9,6 @@ import (
 	"time"
 )
 
-// HashType 哈希算法类型
 type HashType int8
 
 const (
@@ -34,7 +33,7 @@ type DuplicateEntry struct {
 	FirstSeen time.Time `json:"first_seen"`
 	Count     int64     `json:"count"`
 	LastSeen  time.Time `json:"last_seen"`
-	Offset    int64     `json:"offset"` // first occurrence offset
+	Offset    int64     `json:"offset"`
 }
 
 // Deduplicator duplicate message deduplicator
@@ -42,7 +41,7 @@ type Deduplicator struct {
 	hashType    HashType
 	entries     map[string]*DuplicateEntry
 	mu          sync.RWMutex
-	maxEntries  int           // maximum number of entries
+	maxEntries  int
 	ttl         time.Duration // entry TTL
 	enabled     bool
 	cleanupTick *time.Ticker
@@ -133,7 +132,6 @@ func (d *Deduplicator) calculateHash(data []byte) string {
 }
 
 // IsDuplicate checks whether the message is a duplicate
-// 返回: isDuplicate, originalOffset, error
 func (d *Deduplicator) IsDuplicate(data []byte, currentOffset int64) (bool, int64, error) {
 	if !d.enabled {
 		return false, -1, nil
@@ -146,7 +144,7 @@ func (d *Deduplicator) IsDuplicate(data []byte, currentOffset int64) (bool, int6
 
 	entry, exists := d.entries[hash]
 	if exists {
-		// 更新统计信息
+
 		entry.Count++
 		entry.LastSeen = time.Now()
 		return true, entry.Offset, nil
@@ -157,7 +155,6 @@ func (d *Deduplicator) IsDuplicate(data []byte, currentOffset int64) (bool, int6
 		d.evictOldest()
 	}
 
-	// 添加新条目
 	now := time.Now()
 	d.entries[hash] = &DuplicateEntry{
 		Hash:      hash,
@@ -170,7 +167,6 @@ func (d *Deduplicator) IsDuplicate(data []byte, currentOffset int64) (bool, int6
 	return false, -1, nil
 }
 
-// GetDuplicateInfo 获取重复消息信息
 func (d *Deduplicator) GetDuplicateInfo(data []byte) *DuplicateEntry {
 	if !d.enabled {
 		return nil
@@ -186,7 +182,6 @@ func (d *Deduplicator) GetDuplicateInfo(data []byte) *DuplicateEntry {
 		return nil
 	}
 
-	// 返回副本避免并发修改
 	return &DuplicateEntry{
 		Hash:      entry.Hash,
 		FirstSeen: entry.FirstSeen,
@@ -196,7 +191,6 @@ func (d *Deduplicator) GetDuplicateInfo(data []byte) *DuplicateEntry {
 	}
 }
 
-// evictOldest 淘汰最老的条目
 func (d *Deduplicator) evictOldest() {
 	var oldestHash string
 	var oldestTime time.Time

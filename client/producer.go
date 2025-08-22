@@ -4,17 +4,10 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+
+	"github.com/issac1998/go-queue/internal/protocol"
 )
 
-const (
-	ProduceRequestType     = 0
-	FetchRequestType       = 1
-	CreateTopicRequestType = 2
-
-	ProtocolVersion = 1
-
-	CompressionNone = 0
-)
 
 // Producer message producer
 type Producer struct {
@@ -67,7 +60,7 @@ func (p *Producer) SendBatch(messages []ProduceMessage) (*ProduceResult, error) 
 		return nil, fmt.Errorf("failed to build request: %v", err)
 	}
 
-	responseData, err := p.client.sendRequest(ProduceRequestType, requestData)
+	responseData, err := p.client.sendRequest(protocol.ProduceRequestType, requestData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send request: %v", err)
 	}
@@ -84,7 +77,7 @@ func (p *Producer) SendBatch(messages []ProduceMessage) (*ProduceResult, error) 
 func (p *Producer) buildProduceRequest(topic string, partition int32, messages []ProduceMessage) ([]byte, error) {
 	buf := new(bytes.Buffer)
 
-	if err := binary.Write(buf, binary.BigEndian, int16(ProtocolVersion)); err != nil {
+	if err := binary.Write(buf, binary.BigEndian, int16(protocol.ProtocolVersion)); err != nil {
 		return nil, err
 	}
 
@@ -99,7 +92,7 @@ func (p *Producer) buildProduceRequest(topic string, partition int32, messages [
 		return nil, err
 	}
 
-	if err := binary.Write(buf, binary.BigEndian, int8(CompressionNone)); err != nil {
+	if err := binary.Write(buf, binary.BigEndian, int8(protocol.CompressionNone)); err != nil {
 		return nil, err
 	}
 

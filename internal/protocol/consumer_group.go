@@ -11,94 +11,115 @@ import (
 	"github.com/issac1998/go-queue/internal/metadata"
 )
 
-// Consumer Group相关的请求类型
-const (
-	JoinGroupRequestType     = 3
-	LeaveGroupRequestType    = 4
-	HeartbeatRequestType     = 5
-	CommitOffsetRequestType  = 6
-	FetchOffsetRequestType   = 7
-	ListGroupsRequestType    = 8
-	DescribeGroupRequestType = 9
-)
-
-// JoinGroupRequest 加入组请求
+// JoinGroupRequest represents a request to join a consumer group
 type JoinGroupRequest struct {
-	GroupID        string
-	ConsumerID     string
-	ClientID       string
-	Topics         []string
+	// GroupID is the ID of the consumer group to join
+	GroupID string
+	// ConsumerID is the unique ID of the consumer
+	ConsumerID string
+	// ClientID is the client application identifier
+	ClientID string
+	// Topics is the list of topics the consumer wants to subscribe to
+	Topics []string
+	// SessionTimeout is the maximum time the coordinator will wait for heartbeats
 	SessionTimeout time.Duration
 }
 
-// JoinGroupResponse 加入组响应
+// JoinGroupResponse represents the response from a join group operation
 type JoinGroupResponse struct {
-	ErrorCode  int16
+	// ErrorCode indicates whether the operation succeeded (0) or failed (non-zero)
+	ErrorCode int16
+	// Generation is the current generation ID of the consumer group
 	Generation int32
-	GroupID    string
+	// GroupID is the ID of the consumer group
+	GroupID string
+	// ConsumerID is the assigned consumer ID
 	ConsumerID string
-	Leader     string
-	Members    []GroupMember
+	// Leader is the ID of the consumer that is the group leader
+	Leader string
+	// Members is the list of all members in the consumer group
+	Members []GroupMember
+	// Assignment maps topics to partition assignments for this consumer
 	Assignment map[string][]int32 // Topic -> Partitions
 }
 
-// GroupMember 组成员信息
+// GroupMember represents a member of a consumer group
 type GroupMember struct {
-	ID       string
+	// ID is the unique identifier of the group member
+	ID string
+	// ClientID is the client application identifier
 	ClientID string
 }
 
-// LeaveGroupRequest 离开组请求
+// LeaveGroupRequest represents a request to leave a consumer group
 type LeaveGroupRequest struct {
-	GroupID    string
+	// GroupID is the ID of the consumer group to leave
+	GroupID string
+	// ConsumerID is the unique ID of the consumer leaving
 	ConsumerID string
 }
 
-// LeaveGroupResponse 离开组响应
+// LeaveGroupResponse represents the response from a leave group operation
 type LeaveGroupResponse struct {
+	// ErrorCode indicates whether the operation succeeded (0) or failed (non-zero)
 	ErrorCode int16
 }
 
-// HeartbeatRequest 心跳请求
+// HeartbeatRequest represents a heartbeat request to maintain group membership
 type HeartbeatRequest struct {
-	GroupID    string
+	// GroupID is the ID of the consumer group
+	GroupID string
+	// ConsumerID is the unique ID of the consumer
 	ConsumerID string
+	// Generation is the current generation ID of the consumer group
 	Generation int32
 }
 
-// HeartbeatResponse 心跳响应
+// HeartbeatResponse represents the response from a heartbeat operation
 type HeartbeatResponse struct {
+	// ErrorCode indicates whether the operation succeeded (0) or failed (non-zero)
 	ErrorCode int16
 }
 
-// CommitOffsetRequest 提交offset请求
+// CommitOffsetRequest represents a request to commit message offsets
 type CommitOffsetRequest struct {
-	GroupID   string
+	// GroupID is the ID of the consumer group
+	GroupID string
+	// TopicName is the name of the topic
 	TopicName string
+	// Partition is the partition ID
 	Partition int32
-	Offset    int64
-	Metadata  string
+	// Offset is the offset to commit
+	Offset int64
+	// Metadata is optional metadata associated with the commit
+	Metadata string
 }
 
-// CommitOffsetResponse 提交offset响应
+// CommitOffsetResponse represents the response from a commit offset operation
 type CommitOffsetResponse struct {
+	// ErrorCode indicates whether the operation succeeded (0) or failed (non-zero)
 	ErrorCode int16
 }
 
-// FetchOffsetRequest 获取offset请求
+// FetchOffsetRequest represents a request to fetch committed offsets
 type FetchOffsetRequest struct {
-	GroupID   string
+	// GroupID is the ID of the consumer group
+	GroupID string
+	// TopicName is the name of the topic
 	TopicName string
+	// Partition is the partition ID
 	Partition int32
 }
 
-// FetchOffsetResponse 获取offset响应
+// FetchOffsetResponse represents the response from a fetch offset operation
 type FetchOffsetResponse struct {
+	// ErrorCode indicates whether the operation succeeded (0) or failed (non-zero)
 	ErrorCode int16
-	Offset    int64
+	// Offset is the committed offset value
+	Offset int64
 }
 
-// HandleJoinGroupRequest 处理加入组请求
+// HandleJoinGroupRequest processes a join group request and writes the response
 func HandleJoinGroupRequest(conn net.Conn, manager *metadata.Manager) error {
 	req, err := parseJoinGroupRequest(conn)
 	if err != nil {
@@ -108,7 +129,6 @@ func HandleJoinGroupRequest(conn net.Conn, manager *metadata.Manager) error {
 	log.Printf("Handling JoinGroup request: GroupID=%s, ConsumerID=%s, Topics=%v",
 		req.GroupID, req.ConsumerID, req.Topics)
 
-	// 加入消费者组
 	consumer, err := manager.ConsumerGroups.JoinGroup(
 		req.GroupID, req.ConsumerID, req.ClientID, req.Topics, req.SessionTimeout)
 	if err != nil {
@@ -116,7 +136,6 @@ func HandleJoinGroupRequest(conn net.Conn, manager *metadata.Manager) error {
 		return sendJoinGroupError(conn, 2) // 服务器错误
 	}
 
-	// 检查是否需要重平衡
 	group, exists, unlock := manager.ConsumerGroups.GetGroupInfo(req.GroupID)
 	if !exists {
 		return sendJoinGroupError(conn, 3) // 组不存在
@@ -125,11 +144,9 @@ func HandleJoinGroupRequest(conn net.Conn, manager *metadata.Manager) error {
 	isLeader := group.Leader == req.ConsumerID
 	unlock()
 
-	// 如果需要重平衡且当前消费者是Leader，执行重平衡
 	if needRebalance && isLeader {
 		topicPartitions := make(map[string][]int32)
 
-		// 获取订阅Topic的分区信息
 		for _, topicName := range req.Topics {
 			if topic, exists := manager.Topics[topicName]; exists {
 				var partitions []int32
@@ -146,14 +163,12 @@ func HandleJoinGroupRequest(conn net.Conn, manager *metadata.Manager) error {
 		}
 	}
 
-	// 重新获取组信息（可能已经重平衡）
 	group, exists, unlock = manager.ConsumerGroups.GetGroupInfo(req.GroupID)
 	if !exists {
 		return sendJoinGroupError(conn, 3) // 组不存在
 	}
 	defer unlock()
 
-	// 构建响应
 	response := &JoinGroupResponse{
 		ErrorCode:  0,
 		Generation: group.Generation,
@@ -163,7 +178,6 @@ func HandleJoinGroupRequest(conn net.Conn, manager *metadata.Manager) error {
 		Assignment: consumer.Assignment,
 	}
 
-	// 添加组成员信息
 	for _, member := range group.Members {
 		response.Members = append(response.Members, GroupMember{
 			ID:       member.ID,
@@ -174,7 +188,7 @@ func HandleJoinGroupRequest(conn net.Conn, manager *metadata.Manager) error {
 	return sendJoinGroupResponse(conn, response)
 }
 
-// HandleLeaveGroupRequest 处理离开组请求
+// HandleLeaveGroupRequest processes a leave group request and writes the response
 func HandleLeaveGroupRequest(conn net.Conn, manager *metadata.Manager) error {
 	req, err := parseLeaveGroupRequest(conn)
 	if err != nil {
@@ -192,7 +206,7 @@ func HandleLeaveGroupRequest(conn net.Conn, manager *metadata.Manager) error {
 	return sendLeaveGroupResponse(conn, &LeaveGroupResponse{ErrorCode: 0})
 }
 
-// HandleHeartbeatRequest 处理心跳请求
+// HandleHeartbeatRequest processes a heartbeat request and writes the response
 func HandleHeartbeatRequest(conn net.Conn, manager *metadata.Manager) error {
 	req, err := parseHeartbeatRequest(conn)
 	if err != nil {
@@ -208,7 +222,7 @@ func HandleHeartbeatRequest(conn net.Conn, manager *metadata.Manager) error {
 	return sendHeartbeatResponse(conn, &HeartbeatResponse{ErrorCode: 0})
 }
 
-// HandleCommitOffsetRequest 处理提交offset请求
+// HandleCommitOffsetRequest processes a commit offset request and writes the response
 func HandleCommitOffsetRequest(conn net.Conn, manager *metadata.Manager) error {
 	req, err := parseCommitOffsetRequest(conn)
 	if err != nil {
@@ -227,7 +241,7 @@ func HandleCommitOffsetRequest(conn net.Conn, manager *metadata.Manager) error {
 	return sendCommitOffsetResponse(conn, &CommitOffsetResponse{ErrorCode: 0})
 }
 
-// HandleFetchOffsetRequest 处理获取offset请求
+// HandleFetchOffsetRequest processes a fetch offset request and writes the response
 func HandleFetchOffsetRequest(conn net.Conn, manager *metadata.Manager) error {
 	req, err := parseFetchOffsetRequest(conn)
 	if err != nil {
@@ -245,14 +259,12 @@ func HandleFetchOffsetRequest(conn net.Conn, manager *metadata.Manager) error {
 	})
 }
 
-// 解析请求的函数
 func parseJoinGroupRequest(conn net.Conn) (*JoinGroupRequest, error) {
 	var version int16
 	if err := binary.Read(conn, binary.BigEndian, &version); err != nil {
 		return nil, err
 	}
 
-	// 读取GroupID
 	var groupIDLen int16
 	if err := binary.Read(conn, binary.BigEndian, &groupIDLen); err != nil {
 		return nil, err
@@ -262,7 +274,6 @@ func parseJoinGroupRequest(conn net.Conn) (*JoinGroupRequest, error) {
 		return nil, err
 	}
 
-	// 读取ConsumerID
 	var consumerIDLen int16
 	if err := binary.Read(conn, binary.BigEndian, &consumerIDLen); err != nil {
 		return nil, err
@@ -272,7 +283,6 @@ func parseJoinGroupRequest(conn net.Conn) (*JoinGroupRequest, error) {
 		return nil, err
 	}
 
-	// 读取ClientID
 	var clientIDLen int16
 	if err := binary.Read(conn, binary.BigEndian, &clientIDLen); err != nil {
 		return nil, err
@@ -282,7 +292,6 @@ func parseJoinGroupRequest(conn net.Conn) (*JoinGroupRequest, error) {
 		return nil, err
 	}
 
-	// 读取Topic数量
 	var topicCount int32
 	if err := binary.Read(conn, binary.BigEndian, &topicCount); err != nil {
 		return nil, err
@@ -301,7 +310,6 @@ func parseJoinGroupRequest(conn net.Conn) (*JoinGroupRequest, error) {
 		topics[i] = string(topicBytes)
 	}
 
-	// 读取SessionTimeout
 	var sessionTimeoutMs int32
 	if err := binary.Read(conn, binary.BigEndian, &sessionTimeoutMs); err != nil {
 		return nil, err
@@ -322,7 +330,6 @@ func parseLeaveGroupRequest(conn net.Conn) (*LeaveGroupRequest, error) {
 		return nil, err
 	}
 
-	// 读取GroupID
 	var groupIDLen int16
 	if err := binary.Read(conn, binary.BigEndian, &groupIDLen); err != nil {
 		return nil, err
@@ -332,7 +339,6 @@ func parseLeaveGroupRequest(conn net.Conn) (*LeaveGroupRequest, error) {
 		return nil, err
 	}
 
-	// 读取ConsumerID
 	var consumerIDLen int16
 	if err := binary.Read(conn, binary.BigEndian, &consumerIDLen); err != nil {
 		return nil, err
@@ -354,7 +360,6 @@ func parseHeartbeatRequest(conn net.Conn) (*HeartbeatRequest, error) {
 		return nil, err
 	}
 
-	// 读取GroupID
 	var groupIDLen int16
 	if err := binary.Read(conn, binary.BigEndian, &groupIDLen); err != nil {
 		return nil, err
@@ -364,7 +369,6 @@ func parseHeartbeatRequest(conn net.Conn) (*HeartbeatRequest, error) {
 		return nil, err
 	}
 
-	// 读取ConsumerID
 	var consumerIDLen int16
 	if err := binary.Read(conn, binary.BigEndian, &consumerIDLen); err != nil {
 		return nil, err
@@ -374,7 +378,6 @@ func parseHeartbeatRequest(conn net.Conn) (*HeartbeatRequest, error) {
 		return nil, err
 	}
 
-	// 读取Generation
 	var generation int32
 	if err := binary.Read(conn, binary.BigEndian, &generation); err != nil {
 		return nil, err
@@ -393,7 +396,6 @@ func parseCommitOffsetRequest(conn net.Conn) (*CommitOffsetRequest, error) {
 		return nil, err
 	}
 
-	// 读取GroupID
 	var groupIDLen int16
 	if err := binary.Read(conn, binary.BigEndian, &groupIDLen); err != nil {
 		return nil, err
@@ -403,7 +405,6 @@ func parseCommitOffsetRequest(conn net.Conn) (*CommitOffsetRequest, error) {
 		return nil, err
 	}
 
-	// 读取TopicName
 	var topicLen int16
 	if err := binary.Read(conn, binary.BigEndian, &topicLen); err != nil {
 		return nil, err
@@ -413,19 +414,16 @@ func parseCommitOffsetRequest(conn net.Conn) (*CommitOffsetRequest, error) {
 		return nil, err
 	}
 
-	// 读取Partition
 	var partition int32
 	if err := binary.Read(conn, binary.BigEndian, &partition); err != nil {
 		return nil, err
 	}
 
-	// 读取Offset
 	var offset int64
 	if err := binary.Read(conn, binary.BigEndian, &offset); err != nil {
 		return nil, err
 	}
 
-	// 读取Metadata
 	var metadataLen int16
 	if err := binary.Read(conn, binary.BigEndian, &metadataLen); err != nil {
 		return nil, err
@@ -450,7 +448,6 @@ func parseFetchOffsetRequest(conn net.Conn) (*FetchOffsetRequest, error) {
 		return nil, err
 	}
 
-	// 读取GroupID
 	var groupIDLen int16
 	if err := binary.Read(conn, binary.BigEndian, &groupIDLen); err != nil {
 		return nil, err
@@ -460,7 +457,6 @@ func parseFetchOffsetRequest(conn net.Conn) (*FetchOffsetRequest, error) {
 		return nil, err
 	}
 
-	// 读取TopicName
 	var topicLen int16
 	if err := binary.Read(conn, binary.BigEndian, &topicLen); err != nil {
 		return nil, err
@@ -470,7 +466,6 @@ func parseFetchOffsetRequest(conn net.Conn) (*FetchOffsetRequest, error) {
 		return nil, err
 	}
 
-	// 读取Partition
 	var partition int32
 	if err := binary.Read(conn, binary.BigEndian, &partition); err != nil {
 		return nil, err
@@ -483,7 +478,6 @@ func parseFetchOffsetRequest(conn net.Conn) (*FetchOffsetRequest, error) {
 	}, nil
 }
 
-// 发送响应的函数
 func sendJoinGroupResponse(conn net.Conn, response *JoinGroupResponse) error {
 	buf := new(bytes.Buffer)
 
@@ -525,7 +519,6 @@ func sendJoinGroupResponse(conn net.Conn, response *JoinGroupResponse) error {
 		}
 	}
 
-	// 发送响应长度和数据
 	responseData := buf.Bytes()
 	binary.Write(conn, binary.BigEndian, int32(len(responseData)))
 	_, err := conn.Write(responseData)
