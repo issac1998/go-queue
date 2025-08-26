@@ -14,13 +14,30 @@ import (
 // BrokerConfig represents the complete broker configuration
 type BrokerConfig struct {
 	*metadata.Config
-	Server ServerConfig `json:"server"`
+	Server  ServerConfig  `json:"server"`
+	Cluster ClusterConfig `json:"cluster"`
 }
 
 // ServerConfig represents server-specific configuration
 type ServerConfig struct {
 	Port    string `json:"port"`
 	LogFile string `json:"log_file"`
+}
+
+// ClusterConfig represents cluster and Raft configuration
+type ClusterConfig struct {
+	Enabled        bool     `json:"enabled"`
+	NodeID         uint64   `json:"node_id"`
+	RaftAddress    string   `json:"raft_address"`
+	InitialMembers []string `json:"initial_members"`
+	DataDir        string   `json:"data_dir"`
+
+	// Raft配置
+	ElectionRTT        uint64 `json:"election_rtt"`
+	HeartbeatRTT       uint64 `json:"heartbeat_rtt"`
+	CheckQuorum        bool   `json:"check_quorum"`
+	SnapshotEntries    uint64 `json:"snapshot_entries"`
+	CompactionOverhead uint64 `json:"compaction_overhead"`
 }
 
 // ClientConfig represents client configuration
@@ -67,7 +84,8 @@ type brokerConfigJSON struct {
 	DeduplicationEnabled bool                     `json:"deduplication_enabled"`
 	DeduplicationConfig  *deduplicationConfigJSON `json:"deduplication_config"`
 
-	Server ServerConfig `json:"server"`
+	Server  ServerConfig  `json:"server"`
+	Cluster ClusterConfig `json:"cluster"`
 }
 
 // LoadBrokerConfig loads broker configuration from JSON file
@@ -133,7 +151,8 @@ func LoadBrokerConfig(configPath string) (*BrokerConfig, error) {
 			DeduplicationEnabled: configJSON.DeduplicationEnabled,
 			DeduplicationConfig:  dedupConfig,
 		},
-		Server: configJSON.Server,
+		Server:  configJSON.Server,
+		Cluster: configJSON.Cluster,
 	}
 
 	// Set defaults if not provided

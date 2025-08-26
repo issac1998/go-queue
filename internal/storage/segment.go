@@ -222,7 +222,7 @@ func (s *Segment) FindPosition(offset int64) (int64, error) {
 	s.Mu.RLock()
 	defer s.Mu.RUnlock()
 
-	if offset < s.BaseOffset || offset >= s.BaseOffset+s.CurrentSize {
+	if offset < s.BaseOffset || offset >= s.BaseOffset+s.WriteCount {
 		return 0, errors.New("offset out of range")
 	}
 

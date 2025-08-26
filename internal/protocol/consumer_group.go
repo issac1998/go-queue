@@ -99,7 +99,7 @@ type FetchOffsetResponse struct {
 }
 
 // HandleJoinGroupRequest 处理加入组请求
-func HandleJoinGroupRequest(conn net.Conn, manager *metadata.Manager) error {
+func HandleJoinGroupRequest(conn net.Conn, manager *metadata.Manager, clusterManager interface{}) error {
 	req, err := parseJoinGroupRequest(conn)
 	if err != nil {
 		return sendJoinGroupError(conn, 1) // 协议错误
@@ -108,22 +108,50 @@ func HandleJoinGroupRequest(conn net.Conn, manager *metadata.Manager) error {
 	log.Printf("Handling JoinGroup request: GroupID=%s, ConsumerID=%s, Topics=%v",
 		req.GroupID, req.ConsumerID, req.Topics)
 
-	// 加入消费者组
-	consumer, err := manager.ConsumerGroups.JoinGroup(
-		req.GroupID, req.ConsumerID, req.ClientID, req.Topics, req.SessionTimeout)
-	if err != nil {
-		log.Printf("Failed to join group: %v", err)
-		return sendJoinGroupError(conn, 2) // 服务器错误
-	}
+	var consumer *metadata.Consumer
+	var group *metadata.ConsumerGroup
+	var needRebalance bool
+	var isLeader bool
 
-	// 检查是否需要重平衡
-	group, exists, unlock := manager.ConsumerGroups.GetGroupInfo(req.GroupID)
-	if !exists {
-		return sendJoinGroupError(conn, 3) // 组不存在
+	// 检查是否为集群模式
+	if clusterManager != nil {
+		// 集群模式：使用集群管理器
+		if cm, ok := clusterManager.(interface {
+			JoinConsumerGroup(groupID, consumerID, clientID string, topics []string, sessionTimeout time.Duration) (*metadata.Consumer, error)
+		}); ok {
+			consumer, err = cm.JoinConsumerGroup(req.GroupID, req.ConsumerID, req.ClientID, req.Topics, req.SessionTimeout)
+			if err != nil {
+				log.Printf("Failed to join group in cluster mode: %v", err)
+				return sendJoinGroupError(conn, 2) // 服务器错误
+			}
+
+			// 在集群模式下，重平衡逻辑稍有不同
+			// 需要从集群状态中获取组信息
+			// 这里暂时使用简化逻辑
+			needRebalance = true
+			isLeader = true // 假设当前节点是leader
+		} else {
+			log.Printf("Cluster manager does not support consumer groups")
+			return sendJoinGroupError(conn, 2)
+		}
+	} else {
+		// 单机模式：使用本地manager
+		consumer, err = manager.ConsumerGroups.JoinGroup(
+			req.GroupID, req.ConsumerID, req.ClientID, req.Topics, req.SessionTimeout)
+		if err != nil {
+			log.Printf("Failed to join group: %v", err)
+			return sendJoinGroupError(conn, 2) // 服务器错误
+		}
+
+		// 检查是否需要重平衡
+		group, exists, unlock := manager.ConsumerGroups.GetGroupInfo(req.GroupID)
+		if !exists {
+			return sendJoinGroupError(conn, 3) // 组不存在
+		}
+		needRebalance = group.State == metadata.GroupStatePreparingRebalance
+		isLeader = group.Leader == req.ConsumerID
+		unlock()
 	}
-	needRebalance := group.State == metadata.GroupStatePreparingRebalance
-	isLeader := group.Leader == req.ConsumerID
-	unlock()
 
 	// 如果需要重平衡且当前消费者是Leader，执行重平衡
 	if needRebalance && isLeader {
@@ -140,18 +168,49 @@ func HandleJoinGroupRequest(conn net.Conn, manager *metadata.Manager) error {
 			}
 		}
 
-		err = manager.ConsumerGroups.RebalancePartitions(req.GroupID, topicPartitions)
-		if err != nil {
-			log.Printf("Failed to rebalance partitions: %v", err)
+		if clusterManager != nil {
+			// 集群模式重平衡
+			if cm, ok := clusterManager.(interface {
+				RebalanceConsumerGroupPartitions(groupID string, assignment map[string][]int32) error
+			}); ok {
+				// 简化的轮询分配算法
+				assignment := make(map[string][]int32)
+				for topicName, partitions := range topicPartitions {
+					assignment[req.ConsumerID] = partitions // 简化：全部分配给当前消费者
+					consumer.Assignment[topicName] = partitions
+				}
+
+				err = cm.RebalanceConsumerGroupPartitions(req.GroupID, assignment)
+				if err != nil {
+					log.Printf("Failed to rebalance partitions in cluster mode: %v", err)
+				}
+			}
+		} else {
+			// 单机模式重平衡
+			err = manager.ConsumerGroups.RebalancePartitions(req.GroupID, topicPartitions)
+			if err != nil {
+				log.Printf("Failed to rebalance partitions: %v", err)
+			}
 		}
 	}
 
-	// 重新获取组信息（可能已经重平衡）
-	group, exists, unlock = manager.ConsumerGroups.GetGroupInfo(req.GroupID)
-	if !exists {
-		return sendJoinGroupError(conn, 3) // 组不存在
+	// 重新获取组信息（单机模式）或构建响应（集群模式）
+	if clusterManager == nil {
+		groupInfo, exists, unlock := manager.ConsumerGroups.GetGroupInfo(req.GroupID)
+		if !exists {
+			return sendJoinGroupError(conn, 3) // 组不存在
+		}
+		defer unlock()
+		group = groupInfo
+	} else {
+		// 集群模式：构建临时组信息用于响应
+		group = &metadata.ConsumerGroup{
+			ID:         req.GroupID,
+			Generation: 1, // 简化
+			Leader:     req.ConsumerID,
+			Members:    map[string]*metadata.Consumer{req.ConsumerID: consumer},
+		}
 	}
-	defer unlock()
 
 	// 构建响应
 	response := &JoinGroupResponse{
@@ -175,7 +234,7 @@ func HandleJoinGroupRequest(conn net.Conn, manager *metadata.Manager) error {
 }
 
 // HandleLeaveGroupRequest 处理离开组请求
-func HandleLeaveGroupRequest(conn net.Conn, manager *metadata.Manager) error {
+func HandleLeaveGroupRequest(conn net.Conn, manager *metadata.Manager, clusterManager interface{}) error {
 	req, err := parseLeaveGroupRequest(conn)
 	if err != nil {
 		return sendLeaveGroupError(conn, 1)
@@ -183,33 +242,65 @@ func HandleLeaveGroupRequest(conn net.Conn, manager *metadata.Manager) error {
 
 	log.Printf("Handling LeaveGroup request: GroupID=%s, ConsumerID=%s", req.GroupID, req.ConsumerID)
 
-	err = manager.ConsumerGroups.LeaveGroup(req.GroupID, req.ConsumerID)
-	if err != nil {
-		log.Printf("Failed to leave group: %v", err)
-		return sendLeaveGroupError(conn, 2)
+	if clusterManager != nil {
+		// 集群模式
+		if cm, ok := clusterManager.(interface {
+			LeaveConsumerGroup(groupID, consumerID string) error
+		}); ok {
+			err = cm.LeaveConsumerGroup(req.GroupID, req.ConsumerID)
+			if err != nil {
+				log.Printf("Failed to leave group in cluster mode: %v", err)
+				return sendLeaveGroupError(conn, 2)
+			}
+		} else {
+			return sendLeaveGroupError(conn, 2)
+		}
+	} else {
+		// 单机模式
+		err = manager.ConsumerGroups.LeaveGroup(req.GroupID, req.ConsumerID)
+		if err != nil {
+			log.Printf("Failed to leave group: %v", err)
+			return sendLeaveGroupError(conn, 2)
+		}
 	}
 
 	return sendLeaveGroupResponse(conn, &LeaveGroupResponse{ErrorCode: 0})
 }
 
 // HandleHeartbeatRequest 处理心跳请求
-func HandleHeartbeatRequest(conn net.Conn, manager *metadata.Manager) error {
+func HandleHeartbeatRequest(conn net.Conn, manager *metadata.Manager, clusterManager interface{}) error {
 	req, err := parseHeartbeatRequest(conn)
 	if err != nil {
 		return sendHeartbeatError(conn, 1)
 	}
 
-	err = manager.ConsumerGroups.Heartbeat(req.GroupID, req.ConsumerID)
-	if err != nil {
-		log.Printf("Heartbeat failed: %v", err)
-		return sendHeartbeatError(conn, 2)
+	if clusterManager != nil {
+		// 集群模式
+		if cm, ok := clusterManager.(interface {
+			HeartbeatConsumerGroup(groupID, consumerID string) error
+		}); ok {
+			err = cm.HeartbeatConsumerGroup(req.GroupID, req.ConsumerID)
+			if err != nil {
+				log.Printf("Heartbeat failed in cluster mode: %v", err)
+				return sendHeartbeatError(conn, 2)
+			}
+		} else {
+			return sendHeartbeatError(conn, 2)
+		}
+	} else {
+		// 单机模式
+		err = manager.ConsumerGroups.Heartbeat(req.GroupID, req.ConsumerID)
+		if err != nil {
+			log.Printf("Heartbeat failed: %v", err)
+			return sendHeartbeatError(conn, 2)
+		}
 	}
 
 	return sendHeartbeatResponse(conn, &HeartbeatResponse{ErrorCode: 0})
 }
 
 // HandleCommitOffsetRequest 处理提交offset请求
-func HandleCommitOffsetRequest(conn net.Conn, manager *metadata.Manager) error {
+func HandleCommitOffsetRequest(conn net.Conn, manager *metadata.Manager, clusterManager interface{}) error {
 	req, err := parseCommitOffsetRequest(conn)
 	if err != nil {
 		return sendCommitOffsetError(conn, 1)
@@ -218,22 +309,40 @@ func HandleCommitOffsetRequest(conn net.Conn, manager *metadata.Manager) error {
 	log.Printf("Handling CommitOffset request: GroupID=%s, Topic=%s, Partition=%d, Offset=%d",
 		req.GroupID, req.TopicName, req.Partition, req.Offset)
 
-	err = manager.ConsumerGroups.CommitOffset(req.GroupID, req.TopicName, req.Partition, req.Offset, req.Metadata)
-	if err != nil {
-		log.Printf("Failed to commit offset: %v", err)
-		return sendCommitOffsetError(conn, 2)
+	if clusterManager != nil {
+		// 集群模式
+		if cm, ok := clusterManager.(interface {
+			CommitConsumerGroupOffset(groupID, topic string, partition int32, offset int64) error
+		}); ok {
+			err = cm.CommitConsumerGroupOffset(req.GroupID, req.TopicName, req.Partition, req.Offset)
+			if err != nil {
+				log.Printf("Failed to commit offset in cluster mode: %v", err)
+				return sendCommitOffsetError(conn, 2)
+			}
+		} else {
+			return sendCommitOffsetError(conn, 2)
+		}
+	} else {
+		// 单机模式
+		err = manager.ConsumerGroups.CommitOffset(req.GroupID, req.TopicName, req.Partition, req.Offset, req.Metadata)
+		if err != nil {
+			log.Printf("Failed to commit offset: %v", err)
+			return sendCommitOffsetError(conn, 2)
+		}
 	}
 
 	return sendCommitOffsetResponse(conn, &CommitOffsetResponse{ErrorCode: 0})
 }
 
 // HandleFetchOffsetRequest 处理获取offset请求
-func HandleFetchOffsetRequest(conn net.Conn, manager *metadata.Manager) error {
+func HandleFetchOffsetRequest(conn net.Conn, manager *metadata.Manager, clusterManager interface{}) error {
 	req, err := parseFetchOffsetRequest(conn)
 	if err != nil {
 		return sendFetchOffsetError(conn, 1, -1)
 	}
 
+	// 注意：获取offset通常是只读操作，可以从本地读取
+	// 但在集群模式下，可能需要确保数据一致性
 	offset, exists := manager.ConsumerGroups.GetCommittedOffset(req.GroupID, req.TopicName, req.Partition)
 	if !exists {
 		return sendFetchOffsetError(conn, 3, -1) // Offset不存在

@@ -81,8 +81,8 @@ func main() {
 	}
 
 	c := client.NewClient(client.ClientConfig{
-		BrokerAddr: clientConfig.Broker,
-		Timeout:    timeout,
+		BrokerAddrs: []string{clientConfig.Broker},
+		Timeout:     timeout,
 	})
 
 	switch clientConfig.Command.Type {

@@ -12,22 +12,24 @@ func TestNewClient(t *testing.T) {
 		expected ClientConfig
 	}{
 		{
-			name:   "default config",
-			config: ClientConfig{},
+			name: "Default configuration",
+			config: ClientConfig{
+				BrokerAddrs: []string{},
+			},
 			expected: ClientConfig{
-				BrokerAddr: "localhost:9092",
-				Timeout:    5 * time.Second,
+				BrokerAddrs: []string{"localhost:9092"},
+				Timeout:     5 * time.Second,
 			},
 		},
 		{
-			name: "custom config",
+			name: "Custom configuration",
 			config: ClientConfig{
-				BrokerAddr: "127.0.0.1:8080",
-				Timeout:    10 * time.Second,
+				BrokerAddrs: []string{"localhost:9093"},
+				Timeout:     10 * time.Second,
 			},
 			expected: ClientConfig{
-				BrokerAddr: "127.0.0.1:8080",
-				Timeout:    10 * time.Second,
+				BrokerAddrs: []string{"localhost:9093"},
+				Timeout:     10 * time.Second,
 			},
 		},
 	}
@@ -35,22 +37,33 @@ func TestNewClient(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			client := NewClient(tt.config)
-
-			if client.brokerAddr != tt.expected.BrokerAddr {
-				t.Errorf("expected BrokerAddr %s, got %s", tt.expected.BrokerAddr, client.brokerAddr)
+			if !slicesEqual(client.brokerAddrs, tt.expected.BrokerAddrs) {
+				t.Errorf("Expected broker addrs %v, got %v", tt.expected.BrokerAddrs, client.brokerAddrs)
 			}
-
 			if client.timeout != tt.expected.Timeout {
-				t.Errorf("expected Timeout %v, got %v", tt.expected.Timeout, client.timeout)
+				t.Errorf("Expected timeout %v, got %v", tt.expected.Timeout, client.timeout)
 			}
 		})
 	}
 }
 
+// slicesEqual 比较两个字符串切片是否相等
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func TestClientConnect(t *testing.T) {
 	client := NewClient(ClientConfig{
-		BrokerAddr: "localhost:9999", // Use non-existent port
-		Timeout:    100 * time.Millisecond,
+		BrokerAddrs: []string{"localhost:9999"}, // Use non-existent port
+		Timeout:     100 * time.Millisecond,
 	})
 
 	conn, err := client.connect()

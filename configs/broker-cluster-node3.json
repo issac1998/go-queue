@@ -1,0 +1,44 @@
+{
+  "data_dir": "./data-node3",
+  "max_topic_partitions": 16,
+  "segment_size": 1073741824,
+  "retention_time": "168h",
+  "max_storage_size": 107374182400,
+  "flush_interval": "1s",
+  "cleanup_interval": "1h",
+  "max_message_size": 1048576,
+  
+  "compression_enabled": true,
+  "compression_type": 3,
+  "compression_threshold": 100,
+  
+  "deduplication_enabled": true,
+  "deduplication_config": {
+    "hash_type": 1,
+    "max_entries": 100000,
+    "ttl": "24h",
+    "enabled": true
+  },
+
+  "server": {
+    "port": "9094",
+    "log_file": "logs/node3.log"
+  },
+
+  "cluster": {
+    "enabled": true,
+    "node_id": 3,
+    "raft_address": "localhost:8003",
+    "initial_members": [
+      "localhost:8001",
+      "localhost:8002", 
+      "localhost:8003"
+    ],
+    "data_dir": "./raft-data/node3",
+    "election_rtt": 10,
+    "heartbeat_rtt": 1,
+    "check_quorum": true,
+    "snapshot_entries": 10000,
+    "compaction_overhead": 5000
+  }
+} 
