@@ -72,7 +72,6 @@ func (c *Client) sendRequest(requestType int32, requestData []byte) ([]byte, err
 		return nil, fmt.Errorf("failed to read response length: %v", err)
 	}
 
-
 	// Calculate actual data length based on protocol
 	actualDataLen := responseLen
 	if requestType == FetchRequestType {
