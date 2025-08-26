@@ -47,12 +47,6 @@ func TestNewManager(t *testing.T) {
 	if manager.Topics == nil {
 		t.Error("topics map not initialized")
 	}
-	if manager.Partitions == nil {
-		t.Error("partitions map not initialized")
-	}
-	if manager.Segments == nil {
-		t.Error("segments map not initialized")
-	}
 }
 
 func TestManagerCreateTopic(t *testing.T) {

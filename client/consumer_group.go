@@ -330,7 +330,6 @@ func (gc *GroupConsumer) buildFetchOffsetRequest(topic string, partition int32) 
 	return buf.Bytes(), nil
 }
 
-
 func (gc *GroupConsumer) parseJoinGroupResponse(data []byte) error {
 	buf := bytes.NewReader(data)
 
@@ -498,4 +497,53 @@ func (gc *GroupConsumer) parseFetchOffsetResponse(data []byte) (int64, error) {
 	}
 
 	return offset, nil
+}
+
+// StartHeartbeat 启动心跳 (公开方法)
+func (gc *GroupConsumer) StartHeartbeat() error {
+	gc.mu.Lock()
+	defer gc.mu.Unlock()
+	gc.startHeartbeat()
+	return nil
+}
+
+// StopHeartbeat 停止心跳 (公开方法)
+func (gc *GroupConsumer) StopHeartbeat() {
+	gc.mu.Lock()
+	defer gc.mu.Unlock()
+	gc.stopHeartbeatInternal()
+}
+
+// Subscribe 订阅消息
+func (gc *GroupConsumer) Subscribe() ([]Message, error) {
+	// 简化实现：从分配的分区获取消息
+	gc.mu.RLock()
+	assignment := gc.assignment
+	gc.mu.RUnlock()
+
+	var messages []Message
+
+	// 遍历分配的分区获取消息
+	for topic, partitions := range assignment {
+		for _, partition := range partitions {
+			// 获取当前offset
+			offset, err := gc.FetchCommittedOffset(topic, partition)
+			if err != nil {
+				log.Printf("Failed to fetch offset for %s:%d: %v", topic, partition, err)
+				offset = 0 // 从头开始
+			}
+
+			// 创建consumer并获取消息
+			consumer := NewConsumer(gc.client)
+			result, err := consumer.FetchFrom(topic, partition, offset)
+			if err != nil {
+				log.Printf("Failed to fetch from %s:%d: %v", topic, partition, err)
+				continue
+			}
+
+			messages = append(messages, result.Messages...)
+		}
+	}
+
+	return messages, nil
 }

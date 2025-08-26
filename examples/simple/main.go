@@ -9,10 +9,10 @@ import (
 )
 
 func main() {
-	// Create client
+	// 创建客户端
 	c := client.NewClient(client.ClientConfig{
-		BrokerAddr: "localhost:9092",
-		Timeout:    5 * time.Second,
+		BrokerAddrs: []string{"localhost:9092"},
+		Timeout:     5 * time.Second,
 	})
 
 	fmt.Println("=== Go Queue Consumer Protocol Fix Test ===")
