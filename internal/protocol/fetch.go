@@ -49,7 +49,6 @@ func ReadFetchRequest(r io.Reader) (*FetchRequest, error) {
 	}
 	req.Topic = string(topicBytes)
 
-
 	if err := binary.Read(r, binary.BigEndian, &req.Partition); err != nil {
 		return nil, fmt.Errorf("failed to read partition: %v", err)
 	}

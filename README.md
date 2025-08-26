@@ -9,6 +9,7 @@
 - **持久化**: 消息数据持久化到磁盘，保证数据不丢失
 - **客户端SDK**: 提供易用的Go客户端库
 - **TCP协议**: 自定义二进制协议，保证高性能通信
+- **🆕 集群和高可用**: 基于Raft算法的集群模式，提供高可用性和数据一致性
 
 ## 📦 项目结构
 
@@ -293,6 +294,41 @@ go run examples/simple/main.go
 go run examples/consumer_groups/main.go
 ```
 
+## 🏗️ 集群模式
+
+### 快速启动集群
+
+```bash
+# 1. 编译broker
+go build -o broker cmd/broker/main.go
+
+# 2. 启动3节点集群
+./scripts/start-cluster.sh
+
+# 3. 测试集群功能
+./scripts/test-cluster.sh
+```
+
+### 集群配置示例
+
+```json
+{
+  "cluster": {
+    "enabled": true,
+    "node_id": 1,
+    "raft_address": "localhost:8001",
+    "initial_members": [
+      "localhost:8001",
+      "localhost:8002", 
+      "localhost:8003"
+    ],
+    "data_dir": "./raft-data/node1"
+  }
+}
+```
+
+详细的集群配置和使用说明请参考 [集群指南](CLUSTER_GUIDE.md)。
+
 ## 🔮 架构说明
 
 ### 存储架构
@@ -317,13 +353,16 @@ go run examples/consumer_groups/main.go
 - ✅ 自动分区分配和重平衡
 - ✅ Offset管理和提交
 - ✅ 心跳和故障检测
+- ✅ **集群和高可用性** (基于Raft算法)
+- ✅ **元数据一致性** (使用dragonboat实现)
+- ✅ **自动Leader选举** (故障自动恢复)
 
 计划实现的功能：
-- ⏳ 多Broker集群支持
-- ⏳ 数据副本和故障恢复
+- ⏳ 消息数据副本同步
+- ⏳ 动态成员管理
 - ⏳ HTTP API接口
 - ⏳ 监控和度量指标
-- ⏳ 更多分区分配策略
+- ⏳ 客户端负载均衡
 
 ## 🤝 贡献
 

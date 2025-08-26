@@ -222,7 +222,7 @@ func (s *Segment) FindPosition(offset int64) (int64, error) {
 	s.Mu.RLock()
 	defer s.Mu.RUnlock()
 
-	if offset < s.BaseOffset || offset >= s.BaseOffset+s.CurrentSize {
+	if offset < s.BaseOffset || offset >= s.BaseOffset+s.WriteCount {
 		return 0, errors.New("offset out of range")
 	}
 
@@ -269,6 +269,7 @@ func (s *Segment) FindPosition(offset int64) (int64, error) {
 			return 0, fmt.Errorf("seek failed: %v", err)
 		}
 
+<<<<<<< HEAD
 		n, err := s.LogFile.Read(lenBuf)
 		if err != nil || n != 4 {
 			return 0, fmt.Errorf("failed to read message length at position %d: %v", currentPos, err)
@@ -290,6 +291,8 @@ func (s *Segment) FindPosition(offset int64) (int64, error) {
 	return 0, fmt.Errorf("offset %d not found in segment", offset)
 }
 
+=======
+>>>>>>> 7213a65 (feat: support broker raft)
 // ReadAt reads data from a specified position
 func (s *Segment) ReadAt(pos int64, buf []byte) (int, error) {
 	s.Mu.RLock()

@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 
+	"github.com/issac1998/go-queue/internal/cluster"
 	"github.com/issac1998/go-queue/internal/config"
 	"github.com/issac1998/go-queue/internal/metadata"
 	"github.com/issac1998/go-queue/internal/protocol"
@@ -23,7 +24,10 @@ const (
 	fetchOffsetRequest  = 7
 )
 
-var manager *metadata.Manager
+var (
+	manager        *metadata.Manager
+	clusterManager *cluster.Manager
+)
 
 func main() {
 	var (
@@ -61,8 +65,26 @@ func main() {
 		log.Fatalf("Failed to start Manager: %v", err)
 	}
 
+	// Initialize cluster if enabled
+	if brokerConfig.Cluster.Enabled {
+		log.Printf("Cluster mode enabled - NodeID: %d, RaftAddress: %s",
+			brokerConfig.Cluster.NodeID, brokerConfig.Cluster.RaftAddress)
+
+		clusterManager, err = cluster.NewManager(brokerConfig.Cluster.NodeID, &brokerConfig.Cluster, manager)
+		if err != nil {
+			log.Fatalf("Failed to initialize cluster manager: %v", err)
+		}
+
+		log.Printf("Cluster manager initialized successfully")
+	}
+
 	// Ensure data directory exists
 	os.MkdirAll(brokerConfig.Config.DataDir, 0755)
+
+	// Create raft data directory if cluster is enabled
+	if brokerConfig.Cluster.Enabled {
+		os.MkdirAll(brokerConfig.Cluster.DataDir, 0755)
+	}
 
 	log.Printf("Go Queue server started on :%s", brokerConfig.Server.Port)
 
@@ -83,63 +105,35 @@ func main() {
 }
 
 func handleConnection(conn net.Conn) {
-	defer func() {
-		conn.Close()
-		if r := recover(); r != nil {
-			log.Printf("Connection handling panic: %v", r)
-		}
-	}()
+	defer conn.Close()
 
-	var reqType int32
-	err := binary.Read(conn, binary.BigEndian, &reqType)
-	if err != nil {
-		log.Printf("Failed to read request type: %v", err)
-		return
+	for {
+		// Read request type
+		var reqType int32
+		if err := binary.Read(conn, binary.BigEndian, &reqType); err != nil {
+			return
+		}
+
+		switch reqType {
+		case produceRequest:
+			protocol.HandleProduceRequest(conn, manager, clusterManager)
+		case fetchRequest:
+			protocol.HandleFetchRequest(conn, manager)
+		case createTopicRequest:
+			protocol.HandleCreateTopicRequest(conn, manager)
+		case joinGroupRequest:
+			protocol.HandleJoinGroupRequest(conn, manager)
+		case leaveGroupRequest:
+			protocol.HandleLeaveGroupRequest(conn, manager)
+		case heartbeatRequest:
+			protocol.HandleHeartbeatRequest(conn, manager)
+		case commitOffsetRequest:
+			protocol.HandleCommitOffsetRequest(conn, manager)
+		case fetchOffsetRequest:
+			protocol.HandleFetchOffsetRequest(conn, manager)
+		default:
+			log.Printf("Unknown request type: %d", reqType)
+			return
+		}
 	}
-
-	log.Printf("Received request type: %d", reqType)
-
-	switch reqType {
-	case fetchRequest:
-		log.Printf("Handling fetch request")
-		if err := protocol.HandleFetchRequest(conn, manager); err != nil {
-			log.Printf("Failed to handle fetch request: %v", err)
-		}
-	case produceRequest:
-		log.Printf("Handling produce request")
-		if err := protocol.HandleProduceRequest(conn, manager); err != nil {
-			log.Printf("Failed to handle produce request: %v", err)
-		}
-	case createTopicRequest:
-		log.Printf("Handling createTopic request")
-		protocol.HandleCreateTopicRequest(conn, manager)
-	case joinGroupRequest:
-		log.Printf("Handling joinGroup request")
-		if err := protocol.HandleJoinGroupRequest(conn, manager); err != nil {
-			log.Printf("Failed to handle joinGroup request: %v", err)
-		}
-	case leaveGroupRequest:
-		log.Printf("Handling leaveGroup request")
-		if err := protocol.HandleLeaveGroupRequest(conn, manager); err != nil {
-			log.Printf("Failed to handle leaveGroup request: %v", err)
-		}
-	case heartbeatRequest:
-		log.Printf("Handling heartbeat request")
-		if err := protocol.HandleHeartbeatRequest(conn, manager); err != nil {
-			log.Printf("Failed to handle heartbeat request: %v", err)
-		}
-	case commitOffsetRequest:
-		log.Printf("Handling commitOffset request")
-		if err := protocol.HandleCommitOffsetRequest(conn, manager); err != nil {
-			log.Printf("Failed to handle commitOffset request: %v", err)
-		}
-	case fetchOffsetRequest:
-		log.Printf("Handling fetchOffset request")
-		if err := protocol.HandleFetchOffsetRequest(conn, manager); err != nil {
-			log.Printf("Failed to handle fetchOffset request: %v", err)
-		}
-	default:
-		log.Printf("Unknown request type: %d", reqType)
-	}
-
 }

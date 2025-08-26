@@ -133,7 +133,7 @@ func (res *ProduceResponse) Write(w io.Writer) error {
 }
 
 // HandleProduceRequest
-func HandleProduceRequest(conn io.ReadWriter, manager *metadata.Manager) error {
+func HandleProduceRequest(conn io.ReadWriter, manager *metadata.Manager, clusterManager interface{}) error {
 	req, err := ReadProduceRequest(conn)
 	if err != nil {
 		return fmt.Errorf("invalid produce request: %v", err)
@@ -144,6 +144,12 @@ func HandleProduceRequest(conn io.ReadWriter, manager *metadata.Manager) error {
 	}
 	if len(req.Messages) == 0 {
 		return writeErrorResponse(conn, ErrorInvalidMessage)
+	}
+
+	// 如果启用了集群模式，优先使用集群管理器
+	if clusterManager != nil {
+		// 这里可以添加集群相关的逻辑
+		// 目前先使用本地manager
 	}
 
 	var firstOffset int64 = -1

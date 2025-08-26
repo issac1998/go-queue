@@ -27,10 +27,8 @@ type Manager struct {
 
 	mu sync.RWMutex
 
-	ctx           context.Context
-	cancel        context.CancelFunc
-	cleanupTicker *time.Ticker
-	flushTicker   *time.Ticker
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	Stats *SystemStats
 
@@ -131,6 +129,7 @@ func NewManager(config *Config) (*Manager, error) {
 		var err error
 		compressor, err = compression.GetCompressor(config.CompressionType)
 		if err != nil {
+			cancel()
 			return nil, fmt.Errorf("create compressor failed: %v", err)
 		}
 	} else {
@@ -476,21 +475,16 @@ func (m *Manager) startBackgroundTasks() {
 }
 
 func (m *Manager) stopBackgroundTasks() {
-	if m.cleanupTicker != nil {
-		m.cleanupTicker.Stop()
-	}
-	if m.flushTicker != nil {
-		m.flushTicker.Stop()
-	}
 	m.cancel()
 }
 
 func (m *Manager) cleanupTask() {
-	m.cleanupTicker = time.NewTicker(m.Config.CleanupInterval)
+	ticker := time.NewTicker(m.Config.CleanupInterval)
+	defer ticker.Stop()
 
 	for {
 		select {
-		case <-m.cleanupTicker.C:
+		case <-ticker.C:
 			if err := m.cleanupExpiredMessages(); err != nil {
 				log.Printf("Cleanup failed: %v", err)
 			}
@@ -706,8 +700,10 @@ func (m *Manager) updateStats() {
 		for _, partition := range topic.Partitions {
 			totalPartitions++
 			for _, segment := range partition.Segments {
+				segment.Mu.RLock()
 				totalSegments++
 				totalBytes += segment.CurrentSize
+				segment.Mu.RUnlock()
 			}
 		}
 	}
@@ -773,11 +769,12 @@ func validateConfig(config *Config) error {
 }
 
 func (m *Manager) flushTask() {
-	m.flushTicker = time.NewTicker(m.Config.FlushInterval)
+	ticker := time.NewTicker(m.Config.FlushInterval)
+	defer ticker.Stop()
 
 	for {
 		select {
-		case <-m.flushTicker.C:
+		case <-ticker.C:
 			m.flushAll()
 		case <-m.ctx.Done():
 			return
