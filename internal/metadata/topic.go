@@ -59,97 +59,6 @@ func NewPartition(id int32, topic string, sysConfig *Config) (*Partition, error)
 	return p, nil
 }
 
-var (
-	topics     = make(map[string]*Topic)
-	topicsLock sync.RWMutex
-)
-
-// CreateTopic creates a new topic
-func CreateTopic(name string, numPartitions int32, dataDir string) (*Topic, error) {
-	topicsLock.Lock()
-	defer topicsLock.Unlock()
-
-	if _, exists := topics[name]; exists {
-		return nil, fmt.Errorf("topic %s already exists", name)
-	}
-
-	topic := &Topic{
-		Name:       name,
-		Partitions: make(map[int32]*Partition),
-	}
-
-	for i := int32(0); i < numPartitions; i++ {
-		partition, err := createPartition(name, i, dataDir)
-		if err != nil {
-			return nil, fmt.Errorf("create partition %d failed: %v", i, err)
-		}
-		topic.Partitions[i] = partition
-	}
-
-	topics[name] = topic
-	return topic, nil
-}
-
-// GetTopic retrieves a topic by name
-func GetTopic(name string) (*Topic, error) {
-	topicsLock.RLock()
-	defer topicsLock.RUnlock()
-
-	topic, exists := topics[name]
-	if !exists {
-		return nil, fmt.Errorf("topic %s not found", name)
-	}
-	return topic, nil
-}
-
-func createPartition(topic string, id int32, dataDir string) (*Partition, error) {
-	partitionDir := filepath.Join(dataDir, topic, fmt.Sprintf("partition-%d", id))
-
-	segment, err := storage.NewSegment(partitionDir, 0, DefaultSegmentSize)
-	if err != nil {
-		return nil, fmt.Errorf("create initial segment failed: %v", err)
-	}
-
-	return &Partition{
-		ID:       id,
-		Topic:    topic,
-		Segments: map[int]*storage.Segment{0: segment},
-		DataDir:  partitionDir,
-	}, nil
-}
-
-// GetPartition defins
-func GetPartition(topic string, partitionID int32) (*Partition, error) {
-	t, err := GetTopic(topic)
-	if err != nil {
-		return nil, err
-	}
-
-	if partitionID < 0 || int(partitionID) >= len(t.Partitions) {
-		return nil, fmt.Errorf("invalid partition ID: %d", partitionID)
-	}
-
-	return t.Partitions[partitionID], nil
-}
-
-// Close closes the partition and its segments
-func (p *Partition) Close() error {
-	p.Mu.Lock()
-	defer p.Mu.Unlock()
-
-	var errs []error
-	for _, segment := range p.Segments {
-		if err := segment.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-
-	if len(errs) > 0 {
-		return fmt.Errorf("close partition failed: %v", errs)
-	}
-	return nil
-}
-
 // Append appends a message to the partition
 func (p *Partition) Append(msg []byte) (int64, error) {
 	p.Mu.Lock()
@@ -277,4 +186,22 @@ func readMessagesFromSegment(segment *storage.Segment, startPos int64, maxBytes 
 	}
 
 	return messages, nextOffset, nil
+}
+
+// Close closes the partition and its segments
+func (p *Partition) Close() error {
+	p.Mu.Lock()
+	defer p.Mu.Unlock()
+
+	var errs []error
+	for _, segment := range p.Segments {
+		if err := segment.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("close partition failed: %v", errs)
+	}
+	return nil
 }
