@@ -39,14 +39,13 @@ type DuplicateEntry struct {
 
 // Deduplicator duplicate message deduplicator
 type Deduplicator struct {
-	hashType    HashType
-	entries     map[string]*DuplicateEntry
-	mu          sync.RWMutex
-	maxEntries  int           // maximum number of entries
-	ttl         time.Duration // entry TTL
-	enabled     bool
-	cleanupTick *time.Ticker
-	stopCh      chan struct{}
+	hashType   HashType
+	entries    map[string]*DuplicateEntry
+	mu         sync.RWMutex
+	maxEntries int           // maximum number of entries
+	ttl        time.Duration // entry TTL
+	enabled    bool
+	stopCh     chan struct{}
 }
 
 // Config duplicate message deduplicator configuration
@@ -99,7 +98,7 @@ func (d *Deduplicator) Enable() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.enabled = true
-	if d.cleanupTick == nil && d.ttl > 0 {
+	if d.ttl > 0 {
 		d.startCleanup()
 	}
 }
@@ -109,10 +108,6 @@ func (d *Deduplicator) Disable() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.enabled = false
-	if d.cleanupTick != nil {
-		d.cleanupTick.Stop()
-		d.cleanupTick = nil
-	}
 }
 
 // calculateHash calculates the hash of the message
@@ -220,12 +215,13 @@ func (d *Deduplicator) startCleanup() {
 		cleanupInterval = time.Minute
 	}
 
-	d.cleanupTick = time.NewTicker(cleanupInterval)
-
 	go func() {
+		ticker := time.NewTicker(cleanupInterval)
+		defer ticker.Stop()
+
 		for {
 			select {
-			case <-d.cleanupTick.C:
+			case <-ticker.C:
 				d.cleanup()
 			case <-d.stopCh:
 				return
@@ -297,9 +293,6 @@ func (d *Deduplicator) Clear() {
 
 // Close
 func (d *Deduplicator) Close() {
-	if d.cleanupTick != nil {
-		d.cleanupTick.Stop()
-	}
 	close(d.stopCh)
 }
 
