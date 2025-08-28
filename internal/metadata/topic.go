@@ -99,6 +99,72 @@ func (p *Partition) Append(msg []byte) (int64, error) {
 	return offset, nil
 }
 
+// AppendAtOffset appends a message at a specific offset (for replication)
+func (p *Partition) AppendAtOffset(msg []byte, expectedOffset int64) (int64, error) {
+	p.Mu.Lock()
+	defer p.Mu.Unlock()
+
+	// 找到活跃段
+	var activeSegment *storage.Segment
+	for _, seg := range p.Segments {
+		if seg.IsActive {
+			activeSegment = seg
+			break
+		}
+	}
+
+	// 如果没有活跃段，使用第一个段
+	if activeSegment == nil {
+		for _, seg := range p.Segments {
+			activeSegment = seg
+			break
+		}
+	}
+
+	if activeSegment == nil {
+		return 0, fmt.Errorf("no active segment found")
+	}
+
+	// 验证offset是否连续（简化实现，实际可能需要更复杂的逻辑）
+	currentOffset := activeSegment.BaseOffset + activeSegment.WriteCount
+	if expectedOffset != currentOffset {
+		return 0, fmt.Errorf("offset mismatch: expected %d, current %d", expectedOffset, currentOffset)
+	}
+
+	// 写入消息
+	offset, err := activeSegment.Append(msg, time.Now())
+	if err != nil {
+		if err.Error() == "segment is full" {
+			// 创建新段
+			newSegment, err := storage.NewSegment(
+				p.DataDir,
+				activeSegment.BaseOffset+activeSegment.CurrentSize,
+				DefaultSegmentSize,
+			)
+			if err != nil {
+				return 0, fmt.Errorf("create new segment failed: %v", err)
+			}
+
+			// 标记旧段为非活跃
+			activeSegment.IsActive = false
+
+			// 添加新段并设为活跃
+			p.Segments[len(p.Segments)] = newSegment
+			activeSegment = newSegment
+
+			// 重试写入
+			offset, err = activeSegment.Append(msg, time.Now())
+			if err != nil {
+				return 0, fmt.Errorf("append to new segment failed: %v", err)
+			}
+		} else {
+			return 0, err
+		}
+	}
+
+	return offset, nil
+}
+
 // Read
 func (p *Partition) Read(offset int64, maxBytes int32) ([][]byte, int64, error) {
 	p.Mu.RLock()

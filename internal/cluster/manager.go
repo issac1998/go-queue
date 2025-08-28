@@ -196,17 +196,54 @@ func (cm *Manager) CreateTopic(name string, partitions, replicas int32) (*TopicI
 	return &topicInfo, nil
 }
 
-// ProduceMessage produces a message through Raft
-func (cm *Manager) ProduceMessage(topic string, partition int32, data []byte) error {
-	op := Operation{
+// ProduceMessage produces a message through Raft consensus
+func (cm *Manager) ProduceMessage(topic string, partition int32, data []byte) (*ProduceResult, error) {
+	if !cm.IsLeader() {
+		return nil, fmt.Errorf("not the leader")
+	}
+
+	// 创建操作 - 简化，让状态机自己处理offset
+	op := &Operation{
 		Type:      OpAppendMessage,
 		Topic:     topic,
 		Partition: partition,
 		Data:      data,
+		Timestamp: time.Now().UnixMilli(),
 	}
 
-	_, err := cm.propose(&op)
-	return err
+	// 序列化操作
+	opData, err := json.Marshal(op)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal operation: %v", err)
+	}
+
+	// 通过Raft提交 - 这会自动同步到所有节点
+	ctx, cancel := context.WithTimeout(cm.ctx, 10*time.Second)
+	defer cancel()
+
+	result, err := cm.nodeHost.SyncPropose(ctx, cm.nodeHost.GetNoOPSession(ClusterID), opData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to propose message: %v", err)
+	}
+
+	// 解析结果
+	var produceResult struct {
+		MessageID string `json:"message_id"`
+		Offset    int64  `json:"offset"`
+		Timestamp int64  `json:"timestamp"`
+	}
+
+	if err := json.Unmarshal(result.Data, &produceResult); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal result: %v", err)
+	}
+
+	return &ProduceResult{
+		Topic:     topic,
+		Partition: partition,
+		Offset:    produceResult.Offset,
+		MessageID: produceResult.MessageID,
+		Timestamp: produceResult.Timestamp,
+	}, nil
 }
 
 // RegisterBroker registers a broker in the cluster
@@ -225,26 +262,22 @@ func (cm *Manager) RegisterBroker(broker *BrokerInfo) error {
 	return err
 }
 
-// GetClusterInfo gets cluster information
+// GetClusterInfo returns cluster information
 func (cm *Manager) GetClusterInfo() (*ClusterInfo, error) {
-	// 查询brokers
-	brokers, err := cm.query("brokers")
+	brokers, err := cm.getBrokers()
 	if err != nil {
 		return nil, err
 	}
 
-	// 查询topics
-	topics, err := cm.query("topics")
+	topics, err := cm.getTopics()
 	if err != nil {
 		return nil, err
 	}
 
-	clusterInfo := &ClusterInfo{
-		Brokers: brokers.(map[uint64]*BrokerInfo),
-		Topics:  topics.(map[string]*TopicInfo),
-	}
-
-	return clusterInfo, nil
+	return &ClusterInfo{
+		Brokers: brokers,
+		Topics:  topics,
+	}, nil
 }
 
 // IsLeader returns whether current node is leader
@@ -295,18 +328,121 @@ func (cm *Manager) query(queryType string) (interface{}, error) {
 }
 
 // Stop stops the cluster manager
-func (cm *Manager) Stop() error {
-	cm.cancel()
-
+func (cm *Manager) Stop() {
 	if cm.nodeHost != nil {
 		cm.nodeHost.Stop()
 	}
 
-	return nil
+	cm.cancel()
+}
+
+// 简化的辅助方法
+func (cm *Manager) getNextOffset(topic string, partition int32) (int64, error) {
+	// 查询当前状态机中的offset信息
+	query := struct {
+		Type      string `json:"type"`
+		Topic     string `json:"topic"`
+		Partition int32  `json:"partition"`
+	}{
+		Type:      "get_next_offset",
+		Topic:     topic,
+		Partition: partition,
+	}
+
+	queryData, err := json.Marshal(query)
+	if err != nil {
+		return 0, err
+	}
+
+	ctx, cancel := context.WithTimeout(cm.ctx, 3*time.Second)
+	defer cancel()
+
+	result, err := cm.nodeHost.SyncRead(ctx, ClusterID, queryData)
+	if err != nil {
+		return 0, err
+	}
+
+	var offsetResult struct {
+		Offset int64 `json:"offset"`
+	}
+
+	if err := json.Unmarshal(result.([]byte), &offsetResult); err != nil {
+		return 0, nil // 如果查询失败，返回0
+	}
+
+	return offsetResult.Offset, nil
+}
+
+// ProduceResult represents the result of a message production
+type ProduceResult struct {
+	Topic     string `json:"topic"`
+	Partition int32  `json:"partition"`
+	Offset    int64  `json:"offset"`
+	MessageID string `json:"message_id"`
+	Timestamp int64  `json:"timestamp"`
 }
 
 // ClusterInfo represents cluster information
 type ClusterInfo struct {
 	Brokers map[uint64]*BrokerInfo `json:"brokers"`
 	Topics  map[string]*TopicInfo  `json:"topics"`
+}
+
+// 简化的辅助方法
+func (cm *Manager) getBrokers() (map[uint64]*BrokerInfo, error) {
+	brokers := make(map[uint64]*BrokerInfo)
+
+	query := struct {
+		Type string `json:"type"`
+	}{
+		Type: "get_brokers",
+	}
+
+	queryData, err := json.Marshal(query)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(cm.ctx, 3*time.Second)
+	defer cancel()
+
+	result, err := cm.nodeHost.SyncRead(ctx, ClusterID, queryData)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := json.Unmarshal(result.([]byte), &brokers); err != nil {
+		return nil, err
+	}
+
+	return brokers, nil
+}
+
+func (cm *Manager) getTopics() (map[string]*TopicInfo, error) {
+	topics := make(map[string]*TopicInfo)
+
+	query := struct {
+		Type string `json:"type"`
+	}{
+		Type: "get_topics",
+	}
+
+	queryData, err := json.Marshal(query)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(cm.ctx, 3*time.Second)
+	defer cancel()
+
+	result, err := cm.nodeHost.SyncRead(ctx, ClusterID, queryData)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := json.Unmarshal(result.([]byte), &topics); err != nil {
+		return nil, err
+	}
+
+	return topics, nil
 }
