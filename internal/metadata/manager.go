@@ -407,6 +407,32 @@ func (m *Manager) WriteMessage(topicName string, partitionID int32, message []by
 	return offset, nil
 }
 
+// WriteMessageDirect 直接写入消息（用于副本同步，跳过压缩和去重）
+func (m *Manager) WriteMessageDirect(topicName string, partitionID int32, message []byte, expectedOffset int64) (int64, error) {
+	// 验证消息大小
+	if len(message) > m.Config.MaxMessageSize {
+		return 0, fmt.Errorf("message too large: %d bytes", len(message))
+	}
+
+	partition, err := m.GetPartition(topicName, partitionID)
+	if err != nil {
+		return 0, err
+	}
+
+	// 直接写入消息，不进行压缩和去重处理
+	offset, err := partition.AppendAtOffset(message, expectedOffset)
+	if err != nil {
+		m.recordError("write_direct_failed")
+		return 0, fmt.Errorf("write message direct failed: %v", err)
+	}
+
+	// 更新统计信息
+	m.recordSuccess()
+	m.updateStats()
+
+	return offset, nil
+}
+
 // ReadMessage 读取消息
 func (m *Manager) ReadMessage(topicName string, partitionID int32, offset int64, maxBytes int32) ([][]byte, int64, error) {
 	partition, err := m.GetPartition(topicName, partitionID)
