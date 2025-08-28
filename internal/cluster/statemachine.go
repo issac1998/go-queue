@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"sync"
+	"time"
 
 	"github.com/issac1998/go-queue/internal/metadata"
 	sm "github.com/lni/dragonboat/v3/statemachine"
@@ -18,6 +20,7 @@ const (
 	OpUpdateMetadata   = 4
 	OpRegisterBroker   = 5
 	OpUnregisterBroker = 6
+	// 移除 OpReplicateMessage, OpUpdateISR, OpCommitOffset - 这些由Raft自动处理
 )
 
 // Operation represents a state machine operation
@@ -27,6 +30,28 @@ type Operation struct {
 	Partition int32       `json:"partition,omitempty"`
 	Data      []byte      `json:"data,omitempty"`
 	Metadata  interface{} `json:"metadata,omitempty"`
+	// 简化字段 - 只保留消息相关的基本信息
+	Offset    int64 `json:"offset,omitempty"`
+	Timestamp int64 `json:"timestamp,omitempty"`
+}
+
+// MessageEntry represents a message in the Raft log
+type MessageEntry struct {
+	ID        string `json:"id"`
+	Topic     string `json:"topic"`
+	Partition int32  `json:"partition"`
+	Offset    int64  `json:"offset"`
+	Data      []byte `json:"data"`
+	Timestamp int64  `json:"timestamp"`
+	Checksum  uint32 `json:"checksum"`
+}
+
+// PartitionInfo represents partition information
+type PartitionInfo struct {
+	Topic string `json:"topic"`
+	ID    int32  `json:"id"`
+	// 移除 Leader, ISR 概念 - Raft自动管理Leader
+	Replicas []uint64 `json:"replicas"`
 }
 
 // ClusterStateMachine implements the Raft state machine
@@ -38,6 +63,10 @@ type ClusterStateMachine struct {
 	brokers    map[uint64]*BrokerInfo
 	topics     map[string]*TopicInfo
 	partitions map[string]map[int32]*PartitionInfo
+
+	// 消息数据 - 存储在Raft状态机中，自动同步到所有节点
+	messages map[string]map[int32][]*MessageEntry // topic -> partition -> messages
+	offsets  map[string]map[int32]int64           // topic -> partition -> nextOffset
 
 	// 本地数据管理器
 	manager *metadata.Manager
@@ -58,15 +87,6 @@ type TopicInfo struct {
 	Replicas   int32  `json:"replicas"`
 }
 
-// PartitionInfo represents partition information
-type PartitionInfo struct {
-	Topic    string   `json:"topic"`
-	ID       int32    `json:"id"`
-	Leader   uint64   `json:"leader"`
-	Replicas []uint64 `json:"replicas"`
-	ISR      []uint64 `json:"isr"`
-}
-
 // NewClusterStateMachine creates a new cluster state machine
 func NewClusterStateMachine(nodeID uint64, manager *metadata.Manager) sm.IStateMachine {
 	return &ClusterStateMachine{
@@ -74,6 +94,8 @@ func NewClusterStateMachine(nodeID uint64, manager *metadata.Manager) sm.IStateM
 		brokers:    make(map[uint64]*BrokerInfo),
 		topics:     make(map[string]*TopicInfo),
 		partitions: make(map[string]map[int32]*PartitionInfo),
+		messages:   make(map[string]map[int32][]*MessageEntry),
+		offsets:    make(map[string]map[int32]int64),
 		manager:    manager,
 	}
 }
@@ -109,16 +131,61 @@ func (csm *ClusterStateMachine) Lookup(query interface{}) (interface{}, error) {
 			return csm.brokers, nil
 		case "topics":
 			return csm.topics, nil
+		case "partitions":
+			return csm.partitions, nil
+		case "replication_log":
+			// 返回消息数据，而不是日志结构
+			var allMessages []*MessageEntry
+			for _, partitionMap := range csm.messages {
+				for _, messages := range partitionMap {
+					allMessages = append(allMessages, messages...)
+				}
+			}
+			return allMessages, nil
 		default:
 			return nil, fmt.Errorf("unknown query type: %s", q)
 		}
 	case []byte:
+		// 尝试解析JSON查询
+		var jsonQuery struct {
+			Type      string `json:"type"`
+			Topic     string `json:"topic,omitempty"`
+			Partition int32  `json:"partition,omitempty"`
+		}
+
+		if err := json.Unmarshal(q, &jsonQuery); err == nil {
+			switch jsonQuery.Type {
+			case "get_next_offset":
+				return csm.getNextOffsetQuery(jsonQuery.Topic, jsonQuery.Partition)
+			case "get_partition_info":
+				return csm.getPartitionInfo(jsonQuery.Topic, jsonQuery.Partition)
+			case "get_messages":
+				return csm.getMessages(jsonQuery.Topic, jsonQuery.Partition)
+			case "get_brokers":
+				return csm.brokers, nil
+			case "get_topics":
+				return csm.topics, nil
+			}
+		}
+
+		// 兼容原有的字符串查询
 		queryStr := string(q)
 		switch queryStr {
 		case "brokers":
 			return csm.brokers, nil
 		case "topics":
 			return csm.topics, nil
+		case "partitions":
+			return csm.partitions, nil
+		case "replication_log":
+			// 返回消息数据，而不是日志结构
+			var allMessages []*MessageEntry
+			for _, partitionMap := range csm.messages {
+				for _, messages := range partitionMap {
+					allMessages = append(allMessages, messages...)
+				}
+			}
+			return allMessages, nil
 		default:
 			return nil, fmt.Errorf("unknown query type: %s", queryStr)
 		}
@@ -133,13 +200,17 @@ func (csm *ClusterStateMachine) SaveSnapshot(w io.Writer, fc sm.ISnapshotFileCol
 	defer csm.mu.RUnlock()
 
 	snapshot := struct {
-		Brokers    map[uint64]*BrokerInfo              `json:"brokers"`
-		Topics     map[string]*TopicInfo               `json:"topics"`
-		Partitions map[string]map[int32]*PartitionInfo `json:"partitions"`
+		Brokers    map[uint64]*BrokerInfo               `json:"brokers"`
+		Topics     map[string]*TopicInfo                `json:"topics"`
+		Partitions map[string]map[int32]*PartitionInfo  `json:"partitions"`
+		Messages   map[string]map[int32][]*MessageEntry `json:"messages"`
+		Offsets    map[string]map[int32]int64           `json:"offsets"`
 	}{
 		Brokers:    csm.brokers,
 		Topics:     csm.topics,
 		Partitions: csm.partitions,
+		Messages:   csm.messages,
+		Offsets:    csm.offsets,
 	}
 
 	data, err := json.Marshal(snapshot)
@@ -162,9 +233,11 @@ func (csm *ClusterStateMachine) RecoverFromSnapshot(r io.Reader, files []sm.Snap
 	}
 
 	var snapshot struct {
-		Brokers    map[uint64]*BrokerInfo              `json:"brokers"`
-		Topics     map[string]*TopicInfo               `json:"topics"`
-		Partitions map[string]map[int32]*PartitionInfo `json:"partitions"`
+		Brokers    map[uint64]*BrokerInfo               `json:"brokers"`
+		Topics     map[string]*TopicInfo                `json:"topics"`
+		Partitions map[string]map[int32]*PartitionInfo  `json:"partitions"`
+		Messages   map[string]map[int32][]*MessageEntry `json:"messages"`
+		Offsets    map[string]map[int32]int64           `json:"offsets"`
 	}
 
 	if err := json.Unmarshal(data, &snapshot); err != nil {
@@ -174,6 +247,8 @@ func (csm *ClusterStateMachine) RecoverFromSnapshot(r io.Reader, files []sm.Snap
 	csm.brokers = snapshot.Brokers
 	csm.topics = snapshot.Topics
 	csm.partitions = snapshot.Partitions
+	csm.messages = snapshot.Messages
+	csm.offsets = snapshot.Offsets
 
 	return nil
 }
@@ -236,7 +311,7 @@ func (csm *ClusterStateMachine) createTopic(op *Operation) ([]byte, error) {
 	}
 	csm.topics[op.Topic] = topicInfo
 
-	// 创建分区信息
+	// 创建分区信息（简化 - 不需要Leader/ISR概念）
 	csm.partitions[op.Topic] = make(map[int32]*PartitionInfo)
 	brokerList := csm.getAliveBrokers()
 
@@ -245,18 +320,24 @@ func (csm *ClusterStateMachine) createTopic(op *Operation) ([]byte, error) {
 		partitionInfo := &PartitionInfo{
 			Topic:    op.Topic,
 			ID:       i,
-			Leader:   replicas[0], // 第一个副本作为Leader
 			Replicas: replicas,
-			ISR:      replicas, // 初始时所有副本都在ISR中
 		}
 		csm.partitions[op.Topic][i] = partitionInfo
+	}
+
+	// 初始化消息存储
+	csm.messages[op.Topic] = make(map[int32][]*MessageEntry)
+	csm.offsets[op.Topic] = make(map[int32]int64)
+	for i := int32(0); i < topicConfig.Partitions; i++ {
+		csm.messages[op.Topic][i] = make([]*MessageEntry, 0)
+		csm.offsets[op.Topic][i] = 0
 	}
 
 	// 在本地Manager中创建topic
 	if csm.manager != nil {
 		_, err := csm.manager.CreateTopic(op.Topic, &topicConfig)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create topic in local manager: %v", err)
+			log.Printf("Warning: failed to create topic in local manager: %v", err)
 		}
 	}
 
@@ -272,44 +353,76 @@ func (csm *ClusterStateMachine) deleteTopic(op *Operation) ([]byte, error) {
 
 	delete(csm.topics, op.Topic)
 	delete(csm.partitions, op.Topic)
+	delete(csm.messages, op.Topic)
+	delete(csm.offsets, op.Topic)
 
 	return []byte("OK"), nil
 }
 
-// appendMessage appends a message to a partition
+// appendMessage appends a message through Raft (自动同步到所有节点)
 func (csm *ClusterStateMachine) appendMessage(op *Operation) ([]byte, error) {
+	// 检查topic和partition是否存在
 	partitionMap, exists := csm.partitions[op.Topic]
 	if !exists {
 		return nil, fmt.Errorf("topic %s not found", op.Topic)
 	}
 
-	partitionInfo, exists := partitionMap[op.Partition]
+	_, exists = partitionMap[op.Partition]
 	if !exists {
 		return nil, fmt.Errorf("partition %d not found for topic %s", op.Partition, op.Topic)
 	}
 
-	// 检查当前节点是否为该分区的Leader
-	if partitionInfo.Leader != csm.nodeID {
-		return nil, fmt.Errorf("not the leader for partition %d of topic %s", op.Partition, op.Topic)
+	// 获取下一个offset
+	if csm.offsets[op.Topic] == nil {
+		csm.offsets[op.Topic] = make(map[int32]int64)
+	}
+	nextOffset := csm.offsets[op.Topic][op.Partition]
+
+	// 创建消息条目
+	messageID := fmt.Sprintf("%s-%d-%d-%d", op.Topic, op.Partition, nextOffset, time.Now().UnixNano())
+	timestamp := time.Now().UnixMilli()
+
+	messageEntry := &MessageEntry{
+		ID:        messageID,
+		Topic:     op.Topic,
+		Partition: op.Partition,
+		Offset:    nextOffset,
+		Data:      op.Data,
+		Timestamp: timestamp,
+		Checksum:  csm.calculateChecksum(op.Data),
 	}
 
-	// 在本地Manager中写入消息
+	// 存储消息到状态机 - 这会自动通过Raft同步到所有节点
+	if csm.messages[op.Topic] == nil {
+		csm.messages[op.Topic] = make(map[int32][]*MessageEntry)
+	}
+	csm.messages[op.Topic][op.Partition] = append(csm.messages[op.Topic][op.Partition], messageEntry)
+
+	// 更新offset
+	csm.offsets[op.Topic][op.Partition] = nextOffset + 1
+
+	// 在本地存储中写入消息（每个节点都会执行这个操作）
 	if csm.manager != nil {
-		offset, err := csm.manager.WriteMessage(op.Topic, op.Partition, op.Data)
+		_, err := csm.manager.WriteMessageDirect(op.Topic, op.Partition, op.Data, nextOffset)
 		if err != nil {
-			return nil, fmt.Errorf("failed to write message: %v", err)
+			log.Printf("Warning: failed to write message to local storage: %v", err)
+			// 不返回错误，因为数据已经在Raft状态机中了
 		}
-
-		result := struct {
-			Offset int64 `json:"offset"`
-		}{
-			Offset: offset,
-		}
-		resultBytes, _ := json.Marshal(result)
-		return resultBytes, nil
 	}
 
-	return []byte("OK"), nil
+	// 返回结果
+	result := struct {
+		MessageID string `json:"message_id"`
+		Offset    int64  `json:"offset"`
+		Timestamp int64  `json:"timestamp"`
+	}{
+		MessageID: messageID,
+		Offset:    nextOffset,
+		Timestamp: timestamp,
+	}
+
+	resultBytes, _ := json.Marshal(result)
+	return resultBytes, nil
 }
 
 // updateMetadata updates cluster metadata
@@ -367,4 +480,44 @@ func (csm *ClusterStateMachine) assignReplicas(brokers []uint64, replicaCount in
 	}
 
 	return replicas
+}
+
+// 辅助方法
+func (csm *ClusterStateMachine) calculateChecksum(data []byte) uint32 {
+	// 简单的校验和计算
+	var sum uint32
+	for _, b := range data {
+		sum += uint32(b)
+	}
+	return sum
+}
+
+// 查询辅助方法
+func (csm *ClusterStateMachine) getNextOffsetQuery(topic string, partition int32) (interface{}, error) {
+	if csm.offsets[topic] != nil {
+		if offset, exists := csm.offsets[topic][partition]; exists {
+			return map[string]interface{}{"offset": offset}, nil
+		}
+	}
+
+	// 如果没有记录，返回0
+	return map[string]interface{}{"offset": int64(0)}, nil
+}
+
+func (csm *ClusterStateMachine) getPartitionInfo(topic string, partition int32) (interface{}, error) {
+	if partitionMap, exists := csm.partitions[topic]; exists {
+		if partitionInfo, exists := partitionMap[partition]; exists {
+			return partitionInfo, nil
+		}
+	}
+	return nil, fmt.Errorf("partition %d not found for topic %s", partition, topic)
+}
+
+func (csm *ClusterStateMachine) getMessages(topic string, partition int32) (interface{}, error) {
+	if partitionMap, exists := csm.messages[topic]; exists {
+		if partitionMessages, exists := partitionMap[partition]; exists {
+			return partitionMessages, nil
+		}
+	}
+	return nil, fmt.Errorf("messages for partition %d not found for topic %s", partition, topic)
 }

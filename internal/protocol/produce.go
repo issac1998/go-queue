@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 
+	"github.com/issac1998/go-queue/internal/cluster"
 	"github.com/issac1998/go-queue/internal/metadata"
 )
 
@@ -34,9 +35,10 @@ const (
 	ErrorMessageTooLarge  = 5
 	ErrorOffsetOutOfRange = 6
 
-	ErrorBrokerNotAvailable = 100
-	ErrorFetchFailed        = 101
-	ErrorProduceFailed      = 102
+	ErrorBrokerNotAvailable    = 100
+	ErrorFetchFailed           = 101
+	ErrorProduceFailed         = 102
+	ErrorNotLeaderForPartition = 103 // 新增：不是分区leader
 
 	ErrorUnauthorized  = 200
 	ErrorQuotaExceeded = 201
@@ -148,10 +150,35 @@ func HandleProduceRequest(conn io.ReadWriter, manager *metadata.Manager, cluster
 
 	// 如果启用了集群模式，优先使用集群管理器
 	if clusterManager != nil {
-		// 这里可以添加集群相关的逻辑
-		// 目前先使用本地manager
+		// 类型断言为集群管理器
+		if cm, ok := clusterManager.(interface {
+			ProduceMessage(topic string, partition int32, data []byte) (*cluster.ProduceResult, error)
+		}); ok {
+			// 通过Raft集群进行消息写入
+			var firstOffset int64 = -1
+			for _, msg := range req.Messages {
+				result, err := cm.ProduceMessage(req.Topic, req.Partition, msg)
+				if err != nil {
+					// 如果是非leader错误，返回特殊错误码
+					if err.Error() == "not the leader" {
+						return writeErrorResponse(conn, ErrorNotLeaderForPartition)
+					}
+					return writeErrorResponse(conn, ErrorMessageTooLarge)
+				}
+				if firstOffset == -1 {
+					firstOffset = result.Offset
+				}
+			}
+
+			response := &ProduceResponse{
+				BaseOffset: firstOffset,
+				ErrorCode:  0,
+			}
+			return response.Write(conn)
+		}
 	}
 
+	// 单机模式 - 使用本地manager
 	var firstOffset int64 = -1
 	for _, msg := range req.Messages {
 		offset, err := manager.WriteMessage(req.Topic, req.Partition, msg)
