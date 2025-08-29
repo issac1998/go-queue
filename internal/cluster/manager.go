@@ -264,6 +264,12 @@ func (cm *Manager) RegisterBroker(broker *BrokerInfo) error {
 
 // GetClusterInfo returns cluster information
 func (cm *Manager) GetClusterInfo() (*ClusterInfo, error) {
+	// 获取Leader信息
+	leaderID, valid, err := cm.nodeHost.GetLeaderID(ClusterID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get leader ID: %v", err)
+	}
+
 	brokers, err := cm.getBrokers()
 	if err != nil {
 		return nil, err
@@ -275,21 +281,102 @@ func (cm *Manager) GetClusterInfo() (*ClusterInfo, error) {
 	}
 
 	return &ClusterInfo{
-		Brokers: brokers,
-		Topics:  topics,
+		LeaderID:    leaderID,
+		LeaderValid: valid,
+		CurrentNode: cm.nodeID,
+		IsLeader:    valid && leaderID == cm.nodeID,
+		Brokers:     brokers,
+		Topics:      topics,
 	}, nil
 }
 
-// IsLeader returns whether current node is leader
+// IsLeader 检查当前节点是否为Leader
 func (cm *Manager) IsLeader() bool {
-	cm.mu.RLock()
-	defer cm.mu.RUnlock()
-	return cm.isLeader
+	leaderID, valid, err := cm.nodeHost.GetLeaderID(ClusterID)
+	if err != nil || !valid {
+		return false
+	}
+	return leaderID == cm.nodeID
 }
 
-// GetLeaderID returns the current leader ID
+// GetLeaderID 获取当前Leader的节点ID
 func (cm *Manager) GetLeaderID() (uint64, bool, error) {
 	return cm.nodeHost.GetLeaderID(ClusterID)
+}
+
+// ReadMessage 从Raft集群读取消息（支持Follower读）
+func (cm *Manager) ReadMessage(topic string, partition int32, offset int64, maxBytes int32) ([][]byte, int64, error) {
+	// 构建查询请求
+	query := struct {
+		Type      string `json:"type"`
+		Topic     string `json:"topic"`
+		Partition int32  `json:"partition"`
+		Offset    int64  `json:"offset"`
+		MaxBytes  int32  `json:"max_bytes"`
+	}{
+		Type:      "get_messages",
+		Topic:     topic,
+		Partition: partition,
+		Offset:    offset,
+		MaxBytes:  maxBytes,
+	}
+
+	return cm.readWithReadIndex(query)
+}
+
+// readWithReadIndex 使用ReadIndex协议进行强一致性读
+func (cm *Manager) readWithReadIndex(query interface{}) ([][]byte, int64, error) {
+	ctx, cancel := context.WithTimeout(cm.ctx, 5*time.Second)
+	defer cancel()
+
+	// 使用ReadIndex协议确保读取到最新数据
+	rs, err := cm.nodeHost.ReadIndex(ClusterID, 3*time.Second)
+	if err != nil {
+		return nil, 0, fmt.Errorf("ReadIndex failed: %v", err)
+	}
+	defer rs.Release()
+
+	// 等待ReadIndex完成
+	select {
+	case result := <-rs.ResultC():
+		if !result.Completed() {
+			return nil, 0, fmt.Errorf("ReadIndex not completed")
+		}
+
+		// 执行本地读取
+		readResult, err := cm.nodeHost.ReadLocalNode(rs, query)
+		if err != nil {
+			return nil, 0, fmt.Errorf("ReadLocalNode failed: %v", err)
+		}
+
+		return cm.parseReadResult(readResult)
+	case <-ctx.Done():
+		return nil, 0, fmt.Errorf("ReadIndex timeout")
+	}
+}
+
+// parseReadResult 解析读取结果
+func (cm *Manager) parseReadResult(result interface{}) ([][]byte, int64, error) {
+	// 解析Raft状态机返回的结果
+	if resultData, ok := result.([]byte); ok {
+		var response struct {
+			Messages   [][]byte `json:"messages"`
+			NextOffset int64    `json:"next_offset"`
+			Error      string   `json:"error"`
+		}
+
+		if err := json.Unmarshal(resultData, &response); err != nil {
+			return nil, 0, fmt.Errorf("failed to parse read result: %v", err)
+		}
+
+		if response.Error != "" {
+			return nil, 0, fmt.Errorf("read error: %s", response.Error)
+		}
+
+		return response.Messages, response.NextOffset, nil
+	}
+
+	return nil, 0, fmt.Errorf("invalid read result format")
 }
 
 // propose proposes an operation to the Raft cluster
@@ -384,8 +471,12 @@ type ProduceResult struct {
 
 // ClusterInfo represents cluster information
 type ClusterInfo struct {
-	Brokers map[uint64]*BrokerInfo `json:"brokers"`
-	Topics  map[string]*TopicInfo  `json:"topics"`
+	LeaderID    uint64                 `json:"leader_id"`
+	LeaderValid bool                   `json:"leader_valid"`
+	CurrentNode uint64                 `json:"current_node"`
+	IsLeader    bool                   `json:"is_leader"`
+	Brokers     map[uint64]*BrokerInfo `json:"brokers"`
+	Topics      map[string]*TopicInfo  `json:"topics"`
 }
 
 // 简化的辅助方法

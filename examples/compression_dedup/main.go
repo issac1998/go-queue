@@ -14,8 +14,8 @@ func main() {
 	fmt.Println(strings.Repeat("=", 60))
 
 	c := client.NewClient(client.ClientConfig{
-		BrokerAddr: "localhost:9092",
-		Timeout:    10 * time.Second,
+		BrokerAddrs: []string{"localhost:9092"},
+		Timeout:     10 * time.Second,
 	})
 
 	testTopicName := "compression-dedup-demo"
