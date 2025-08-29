@@ -60,11 +60,19 @@ import (
 )
 
 func main() {
-    // 创建客户端
+    // 统一智能客户端（自动检测集群/单机模式）
+    
+    // 单机模式
     client := client.NewClient(client.ClientConfig{
-        BrokerAddr: "localhost:9092",
-        Timeout:    5 * time.Second,
+        BrokerAddrs: []string{"localhost:9092"},
+        Timeout:     5 * time.Second,
     })
+    
+    // 集群模式（自动启用负载均衡）
+    // client := client.NewClient(client.ClientConfig{
+    //     BrokerAddrs: []string{"localhost:9092", "localhost:9093", "localhost:9094"},
+    //     Timeout:     10 * time.Second,
+    // })
 
     // 创建管理员客户端
     admin := client.NewAdmin(client)
@@ -171,8 +179,8 @@ go run main.go -cmd=consume -topic=test-topic -partition=0 -offset=0
 
 ```go
 type ClientConfig struct {
-    BrokerAddr string        // Broker地址，默认localhost:9092
-    Timeout    time.Duration // 连接超时时间，默认5秒
+    BrokerAddrs []string      // Broker地址列表，单个地址表示单Broker模式，多个地址表示集群模式
+    Timeout     time.Duration // 连接超时时间，默认5秒
 }
 
 func NewClient(config ClientConfig) *Client

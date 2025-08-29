@@ -13,13 +13,9 @@ import (
 
 // Consumer Group相关的请求类型
 const (
-	JoinGroupRequestType     = 3
-	LeaveGroupRequestType    = 4
-	HeartbeatRequestType     = 5
-	CommitOffsetRequestType  = 6
-	FetchOffsetRequestType   = 7
-	ListGroupsRequestType    = 8
-	DescribeGroupRequestType = 9
+	// 基础请求类型常量已移至 protocol.go
+	ListGroupsRequestType    = 9
+	DescribeGroupRequestType = 10
 )
 
 // JoinGroupRequest 加入组请求

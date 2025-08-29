@@ -13,8 +13,8 @@ func main() {
 
 	// 创建客户端连接到集群
 	c := client.NewClient(client.ClientConfig{
-		BrokerAddr: "localhost:9092", // 连接到集群的第一个节点
-		Timeout:    10 * time.Second,
+		BrokerAddrs: []string{"localhost:9092"}, // 连接到集群的第一个节点
+		Timeout:     10 * time.Second,
 	})
 
 	// 创建管理员客户端

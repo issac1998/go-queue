@@ -29,7 +29,8 @@ func TestNewClient(t *testing.T) {
 			},
 			expected: ClientConfig{
 				BrokerAddrs: []string{"localhost:9093"},
-				Timeout:     10 * time.Second,
+
+				Timeout: 10 * time.Second,
 			},
 		},
 	}
@@ -66,11 +67,8 @@ func TestClientConnect(t *testing.T) {
 		Timeout:     100 * time.Millisecond,
 	})
 
-	conn, err := client.connect()
+	_, err := client.connect(false)
 	if err == nil {
 		t.Error("expected connection error for non-existent broker")
-		if conn != nil {
-			conn.Close()
-		}
 	}
 }
