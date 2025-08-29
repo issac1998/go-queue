@@ -11,7 +11,6 @@ import (
 	"github.com/issac1998/go-queue/internal/storage"
 )
 
-const FetchRequestType = 0x01
 
 type FetchRequest struct {
 	Topic     string
@@ -102,7 +101,7 @@ func (res *FetchResponse) Write(w io.Writer) error {
 }
 
 // HandleFetchRequest
-func HandleFetchRequest(conn io.ReadWriteCloser, manager *metadata.Manager) error {
+func HandleFetchRequest(conn io.ReadWriteCloser, manager *metadata.Manager, clusterManager interface{}) error {
 	defer conn.Close()
 
 	req, err := ReadFetchRequest(conn)
@@ -110,6 +109,29 @@ func HandleFetchRequest(conn io.ReadWriteCloser, manager *metadata.Manager) erro
 		return sendFetchError(conn, ErrorInvalidRequest, err.Error())
 	}
 
+	// 如果启用了集群模式，优先使用Raft读取
+	if clusterManager != nil {
+		if cm, ok := clusterManager.(interface {
+			ReadMessage(topic string, partition int32, offset int64, maxBytes int32) ([][]byte, int64, error)
+		}); ok {
+			// 使用集群管理器读取（支持Follower读）
+			messages, nextOffset, err := cm.ReadMessage(req.Topic, req.Partition, req.Offset, req.MaxBytes)
+			if err != nil {
+				return sendFetchError(conn, ErrorOffsetOutOfRange, err.Error())
+			}
+
+			response := &FetchResponse{
+				Topic:      req.Topic,
+				Partition:  req.Partition,
+				ErrorCode:  ErrorNone,
+				Messages:   messages,
+				NextOffset: nextOffset,
+			}
+			return response.Write(conn)
+		}
+	}
+
+	// 单机模式 - 使用本地manager
 	messages, nextOffset, err := manager.ReadMessage(req.Topic, req.Partition, req.Offset, req.MaxBytes)
 	if err != nil {
 		return sendFetchError(conn, ErrorOffsetOutOfRange, err.Error())

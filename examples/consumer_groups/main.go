@@ -16,6 +16,7 @@ func main() {
 	c := client.NewClient(client.ClientConfig{
 		BrokerAddrs: []string{"localhost:9092"},
 		Timeout:     10 * time.Second,
+
 	})
 
 	// 1. 创建测试topic

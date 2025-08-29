@@ -15,8 +15,9 @@ const (
 	// MaxMessageSize defines max message size.
 	MaxMessageSize = 1 << 20
 	// CompressionNone decides compress or not
-	CompressionNone    = 0x00
-	ProduceRequestType = 0x00
+
+	CompressionNone = 0x00
+	// CompressionNone decides compress or not
 
 	DefaultMaxFetchBytes = 1 << 20
 	MaxFetchBytesLimit   = 5 << 20
