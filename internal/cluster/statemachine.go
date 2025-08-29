@@ -151,6 +151,8 @@ func (csm *ClusterStateMachine) Lookup(query interface{}) (interface{}, error) {
 			Type      string `json:"type"`
 			Topic     string `json:"topic,omitempty"`
 			Partition int32  `json:"partition,omitempty"`
+			Offset    int64  `json:"offset,omitempty"`
+			MaxBytes  int32  `json:"max_bytes,omitempty"`
 		}
 
 		if err := json.Unmarshal(q, &jsonQuery); err == nil {
@@ -160,7 +162,7 @@ func (csm *ClusterStateMachine) Lookup(query interface{}) (interface{}, error) {
 			case "get_partition_info":
 				return csm.getPartitionInfo(jsonQuery.Topic, jsonQuery.Partition)
 			case "get_messages":
-				return csm.getMessages(jsonQuery.Topic, jsonQuery.Partition)
+				return csm.getMessagesWithRange(jsonQuery.Topic, jsonQuery.Partition, jsonQuery.Offset, jsonQuery.MaxBytes)
 			case "get_brokers":
 				return csm.brokers, nil
 			case "get_topics":
@@ -520,4 +522,63 @@ func (csm *ClusterStateMachine) getMessages(topic string, partition int32) (inte
 		}
 	}
 	return nil, fmt.Errorf("messages for partition %d not found for topic %s", partition, topic)
+}
+
+// getMessagesWithRange 根据offset和maxBytes获取消息
+func (csm *ClusterStateMachine) getMessagesWithRange(topic string, partition int32, offset int64, maxBytes int32) (interface{}, error) {
+	if partitionMap, exists := csm.messages[topic]; exists {
+		if partitionMessages, exists := partitionMap[partition]; exists {
+			// 过滤出指定offset范围的消息
+			var resultMessages [][]byte
+			var totalBytes int32 = 0
+			nextOffset := offset
+
+			for _, msg := range partitionMessages {
+				if msg.Offset >= offset {
+					if maxBytes > 0 && totalBytes+int32(len(msg.Data)) > maxBytes {
+						break
+					}
+					resultMessages = append(resultMessages, msg.Data)
+					totalBytes += int32(len(msg.Data))
+					nextOffset = msg.Offset + 1
+				}
+			}
+
+			// 返回JSON格式的响应
+			response := struct {
+				Messages   [][]byte `json:"messages"`
+				NextOffset int64    `json:"next_offset"`
+				Error      string   `json:"error"`
+			}{
+				Messages:   resultMessages,
+				NextOffset: nextOffset,
+				Error:      "",
+			}
+
+			responseData, err := json.Marshal(response)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal response: %v", err)
+			}
+
+			return responseData, nil
+		}
+	}
+
+	// 如果topic/partition不存在，返回空结果
+	response := struct {
+		Messages   [][]byte `json:"messages"`
+		NextOffset int64    `json:"next_offset"`
+		Error      string   `json:"error"`
+	}{
+		Messages:   [][]byte{},
+		NextOffset: offset,
+		Error:      "",
+	}
+
+	responseData, err := json.Marshal(response)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal empty response: %v", err)
+	}
+
+	return responseData, nil
 }

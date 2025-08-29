@@ -13,16 +13,8 @@ import (
 	"github.com/issac1998/go-queue/internal/protocol"
 )
 
-const (
-	produceRequest      = 0
-	fetchRequest        = 1
-	createTopicRequest  = 2
-	joinGroupRequest    = 3
-	leaveGroupRequest   = 4
-	heartbeatRequest    = 5
-	commitOffsetRequest = 6
-	fetchOffsetRequest  = 7
-)
+// 使用 protocol 包中定义的常量
+// const 定义已移至 internal/protocol/protocol.go
 
 var (
 	manager        *metadata.Manager
@@ -110,22 +102,24 @@ func handleConnection(conn net.Conn) {
 		}
 
 		switch reqType {
-		case produceRequest:
+		case protocol.ProduceRequestType:
 			protocol.HandleProduceRequest(conn, manager, clusterManager)
-		case fetchRequest:
-			protocol.HandleFetchRequest(conn, manager)
-		case createTopicRequest:
+		case protocol.FetchRequestType:
+			protocol.HandleFetchRequest(conn, manager, clusterManager)
+		case protocol.CreateTopicRequestType:
 			protocol.HandleCreateTopicRequest(conn, manager)
-		case joinGroupRequest:
+		case protocol.JoinGroupRequestType:
 			protocol.HandleJoinGroupRequest(conn, manager)
-		case leaveGroupRequest:
+		case protocol.LeaveGroupRequestType:
 			protocol.HandleLeaveGroupRequest(conn, manager)
-		case heartbeatRequest:
+		case protocol.HeartbeatRequestType:
 			protocol.HandleHeartbeatRequest(conn, manager)
-		case commitOffsetRequest:
+		case protocol.CommitOffsetRequestType:
 			protocol.HandleCommitOffsetRequest(conn, manager)
-		case fetchOffsetRequest:
+		case protocol.FetchOffsetRequestType:
 			protocol.HandleFetchOffsetRequest(conn, manager)
+		case protocol.ClusterInfoRequestType:
+			protocol.HandleClusterInfoRequest(conn, clusterManager)
 		default:
 			log.Printf("Unknown request type: %d", reqType)
 			return
