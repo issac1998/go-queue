@@ -37,6 +37,13 @@ const (
 	ListGroupsRequestType = 8
 	// DescribeGroupRequestType is used for getting detailed information about a consumer group
 	DescribeGroupRequestType = 9
+
+	// Controller discovery and verification requests
+	ControllerDiscoverRequestType = 1000
+	ControllerVerifyRequestType   = 1001
+
+	// Topic metadata requests
+	GetTopicMetadataRequestType = 1002
 )
 
 // Error code constants define different types of errors that can occur

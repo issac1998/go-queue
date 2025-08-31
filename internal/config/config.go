@@ -15,6 +15,9 @@ import (
 type BrokerConfig struct {
 	*metadata.Config
 	Server ServerConfig `json:"server"`
+
+	// FollowerRead configuration
+	EnableFollowerRead bool `json:"enable_follower_read" yaml:"enable_follower_read"` // Enable follower read for this broker
 }
 
 // ServerConfig represents server-specific configuration
@@ -25,10 +28,10 @@ type ServerConfig struct {
 
 // ClientConfig represents client configuration
 type ClientConfig struct {
-	Broker  string        `json:"broker"`
-	Timeout string        `json:"timeout"`
-	LogFile string        `json:"log_file"`
-	Command CommandConfig `json:"command"`
+	BrokerAddrs []string      `json:"broker_addrs"`
+	Timeout     string        `json:"timeout"`
+	LogFile     string        `json:"log_file"`
+	Command     CommandConfig `json:"command"`
 }
 
 // CommandConfig represents command-specific configuration
@@ -157,8 +160,8 @@ func LoadClientConfig(configPath string) (*ClientConfig, error) {
 	}
 
 	// Set defaults if not provided
-	if config.Broker == "" {
-		config.Broker = "localhost:9092"
+	if len(config.BrokerAddrs) == 0 {
+		config.BrokerAddrs = []string{"localhost:9092"}
 	}
 	if config.Timeout == "" {
 		config.Timeout = "10s"
@@ -170,4 +173,12 @@ func LoadClientConfig(configPath string) (*ClientConfig, error) {
 // GetTimeoutDuration parses timeout string to duration
 func (c *ClientConfig) GetTimeoutDuration() (time.Duration, error) {
 	return time.ParseDuration(c.Timeout)
+}
+
+// GetBrokerAddrs returns the broker addresses, handling both new and legacy config
+func (c *ClientConfig) GetBrokerAddrs() []string {
+	if len(c.BrokerAddrs) > 0 {
+		return c.BrokerAddrs
+	}
+	return []string{"localhost:9092"} // Default fallback
 }

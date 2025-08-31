@@ -12,18 +12,17 @@ import (
 func main() {
 	fmt.Println("=== Go Queue Consumer Groups Demo ===")
 
-	
+	// Create a client
 	c := client.NewClient(client.ClientConfig{
-		BrokerAddr: "localhost:9092",
-		Timeout:    5 * time.Second,
+		BrokerAddrs: []string{"localhost:9092"},
+		Timeout:     5 * time.Second,
 	})
 
-	
 	fmt.Println("\n1. Creating test topic...")
 	admin := client.NewAdmin(c)
 	createResult, err := admin.CreateTopic(client.CreateTopicRequest{
 		Name:       "consumer-group-topic",
-		Partitions: 4, 
+		Partitions: 4,
 		Replicas:   1,
 	})
 	if err != nil {
@@ -34,11 +33,9 @@ func main() {
 		fmt.Printf("✓ Topic '%s' created successfully with 4 partitions!\n", createResult.Name)
 	}
 
-	
 	fmt.Println("\n2. Producing test messages...")
 	producer := client.NewProducer(c)
 
-	
 	for i := 0; i < 20; i++ {
 		partition := int32(i % 4) // 轮询分配到4个分区
 		message := fmt.Sprintf("Message %d for consumer groups", i+1)
@@ -60,13 +57,11 @@ func main() {
 		fmt.Printf("  ✓ Sent message %d to partition %d (offset: %d)\n", i+1, partition, result.Offset)
 	}
 
-	
 	fmt.Println("\n3. Creating consumer group with multiple consumers...")
 
 	groupID := "demo-consumer-group"
 	topics := []string{"consumer-group-topic"}
 
-	
 	var wg sync.WaitGroup
 	consumers := make([]*client.GroupConsumer, 3)
 
@@ -86,18 +81,14 @@ func main() {
 			continue
 		}
 
-		
 		assignment := consumers[i].GetAssignment()
 		fmt.Printf("  ✓ Consumer %s joined! Assignment: %v\n", consumerID, assignment)
 	}
 
-	
 	time.Sleep(2 * time.Second)
 
-	
 	fmt.Println("\n4. Starting message consumption...")
 
-	
 	consumedMessages := make(map[string][]string) // consumerID -> messages
 	var mu sync.Mutex
 
@@ -108,7 +99,6 @@ func main() {
 		go func(gc *client.GroupConsumer, cid string) {
 			defer wg.Done()
 
-			
 			messageHandler := func(msg client.Message) error {
 				mu.Lock()
 				if consumedMessages[cid] == nil {
@@ -122,10 +112,8 @@ func main() {
 				return nil
 			}
 
-			
 			fmt.Printf("  %s starting subscription...\n", cid)
 
-			
 			done := make(chan struct{})
 			go func() {
 				time.Sleep(10 * time.Second) // 消费10秒
@@ -138,7 +126,7 @@ func main() {
 			for topic, partitions := range assignment {
 				for _, partition := range partitions {
 					go func(t string, p int32) {
-						
+
 						startOffset, err := gc.FetchCommittedOffset(t, p)
 						if err != nil {
 							startOffset = 0 // 如果没有提交的offset，从头开始
@@ -150,7 +138,7 @@ func main() {
 							case <-done:
 								return
 							default:
-								
+
 								result, err := regularConsumer.FetchFrom(t, p, offset)
 								if err != nil {
 									log.Printf("Error fetching from %s:%d: %v", t, p, err)
@@ -164,12 +152,10 @@ func main() {
 									continue
 								}
 
-								
 								for _, msg := range result.Messages {
 									messageHandler(msg)
 									offset = msg.Offset + 1
 
-									
 									gc.CommitOffset(t, p, offset, "")
 								}
 
@@ -179,16 +165,13 @@ func main() {
 				}
 			}
 
-			
 			<-done
 		}(consumer, consumerID)
 	}
 
-	
 	fmt.Println("\n  Consuming messages for 10 seconds...")
 	wg.Wait()
 
-	
 	fmt.Println("\n5. Consumption statistics:")
 	totalConsumed := 0
 	for consumerID, messages := range consumedMessages {
@@ -197,7 +180,6 @@ func main() {
 	}
 	fmt.Printf("  Total messages consumed: %d\n", totalConsumed)
 
-	
 	fmt.Println("\n6. Simulating consumer leave and rebalance...")
 	if len(consumers) > 0 {
 		leavingConsumer := consumers[0]
@@ -209,10 +191,8 @@ func main() {
 			fmt.Printf("  ✓ Consumer consumer-1 left group successfully\n")
 		}
 
-		
 		time.Sleep(2 * time.Second)
 
-		
 		for i := 1; i < len(consumers); i++ {
 			consumerID := fmt.Sprintf("consumer-%d", i+1)
 			assignment := consumers[i].GetAssignment()
@@ -220,7 +200,6 @@ func main() {
 		}
 	}
 
-	
 	fmt.Println("\n7. Cleaning up remaining consumers...")
 	for i := 1; i < len(consumers); i++ {
 		consumerID := fmt.Sprintf("consumer-%d", i+1)

@@ -51,25 +51,11 @@ type FetchResult struct {
 // Fetch fetches messages
 func (c *Consumer) Fetch(req FetchRequest) (*FetchResult, error) {
 	if req.MaxBytes <= 0 {
-		req.MaxBytes = 1024 * 1024 
+		req.MaxBytes = 1024 * 1024
 	}
 
-	requestData, err := c.buildFetchRequest(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to build request: %v", err)
-	}
-
-	responseData, err := c.client.sendRequest(protocol.FetchRequestType, requestData)
-	if err != nil {
-		return nil, fmt.Errorf("failed to send request: %v", err)
-	}
-
-	result, err := c.parseFetchResponse(req.Topic, req.Partition, req.Offset, responseData)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse response: %v", err)
-	}
-
-	return result, nil
+	// Use partition-aware routing for data operations
+	return c.fetchFromPartition(req)
 }
 
 // FetchFrom fetches messages starting from specified offset
@@ -179,6 +165,49 @@ func (c *Consumer) parseFetchResponse(topic string, partition int32, requestOffs
 		}
 		result.Messages = append(result.Messages, message)
 		currentOffset++
+	}
+
+	return result, nil
+}
+
+// fetchFromPartition fetches messages directly from the partition leader or follower
+func (c *Consumer) fetchFromPartition(req FetchRequest) (*FetchResult, error) {
+	conn, err := c.client.connectForDataOperation(req.Topic, req.Partition, false)
+	if err != nil {
+		c.client.refreshTopicMetadata(req.Topic)
+		return nil, fmt.Errorf("failed to connect to partition leader or follower: %v", err)
+	}
+	defer conn.Close()
+
+	conn.SetDeadline(time.Now().Add(c.client.timeout))
+
+	requestData, err := c.buildFetchRequest(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build request: %v", err)
+	}
+
+	requestType := protocol.FetchRequestType
+	if err := binary.Write(conn, binary.BigEndian, requestType); err != nil {
+		return nil, fmt.Errorf("failed to send request type: %v", err)
+	}
+
+	if _, err := conn.Write(requestData); err != nil {
+		return nil, fmt.Errorf("failed to send request data: %v", err)
+	}
+
+	var responseLen int32
+	if err := binary.Read(conn, binary.BigEndian, &responseLen); err != nil {
+		return nil, fmt.Errorf("failed to read response length: %v", err)
+	}
+
+	responseData := make([]byte, responseLen)
+	if _, err := io.ReadFull(conn, responseData); err != nil {
+		return nil, fmt.Errorf("failed to read response data: %v", err)
+	}
+
+	result, err := c.parseFetchResponse(req.Topic, req.Partition, req.Offset, responseData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse response: %v", err)
 	}
 
 	return result, nil

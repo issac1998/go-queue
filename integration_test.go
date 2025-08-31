@@ -22,7 +22,7 @@ func TestBrokerIntegration(t *testing.T) {
 
 	// Create test client
 	c := client.NewClient(client.ClientConfig{
-		BrokerAddr: "localhost:9092",
+		BrokerAddrs: []string{"localhost:9092"},
 		Timeout:    5 * time.Second,
 	})
 
@@ -373,7 +373,7 @@ func TestManagerLifecycle(t *testing.T) {
 // TestClientReconnection tests client reconnection behavior
 func TestClientReconnection(t *testing.T) {
 	c := client.NewClient(client.ClientConfig{
-		BrokerAddr: "localhost:9999", // Non-existent port
+		BrokerAddrs: []string{"localhost:9999"}, // Non-existent port
 		Timeout:     100 * time.Millisecond,
 	})
 

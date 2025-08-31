@@ -11,9 +11,10 @@ import (
 func main() {
 	fmt.Println("=== Go Queue Topic Management Demo ===")
 
+	// Create a client
 	c := client.NewClient(client.ClientConfig{
-		BrokerAddr: "localhost:9092",
-		Timeout:    5 * time.Second,
+		BrokerAddrs: []string{"localhost:9092"},
+		Timeout:     5 * time.Second,
 	})
 
 	admin := client.NewAdmin(c)

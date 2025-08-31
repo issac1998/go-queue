@@ -8,6 +8,7 @@ import (
 
 	"github.com/issac1998/go-queue/internal/discovery"
 	"github.com/issac1998/go-queue/internal/raft"
+	"github.com/lni/dragonboat/v3"
 )
 
 // Broker is the core node of the system, integrating all functionality
@@ -17,8 +18,8 @@ type Broker struct {
 	Address string
 	Port    int
 
-	// NodeHost placeholder - in real implementation this would be *dragonboat.NodeHost
-	NodeHost interface{}
+	// NodeHost - Dragonboat NodeHost instance
+	NodeHost *dragonboat.NodeHost
 
 	// Controller functionality
 	Controller *ControllerManager
@@ -62,6 +63,9 @@ type BrokerConfig struct {
 
 	// Performance tuning
 	Performance *PerformanceConfig `yaml:"performance"`
+
+	// FollowerRead configuration
+	EnableFollowerRead bool `yaml:"enable_follower_read"` // Enable follower read for this broker
 }
 
 // PerformanceConfig contains performance tuning configuration
@@ -258,8 +262,8 @@ func (b *Broker) registerBroker() error {
 		ID:          b.ID,
 		Address:     b.Address,
 		Port:        b.Port,
-		RaftAddress: b.Address,
-		RaftPort:    b.Port + 1000, // Raft port offset
+		RaftAddress: b.Config.RaftConfig.RaftAddr, // Use actual Raft address
+		RaftPort:    0,                            // Port is included in RaftAddress
 		Status:      "starting",
 	}
 
