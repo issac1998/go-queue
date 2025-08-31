@@ -1,9 +1,9 @@
 {
-  "broker": "localhost:9092",
+  "broker_addrs": ["localhost:9092"],
   "timeout": "10s",
-  "log_file": "",
+  "log_file": "logs/client.log",
   "command": {
-    "type": "",
+    "type": "list-topics",
     "topic": "",
     "partition": 0,
     "message": "",

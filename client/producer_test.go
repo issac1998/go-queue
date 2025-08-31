@@ -1,7 +1,9 @@
 package client
 
 import (
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestNewProducer(t *testing.T) {
@@ -57,7 +59,10 @@ func TestProduceMessage_Validation(t *testing.T) {
 		},
 	}
 
-	client := NewClient(ClientConfig{})
+	client := NewClient(ClientConfig{
+		BrokerAddrs: []string{"localhost:9092"},
+		Timeout:     50 * time.Millisecond, // Very short timeout for tests
+	})
 	producer := NewProducer(client)
 
 	for _, tt := range tests {
@@ -131,5 +136,50 @@ func TestParseProduceResponse(t *testing.T) {
 	}
 	if result.Error != nil {
 		t.Errorf("expected no error, got %v", result.Error)
+	}
+}
+
+
+func TestProducerBatchValidation(t *testing.T) {
+	config := ClientConfig{
+		BrokerAddrs: []string{"localhost:9092"},
+		Timeout:     50,
+	}
+	client := NewClient(config)
+	producer := NewProducer(client)
+
+	// Test empty batch
+	_, err := producer.SendBatch([]ProduceMessage{})
+	if err == nil {
+		t.Error("Expected error for empty batch, got nil")
+	}
+	if !strings.Contains(err.Error(), "cannot be empty") {
+		t.Errorf("Expected 'cannot be empty' error, got: %v", err)
+	}
+
+	// Test mixed topic/partition batch
+	mixedMessages := []ProduceMessage{
+		{Topic: "topic1", Partition: 0, Value: []byte("msg1")},
+		{Topic: "topic2", Partition: 0, Value: []byte("msg2")}, // Different topic
+	}
+	_, err = producer.SendBatch(mixedMessages)
+	if err == nil {
+		t.Error("Expected error for mixed topic batch, got nil")
+	}
+	if !strings.Contains(err.Error(), "same topic and partition") {
+		t.Errorf("Expected 'same topic and partition' error, got: %v", err)
+	}
+
+	// Test mixed partition batch
+	mixedPartitions := []ProduceMessage{
+		{Topic: "topic1", Partition: 0, Value: []byte("msg1")},
+		{Topic: "topic1", Partition: 1, Value: []byte("msg2")}, // Different partition
+	}
+	_, err = producer.SendBatch(mixedPartitions)
+	if err == nil {
+		t.Error("Expected error for mixed partition batch, got nil")
+	}
+	if !strings.Contains(err.Error(), "same topic and partition") {
+		t.Errorf("Expected 'same topic and partition' error, got: %v", err)
 	}
 }

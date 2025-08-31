@@ -32,7 +32,7 @@ func main() {
 	}
 
 	if *broker != "" {
-		clientConfig.Broker = *broker
+		clientConfig.BrokerAddrs = []string{*broker}
 	}
 	if *logFile != "" {
 		clientConfig.LogFile = *logFile
@@ -71,18 +71,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	log.Printf("Go Queue client starting - Broker: %s, Command: %s",
-		clientConfig.Broker, clientConfig.Command.Type)
+	brokerAddrs := clientConfig.GetBrokerAddrs()
+	log.Printf("Go Queue client starting - Brokers: %v, Command: %s",
+		brokerAddrs, clientConfig.Command.Type)
 
-	// Parse timeout
 	timeout, err := clientConfig.GetTimeoutDuration()
 	if err != nil {
 		log.Fatalf("Invalid timeout configuration: %v", err)
 	}
 
 	c := client.NewClient(client.ClientConfig{
-		BrokerAddr: clientConfig.Broker,
-		Timeout:    timeout,
+		BrokerAddrs: brokerAddrs,
+		Timeout:     timeout,
 	})
 
 	switch clientConfig.Command.Type {
@@ -300,7 +300,7 @@ func describeTopic(c *client.Client, topicName string) {
 	log.Printf("Describing topic: %s", topicName)
 	admin := client.NewAdmin(c)
 
-	topic, err := admin.DescribeTopic(topicName)
+	topic, err := admin.GetTopicInfo(topicName)
 	if err != nil {
 		log.Fatalf("Failed to describe topic: %v", err)
 	}

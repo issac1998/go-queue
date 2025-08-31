@@ -1,0 +1,35 @@
+# Broker configuration
+node_id: "broker-1"
+bind_addr: "0.0.0.0"
+bind_port: 9092
+data_dir: "./data/broker-1"
+
+# Raft configuration
+raft:
+  rtt_millisecond: 200
+  heartbeat_rtt: 5
+  election_rtt: 10
+  check_quorum: true
+  snapshot_entries: 10000
+  compaction_overhead: 5000
+  max_in_mem_log_size: 67108864  # 64MB
+  controller_group_id: 1
+  controller_snapshot_freq: 1000
+
+# Service discovery configuration
+discovery:
+  type: "memory"  # "etcd", "consul", "memory"
+  endpoints: []
+  timeout: "5s"
+
+# Performance tuning
+performance:
+  max_batch_size: 500
+  max_batch_bytes: 1048576  # 1MB
+  batch_timeout: "10ms"
+  write_cache_size: 33554432  # 32MB
+  read_cache_size: 67108864   # 64MB
+  connection_pool_size: 100
+  connection_idle_timeout: "5m"
+  compression_type: "snappy"
+  compression_threshold: 1024 

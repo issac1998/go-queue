@@ -1,7 +1,11 @@
 package client
 
 import (
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/issac1998/go-queue/internal/protocol"
 )
 
 func TestNewAdmin(t *testing.T) {
@@ -14,7 +18,11 @@ func TestNewAdmin(t *testing.T) {
 }
 
 func TestCreateTopicRequest_Validation(t *testing.T) {
-	client := NewClient(ClientConfig{})
+	// Use very short timeout for tests to avoid hanging
+	client := NewClient(ClientConfig{
+		BrokerAddrs: []string{"localhost:9092"},
+		Timeout:     50 * time.Millisecond, // Very short timeout for tests
+	})
 	admin := NewAdmin(client)
 
 	tests := []struct {
@@ -138,7 +146,10 @@ func TestParseCreateTopicResponse(t *testing.T) {
 }
 
 func TestUnimplementedMethods(t *testing.T) {
-	client := NewClient(ClientConfig{})
+	client := NewClient(ClientConfig{
+		BrokerAddrs: []string{"localhost:9092"},
+		Timeout:     50 * time.Millisecond, // Very short timeout for tests
+	})
 	admin := NewAdmin(client)
 
 	// Test ListTopics
@@ -157,5 +168,90 @@ func TestUnimplementedMethods(t *testing.T) {
 	_, err = admin.GetTopicInfo("test-topic")
 	if err == nil {
 		t.Error("expected error for unimplemented GetTopicInfo")
+	}
+}
+
+func TestCreateTopic(t *testing.T) {
+	config := ClientConfig{
+		BrokerAddrs: []string{"localhost:9092"},
+		Timeout:     50,
+	}
+	client := NewClient(config)
+	admin := NewAdmin(client)
+
+	createReq := CreateTopicRequest{
+		Name:       "test-topic",
+		Partitions: 3,
+		Replicas:   1,
+	}
+
+	_, err := admin.CreateTopic(createReq)
+	if err == nil {
+		t.Error("Expected error when no broker is running, got nil")
+	}
+
+	// Should contain connection-related error
+	if !strings.Contains(err.Error(), "failed to") {
+		t.Errorf("Expected connection error, got: %v", err)
+	}
+}
+
+func TestFollowerReadListTopics(t *testing.T) {
+	config := ClientConfig{
+		BrokerAddrs: []string{"localhost:9092", "localhost:9093", "localhost:9094"},
+		Timeout:     50,
+	}
+	client := NewClient(config)
+	admin := NewAdmin(client)
+
+	// Test regular ListTopics (backward compatibility)
+	_, err := admin.ListTopics()
+	if err == nil {
+		t.Error("Expected error when no broker is running, got nil")
+	}
+
+	// Test follower read optimized ListTopics
+	_, err = admin.ListTopicsWithFollowerRead()
+	if err == nil {
+		t.Error("Expected error when no broker is running, got nil")
+	}
+
+	// Test direct controller access
+	_, err = admin.ListTopicsFromController()
+	if err == nil {
+		t.Error("Expected error when no controller is running, got nil")
+	}
+
+	// Verify that follower read error contains relevant information
+	if !strings.Contains(err.Error(), "failed to") {
+		t.Errorf("Expected connection-related error, got: %v", err)
+	}
+}
+
+func TestClientFollowerReadClassification(t *testing.T) {
+	config := ClientConfig{
+		BrokerAddrs: []string{"localhost:9092"},
+		Timeout:     50,
+	}
+	client := NewClient(config)
+
+	// Test that our read/write classification works
+	testCases := []struct {
+		requestType int32
+		isWrite     bool
+		description string
+	}{
+		{protocol.CreateTopicRequestType, true, "CREATE_TOPIC"},
+		{protocol.ListTopicsRequestType, false, "LIST_TOPICS"},
+		{protocol.JoinGroupRequestType, true, "JOIN_GROUP"},
+		{protocol.GetTopicMetadataRequestType, false, "GET_TOPIC_METADATA"},
+	}
+
+	for _, tc := range testCases {
+		result := client.isMetadataWriteRequest(tc.requestType)
+		if result != tc.isWrite {
+			t.Errorf("Expected %s (type %d) to be write=%v, got write=%v",
+				tc.description, tc.requestType, tc.isWrite, result)
+		}
 	}
 }
