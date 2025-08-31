@@ -11,9 +11,10 @@ import (
 func main() {
 	fmt.Println("=== Go Queue Topic Management Demo ===")
 
+	// Create a client
 	c := client.NewClient(client.ClientConfig{
-		BrokerAddr: "localhost:9092",
-		Timeout:    5 * time.Second,
+		BrokerAddrs: []string{"localhost:9092"},
+		Timeout:     5 * time.Second,
 	})
 
 	admin := client.NewAdmin(c)
@@ -82,7 +83,7 @@ func main() {
 	// 4. Describe topic details
 	fmt.Println("\n4. Describing topic details...")
 	topicToDescribe := testTopics[1].name
-	topicDetail, err := admin.DescribeTopic(topicToDescribe)
+	topicDetail, err := admin.GetTopicInfo(topicToDescribe)
 	if err != nil {
 		log.Printf("Failed to describe topic %s: %v", topicToDescribe, err)
 	} else {

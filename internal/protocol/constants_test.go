@@ -20,10 +20,9 @@ func TestRequestTypeNames(t *testing.T) {
 		{ListGroupsRequestType, "LIST_GROUPS"},
 		{DescribeGroupRequestType, "DESCRIBE_GROUP"},
 		{ListTopicsRequestType, "LIST_TOPICS"},
-		{DescribeTopicRequestType, "DESCRIBE_TOPIC"},
 		{DeleteTopicRequestType, "DELETE_TOPIC"},
 		{GetTopicInfoRequestType, "GET_TOPIC_INFO"},
-		{999, "UNKNOWN"}, 
+		{999, "UNKNOWN"},
 	}
 
 	for _, test := range tests {
@@ -51,7 +50,7 @@ func TestErrorCodeNames(t *testing.T) {
 		{ErrorProduceFailed, "PRODUCE_FAILED"},
 		{ErrorUnauthorized, "UNAUTHORIZED"},
 		{ErrorQuotaExceeded, "QUOTA_EXCEEDED"},
-		{999, "UNKNOWN_ERROR"}, 
+		{999, "UNKNOWN_ERROR"},
 	}
 
 	for _, test := range tests {
@@ -63,12 +62,11 @@ func TestErrorCodeNames(t *testing.T) {
 }
 
 func TestConstants(t *testing.T) {
-	
+
 	if ProtocolVersion != 1 {
 		t.Errorf("ProtocolVersion = %d, expected 1", ProtocolVersion)
 	}
 
-	
 	expectedRequestTypes := map[string]int32{
 		"PRODUCE":        0,
 		"FETCH":          1,
@@ -81,9 +79,8 @@ func TestConstants(t *testing.T) {
 		"LIST_GROUPS":    8,
 		"DESCRIBE_GROUP": 9,
 		"LIST_TOPICS":    10,
-		"DESCRIBE_TOPIC": 11,
-		"DELETE_TOPIC":   12,
-		"GET_TOPIC_INFO": 13,
+		"DELETE_TOPIC":   11,
+		"GET_TOPIC_INFO": 12,
 	}
 
 	for name, expectedValue := range expectedRequestTypes {
@@ -94,7 +91,6 @@ func TestConstants(t *testing.T) {
 		}
 	}
 
-	
 	expectedErrorCodes := map[string]int16{
 		"NONE":                 0,
 		"INVALID_REQUEST":      1,
@@ -120,7 +116,7 @@ func TestConstants(t *testing.T) {
 }
 
 func TestRequestTypeMapping(t *testing.T) {
-	
+
 	allRequestTypes := []int32{
 		ProduceRequestType,
 		FetchRequestType,
@@ -133,7 +129,6 @@ func TestRequestTypeMapping(t *testing.T) {
 		ListGroupsRequestType,
 		DescribeGroupRequestType,
 		ListTopicsRequestType,
-		DescribeTopicRequestType,
 		DeleteTopicRequestType,
 		GetTopicInfoRequestType,
 	}
@@ -147,7 +142,7 @@ func TestRequestTypeMapping(t *testing.T) {
 }
 
 func TestErrorCodeMapping(t *testing.T) {
-	
+
 	allErrorCodes := []int16{
 		ErrorNone,
 		ErrorInvalidRequest,

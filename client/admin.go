@@ -35,16 +35,18 @@ type CreateTopicResult struct {
 	Error error
 }
 
+// TopicInfo represents topic information
 type TopicInfo struct {
 	Name             string
 	Partitions       int32
 	Replicas         int32
-	CreatedAt        time.Time
-	Size             int64
 	MessageCount     int64
+	Size             int64
+	CreatedAt        time.Time
 	PartitionDetails []PartitionInfo
 }
 
+// PartitionInfo represents partition information
 type PartitionInfo struct {
 	ID           int32
 	Leader       int32
@@ -56,6 +58,7 @@ type PartitionInfo struct {
 	EndOffset    int64
 }
 
+// SimpleTopicInfo represents basic topic information
 type SimpleTopicInfo struct {
 	Name         string
 	Partitions   int32
@@ -90,7 +93,7 @@ func (a *Admin) CreateTopic(req CreateTopicRequest) (*CreateTopicResult, error) 
 	return result, nil
 }
 
-// ListTopics lists all topics
+// ListTopics lists all topics (for backward compatibility)
 func (a *Admin) ListTopics() ([]TopicInfo, error) {
 	requestData, err := a.buildListTopicsRequest()
 	if err != nil {
@@ -110,25 +113,68 @@ func (a *Admin) ListTopics() ([]TopicInfo, error) {
 	return topics, nil
 }
 
-// DescribeTopic gets detailed information about a topic
-func (a *Admin) DescribeTopic(topicName string) (*TopicInfo, error) {
-	requestData, err := a.buildDescribeTopicRequest(topicName)
+// ListTopicsWithFollowerRead lists all topics using follower read optimization
+func (a *Admin) ListTopicsWithFollowerRead() ([]TopicInfo, error) {
+	requestData, err := a.buildListTopicsRequest()
 	if err != nil {
 		return nil, fmt.Errorf("failed to build request: %v", err)
 	}
 
-	responseData, err := a.client.sendRequest(protocol.DescribeTopicRequestType, requestData)
+	// Use follower read optimization for list operations
+	responseData, err := a.client.sendRequestWithType(protocol.ListTopicsRequestType, requestData, true)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send request: %v", err)
 	}
 
-	topic, err := a.parseDescribeTopicResponse(responseData)
+	topics, err := a.parseListTopicsResponse(responseData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse response: %v", err)
 	}
 
-	return topic, nil
+	return topics, nil
 }
+
+// ListTopicsFromController explicitly lists topics from controller leader (for consistency)
+func (a *Admin) ListTopicsFromController() ([]TopicInfo, error) {
+	// Connect directly to controller for consistent reads
+	conn, err := a.client.connectToController()
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to controller: %v", err)
+	}
+	defer conn.Close()
+
+	conn.SetDeadline(time.Now().Add(a.client.timeout))
+
+	// Send request type
+	requestType := protocol.ListTopicsRequestType
+	if err := binary.Write(conn, binary.BigEndian, requestType); err != nil {
+		return nil, fmt.Errorf("failed to send request type: %v", err)
+	}
+
+	// Build and send request data
+	requestData, err := a.buildListTopicsRequest()
+	if err != nil {
+		return nil, fmt.Errorf("failed to build request: %v", err)
+	}
+
+	if _, err := conn.Write(requestData); err != nil {
+		return nil, fmt.Errorf("failed to send request data: %v", err)
+	}
+
+	// Read response
+	var responseLen int32
+	if err := binary.Read(conn, binary.BigEndian, &responseLen); err != nil {
+		return nil, fmt.Errorf("failed to read response length: %v", err)
+	}
+
+	responseData := make([]byte, responseLen)
+	if _, err := io.ReadFull(conn, responseData); err != nil {
+		return nil, fmt.Errorf("failed to read response data: %v", err)
+	}
+
+	return a.parseListTopicsResponse(responseData)
+}
+
 
 // DeleteTopic deletes a topic
 func (a *Admin) DeleteTopic(topicName string) error {
@@ -151,7 +197,7 @@ func (a *Admin) DeleteTopic(topicName string) error {
 }
 
 // GetTopicInfo gets basic topic information
-func (a *Admin) GetTopicInfo(topicName string) (*SimpleTopicInfo, error) {
+func (a *Admin) GetTopicInfo(topicName string) (*TopicInfo, error) {
 	requestData, err := a.buildGetTopicInfoRequest(topicName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build request: %v", err)
@@ -299,7 +345,7 @@ func (a *Admin) parseListTopicsResponse(data []byte) ([]TopicInfo, error) {
 
 	topics := make([]TopicInfo, topicCount)
 	for i := int32(0); i < topicCount; i++ {
-		
+
 		var nameLen int16
 		if err := binary.Read(buf, binary.BigEndian, &nameLen); err != nil {
 			return nil, fmt.Errorf("failed to read topic name length: %v", err)
@@ -310,7 +356,6 @@ func (a *Admin) parseListTopicsResponse(data []byte) ([]TopicInfo, error) {
 		}
 		topics[i].Name = string(nameBytes)
 
-		
 		if err := binary.Read(buf, binary.BigEndian, &topics[i].Partitions); err != nil {
 			return nil, fmt.Errorf("failed to read partitions: %v", err)
 		}
@@ -335,8 +380,8 @@ func (a *Admin) parseListTopicsResponse(data []byte) ([]TopicInfo, error) {
 	return topics, nil
 }
 
-// parseDescribeTopicResponse parses describe topic response
-func (a *Admin) parseDescribeTopicResponse(data []byte) (*TopicInfo, error) {
+// parseGetTopicInfoResponse parses describe topic response
+func (a *Admin) parseGetTopicInfoResponse(data []byte) (*TopicInfo, error) {
 	buf := bytes.NewReader(data)
 
 	var errorCode int16
@@ -350,7 +395,6 @@ func (a *Admin) parseDescribeTopicResponse(data []byte) (*TopicInfo, error) {
 
 	topic := &TopicInfo{}
 
-	
 	var nameLen int16
 	if err := binary.Read(buf, binary.BigEndian, &nameLen); err != nil {
 		return nil, fmt.Errorf("failed to read topic name length: %v", err)
@@ -361,7 +405,6 @@ func (a *Admin) parseDescribeTopicResponse(data []byte) (*TopicInfo, error) {
 	}
 	topic.Name = string(nameBytes)
 
-	
 	if err := binary.Read(buf, binary.BigEndian, &topic.Partitions); err != nil {
 		return nil, fmt.Errorf("failed to read partitions: %v", err)
 	}
@@ -382,7 +425,6 @@ func (a *Admin) parseDescribeTopicResponse(data []byte) (*TopicInfo, error) {
 		return nil, fmt.Errorf("failed to read message count: %v", err)
 	}
 
-	
 	var partitionCount int32
 	if err := binary.Read(buf, binary.BigEndian, &partitionCount); err != nil {
 		return nil, fmt.Errorf("failed to read partition count: %v", err)
@@ -410,7 +452,6 @@ func (a *Admin) parseDescribeTopicResponse(data []byte) (*TopicInfo, error) {
 			return nil, fmt.Errorf("failed to read partition end offset: %v", err)
 		}
 
-		
 		partition.Replicas = []int32{0}
 		partition.ISR = []int32{0}
 	}
@@ -432,44 +473,4 @@ func (a *Admin) parseDeleteTopicResponse(data []byte) error {
 	}
 
 	return nil
-}
-
-// parseGetTopicInfoResponse parses get topic info response
-func (a *Admin) parseGetTopicInfoResponse(data []byte) (*SimpleTopicInfo, error) {
-	buf := bytes.NewReader(data)
-
-	var errorCode int16
-	if err := binary.Read(buf, binary.BigEndian, &errorCode); err != nil {
-		return nil, fmt.Errorf("failed to read error code: %v", err)
-	}
-
-	if errorCode != 0 {
-		return nil, fmt.Errorf("server error, code: %d", errorCode)
-	}
-
-	info := &SimpleTopicInfo{}
-
-	
-	var nameLen int16
-	if err := binary.Read(buf, binary.BigEndian, &nameLen); err != nil {
-		return nil, fmt.Errorf("failed to read topic name length: %v", err)
-	}
-	nameBytes := make([]byte, nameLen)
-	if _, err := io.ReadFull(buf, nameBytes); err != nil {
-		return nil, fmt.Errorf("failed to read topic name: %v", err)
-	}
-	info.Name = string(nameBytes)
-
-	
-	if err := binary.Read(buf, binary.BigEndian, &info.Partitions); err != nil {
-		return nil, fmt.Errorf("failed to read partitions: %v", err)
-	}
-	if err := binary.Read(buf, binary.BigEndian, &info.MessageCount); err != nil {
-		return nil, fmt.Errorf("failed to read message count: %v", err)
-	}
-	if err := binary.Read(buf, binary.BigEndian, &info.Size); err != nil {
-		return nil, fmt.Errorf("failed to read size: %v", err)
-	}
-
-	return info, nil
 }

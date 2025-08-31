@@ -61,18 +61,15 @@ type PartitionInfo struct {
 	EndOffset int64
 }
 
-// DescribeTopicRequest represents a request to get detailed information about a topic
-type DescribeTopicRequest struct {
-	// TopicName is the name of the topic to describe
+// GetTopicRequest represents a request to get detailed information about a topic
+type GetTopicRequest struct {
 	TopicName string
 }
 
-// DescribeTopicResponse represents the response containing detailed topic information
-type DescribeTopicResponse struct {
-	// ErrorCode indicates whether the operation succeeded (0) or failed (non-zero)
+// GetTopicResponse represents the response containing detailed topic information
+type GetTopicResponse struct {
 	ErrorCode int16
-	// Topic contains the detailed topic information
-	Topic *metadata.TopicInfo
+	Topic     *metadata.TopicInfo
 }
 
 // DeleteTopicRequest represents a request to delete a topic
@@ -87,26 +84,6 @@ type DeleteTopicResponse struct {
 	ErrorCode int16
 	// TopicName is the name of the deleted topic
 	TopicName string
-}
-
-// GetTopicInfoRequest represents a request to get detailed information about a topic
-type GetTopicInfoRequest struct {
-	// TopicName is the name of the topic to get info for
-	TopicName string
-}
-
-// GetTopicInfoResponse represents the response containing detailed topic information
-type GetTopicInfoResponse struct {
-	// ErrorCode indicates whether the operation succeeded (0) or failed (non-zero)
-	ErrorCode int16
-	// TopicName is the name of the topic
-	TopicName string
-	// Partitions is the number of partitions in the topic
-	Partitions int32
-	// MessageCount is the total number of messages in the topic
-	MessageCount int64
-	// Size is the total size of the topic in bytes
-	Size int64
 }
 
 func ReadListTopicsRequest(r io.Reader) (*ListTopicsRequest, error) {
@@ -168,8 +145,8 @@ func (res *ListTopicsResponse) Write(w io.Writer) error {
 	return nil
 }
 
-func ReadDescribeTopicRequest(r io.Reader) (*DescribeTopicRequest, error) {
-	req := &DescribeTopicRequest{}
+func ReadDescribeTopicRequest(r io.Reader) (*GetTopicRequest, error) {
+	req := &GetTopicRequest{}
 
 	var version int16
 	if err := binary.Read(r, binary.BigEndian, &version); err != nil {
@@ -189,7 +166,7 @@ func ReadDescribeTopicRequest(r io.Reader) (*DescribeTopicRequest, error) {
 	return req, nil
 }
 
-func (res *DescribeTopicResponse) Write(w io.Writer) error {
+func (res *GetTopicResponse) Write(w io.Writer) error {
 	buf := new(bytes.Buffer)
 
 	if err := binary.Write(buf, binary.BigEndian, res.ErrorCode); err != nil {
@@ -305,65 +282,6 @@ func (res *DeleteTopicResponse) Write(w io.Writer) error {
 	return nil
 }
 
-func ReadGetTopicInfoRequest(r io.Reader) (*GetTopicInfoRequest, error) {
-	req := &GetTopicInfoRequest{}
-
-	var version int16
-	if err := binary.Read(r, binary.BigEndian, &version); err != nil {
-		return nil, fmt.Errorf("failed to read version: %v", err)
-	}
-
-	var topicLen int16
-	if err := binary.Read(r, binary.BigEndian, &topicLen); err != nil {
-		return nil, fmt.Errorf("failed to read topic length: %v", err)
-	}
-	topicBytes := make([]byte, topicLen)
-	if _, err := io.ReadFull(r, topicBytes); err != nil {
-		return nil, fmt.Errorf("failed to read topic name: %v", err)
-	}
-	req.TopicName = string(topicBytes)
-
-	return req, nil
-}
-
-func (res *GetTopicInfoResponse) Write(w io.Writer) error {
-	buf := new(bytes.Buffer)
-
-	if err := binary.Write(buf, binary.BigEndian, res.ErrorCode); err != nil {
-		return err
-	}
-
-	if res.ErrorCode == ErrorNone {
-
-		if err := binary.Write(buf, binary.BigEndian, int16(len(res.TopicName))); err != nil {
-			return err
-		}
-		if _, err := buf.WriteString(res.TopicName); err != nil {
-			return err
-		}
-
-		if err := binary.Write(buf, binary.BigEndian, res.Partitions); err != nil {
-			return err
-		}
-		if err := binary.Write(buf, binary.BigEndian, res.MessageCount); err != nil {
-			return err
-		}
-		if err := binary.Write(buf, binary.BigEndian, res.Size); err != nil {
-			return err
-		}
-	}
-
-	totalLen := int32(buf.Len())
-	if err := binary.Write(w, binary.BigEndian, totalLen); err != nil {
-		return err
-	}
-	if _, err := w.Write(buf.Bytes()); err != nil {
-		return err
-	}
-
-	return nil
-}
-
 // HandleListTopicsRequest processes a list topics request and writes the response
 func HandleListTopicsRequest(conn net.Conn, manager *metadata.Manager) error {
 	defer conn.Close()
@@ -387,7 +305,7 @@ func HandleListTopicsRequest(conn net.Conn, manager *metadata.Manager) error {
 }
 
 // HandleDescribeTopicRequest processes a describe topic request and writes the response
-func HandleDescribeTopicRequest(conn net.Conn, manager *metadata.Manager) error {
+func HandleGetTopicInfoRequest(conn net.Conn, manager *metadata.Manager) error {
 	defer conn.Close()
 
 	req, err := ReadDescribeTopicRequest(conn)
@@ -395,12 +313,12 @@ func HandleDescribeTopicRequest(conn net.Conn, manager *metadata.Manager) error 
 		return sendTopicError(conn, ErrorInvalidRequest, "Failed to read request")
 	}
 
-	topic, err := manager.DescribeTopic(req.TopicName)
+	topic, err := manager.GetTopicInfo(req.TopicName)
 	if err != nil {
 		return sendTopicError(conn, ErrorInvalidTopic, "Topic not found")
 	}
 
-	response := &DescribeTopicResponse{
+	response := &GetTopicResponse{
 		ErrorCode: ErrorNone,
 		Topic:     topic,
 	}
@@ -425,31 +343,6 @@ func HandleDeleteTopicRequest(conn net.Conn, manager *metadata.Manager) error {
 	response := &DeleteTopicResponse{
 		ErrorCode: ErrorNone,
 		TopicName: req.TopicName,
-	}
-
-	return response.Write(conn)
-}
-
-// HandleGetTopicInfoRequest processes a get topic info request and writes the response
-func HandleGetTopicInfoRequest(conn net.Conn, manager *metadata.Manager) error {
-	defer conn.Close()
-
-	req, err := ReadGetTopicInfoRequest(conn)
-	if err != nil {
-		return sendTopicError(conn, ErrorInvalidRequest, "Failed to read request")
-	}
-
-	info, err := manager.GetTopicInfo(req.TopicName)
-	if err != nil {
-		return sendTopicError(conn, ErrorInvalidTopic, "Topic not found")
-	}
-
-	response := &GetTopicInfoResponse{
-		ErrorCode:    ErrorNone,
-		TopicName:    info.TopicName,
-		Partitions:   info.Partitions,
-		MessageCount: info.MessageCount,
-		Size:         info.Size,
 	}
 
 	return response.Write(conn)

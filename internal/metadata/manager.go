@@ -20,7 +20,7 @@ import (
 // Manager defines the manager of the message queue system that coordinates
 // all operations including topic management, message storage, and consumer groups
 type Manager struct {
-	Config *Config
+	Config    *Config
 	IsRunning bool
 
 	Topics map[string]*Topic
@@ -53,15 +53,15 @@ type TopicConfig struct {
 
 // Config contains all system configuration parameters
 type Config struct {
-	DataDir string `json:"data_dir"`
-	MaxTopicPartitions int `json:"max_topic_partitions"`
-	SegmentSize int64 `json:"segment_size"`
-	RetentionTime time.Duration `json:"retention_time"`
-	MaxStorageSize int64 `json:"max_storage_size"`
+	DataDir            string        `json:"data_dir"`
+	MaxTopicPartitions int           `json:"max_topic_partitions"`
+	SegmentSize        int64         `json:"segment_size"`
+	RetentionTime      time.Duration `json:"retention_time"`
+	MaxStorageSize     int64         `json:"max_storage_size"`
 
-	FlushInterval time.Duration `json:"flush_interval"`
+	FlushInterval   time.Duration `json:"flush_interval"`
 	CleanupInterval time.Duration `json:"cleanup_interval"`
-	MaxMessageSize int `json:"max_message_size"`
+	MaxMessageSize  int           `json:"max_message_size"`
 
 	// Compression configuration
 	CompressionEnabled   bool                        `json:"compression_enabled"`
@@ -545,7 +545,7 @@ func (m *Manager) GetMetrics() *Metrics {
 }
 
 // DescribeTopic returns detailed information about a specific topic
-func (m *Manager) DescribeTopic(topicName string) (*TopicInfo, error) {
+func (m *Manager) GetTopicInfo(topicName string) (*TopicInfo, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -606,40 +606,6 @@ func (m *Manager) DescribeTopic(topicName string) (*TopicInfo, error) {
 	return topicInfo, nil
 }
 
-// GetTopicInfo returns basic information about a specific topic
-func (m *Manager) GetTopicInfo(topicName string) (*SimpleTopicInfo, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	topic, exists := m.Topics[topicName]
-	if !exists {
-		return nil, fmt.Errorf("topic '%s' not found", topicName)
-	}
-
-	topic.mu.RLock()
-	defer topic.mu.RUnlock()
-
-	var totalSize int64
-	var totalMessages int64
-
-	for _, partition := range topic.Partitions {
-		partition.Mu.RLock()
-		for _, segment := range partition.Segments {
-			if segment != nil {
-				totalSize += segment.CurrentSize
-				totalMessages += segment.WriteCount
-			}
-		}
-		partition.Mu.RUnlock()
-	}
-
-	return &SimpleTopicInfo{
-		TopicName:    topicName,
-		Partitions:   topic.Config.Partitions,
-		MessageCount: totalMessages,
-		Size:         totalSize,
-	}, nil
-}
 
 func (m *Manager) startBackgroundTasks() {
 	go m.flushTask()

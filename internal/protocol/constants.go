@@ -7,79 +7,52 @@ const (
 
 // Request type constants define different types of requests that can be made to the queue system
 const (
-	// ProduceRequestType is used for sending messages to a topic
 	ProduceRequestType = 0
-	// FetchRequestType is used for retrieving messages from a topic
-	FetchRequestType = 1
+	FetchRequestType   = 1
 
-	// CreateTopicRequestType is used for creating a new topic
-	CreateTopicRequestType = 2
-	// ListTopicsRequestType is used for listing all available topics
-	ListTopicsRequestType = 10
-	// DescribeTopicRequestType is used for getting detailed information about a topic
-	DescribeTopicRequestType = 11
-	// DeleteTopicRequestType is used for deleting an existing topic
-	DeleteTopicRequestType = 12
-	// GetTopicInfoRequestType is used for getting basic topic information
-	GetTopicInfoRequestType = 13
+	CreateTopicRequestType  = 2
+	ListTopicsRequestType   = 10
+	DeleteTopicRequestType  = 11
+	GetTopicInfoRequestType = 12
 
-	// JoinGroupRequestType is used for joining a consumer group
-	JoinGroupRequestType = 3
-	// LeaveGroupRequestType is used for leaving a consumer group
-	LeaveGroupRequestType = 4
-	// HeartbeatRequestType is used for sending heartbeats to maintain group membership
-	HeartbeatRequestType = 5
-	// CommitOffsetRequestType is used for committing message offsets
-	CommitOffsetRequestType = 6
-	// FetchOffsetRequestType is used for retrieving committed offsets
-	FetchOffsetRequestType = 7
-	// ListGroupsRequestType is used for listing all consumer groups
-	ListGroupsRequestType = 8
-	// DescribeGroupRequestType is used for getting detailed information about a consumer group
+	JoinGroupRequestType     = 3
+	LeaveGroupRequestType    = 4
+	HeartbeatRequestType     = 5
+	CommitOffsetRequestType  = 6
+	FetchOffsetRequestType   = 7
+	ListGroupsRequestType    = 8
 	DescribeGroupRequestType = 9
+
+	ControllerDiscoverRequestType = 1000
+	ControllerVerifyRequestType   = 1001
+
+	GetTopicMetadataRequestType = 1002
 )
 
 // Error code constants define different types of errors that can occur
 const (
-	// ErrorNone indicates no error occurred
 	ErrorNone = 0
 
-	// ErrorInvalidRequest indicates the request format is invalid
-	ErrorInvalidRequest = 1
-	// ErrorInvalidTopic indicates the topic name is invalid or not found
-	ErrorInvalidTopic = 2
-	// ErrorUnknownPartition indicates the specified partition does not exist
+	ErrorInvalidRequest   = 1
+	ErrorInvalidTopic     = 2
 	ErrorUnknownPartition = 3
-	// ErrorInvalidMessage indicates the message format is invalid
-	ErrorInvalidMessage = 4
-	// ErrorMessageTooLarge indicates the message exceeds the maximum allowed size
-	ErrorMessageTooLarge = 5
-	// ErrorOffsetOutOfRange indicates the requested offset is not available
+	ErrorInvalidMessage   = 4
+	ErrorMessageTooLarge  = 5
 	ErrorOffsetOutOfRange = 6
 
-	// ErrorBrokerNotAvailable indicates the broker is not available
 	ErrorBrokerNotAvailable = 100
-	// ErrorFetchFailed indicates a fetch operation failed
-	ErrorFetchFailed = 101
-	// ErrorProduceFailed indicates a produce operation failed
-	ErrorProduceFailed = 102
+	ErrorFetchFailed        = 101
+	ErrorProduceFailed      = 102
 
-	// ErrorUnauthorized indicates the client is not authorized for the operation
-	ErrorUnauthorized = 200
-	// ErrorQuotaExceeded indicates the client has exceeded their quota
+	ErrorUnauthorized  = 200
 	ErrorQuotaExceeded = 201
 )
 
-// Size and limit constants define various system limits
 const (
-	// MaxMessageSize defines the maximum size of a single message in bytes (1MB)
-	MaxMessageSize = 1 << 20
-	// DefaultMaxFetchBytes defines the default maximum bytes to fetch in a single request (1MB)
+	MaxMessageSize       = 1 << 20
 	DefaultMaxFetchBytes = 1 << 20
-	// MaxFetchBytesLimit defines the absolute maximum bytes that can be fetched (5MB)
-	MaxFetchBytesLimit = 5 << 20
-	// CompressionNone indicates no compression is applied
-	CompressionNone = 0x00
+	MaxFetchBytesLimit   = 5 << 20
+	CompressionNone      = 0x00
 )
 
 // RequestTypeNames maps request type constants to human-readable names
@@ -95,7 +68,6 @@ var RequestTypeNames = map[int32]string{
 	ListGroupsRequestType:    "LIST_GROUPS",
 	DescribeGroupRequestType: "DESCRIBE_GROUP",
 	ListTopicsRequestType:    "LIST_TOPICS",
-	DescribeTopicRequestType: "DESCRIBE_TOPIC",
 	DeleteTopicRequestType:   "DELETE_TOPIC",
 	GetTopicInfoRequestType:  "GET_TOPIC_INFO",
 }
@@ -131,3 +103,34 @@ func GetErrorCodeName(errorCode int16) string {
 	}
 	return "UNKNOWN_ERROR"
 }
+
+const (
+	RaftCmdRegisterBroker   = "register_broker"
+	RaftCmdUnregisterBroker = "unregister_broker"
+
+	RaftCmdCreateTopic = "create_topic"
+	RaftCmdDeleteTopic = "delete_topic"
+
+	RaftCmdJoinGroup  = "join_group"
+	RaftCmdLeaveGroup = "leave_group"
+
+	RaftCmdMigrateLeader             = "migrate_leader"
+	RaftCmdUpdatePartitionAssignment = "update_partition_assignment"
+	RaftCmdUpdateBrokerLoad          = "update_broker_load"
+	RaftCmdMarkBrokerFailed          = "mark_broker_failed"
+)
+
+const (
+	RaftQueryGetBrokers = "get_brokers"
+
+	RaftQueryGetTopics = "get_topics"
+	RaftQueryGetTopic  = "get_topic"
+
+	RaftQueryGetGroups = "get_groups"
+	RaftQueryGetGroup  = "get_group"
+
+	RaftQueryGetPartitionAssignments = "get_partition_assignments"
+	RaftQueryGetPartitionLeader      = "get_partition_leader"
+
+	RaftQueryGetClusterMetadata = "get_cluster_metadata"
+)

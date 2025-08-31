@@ -1,7 +1,9 @@
 package client
 
 import (
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestNewConsumer(t *testing.T) {
@@ -14,7 +16,10 @@ func TestNewConsumer(t *testing.T) {
 }
 
 func TestFetchRequest_Validation(t *testing.T) {
-	client := NewClient(ClientConfig{})
+	client := NewClient(ClientConfig{
+		BrokerAddrs: []string{"localhost:9092"},
+		Timeout:     50 * time.Millisecond, // Very short timeout for tests
+	})
 	consumer := NewConsumer(client)
 
 	tests := []struct {
@@ -74,7 +79,10 @@ func TestBuildFetchRequest(t *testing.T) {
 }
 
 func TestFetchFrom(t *testing.T) {
-	client := NewClient(ClientConfig{})
+	client := NewClient(ClientConfig{
+		BrokerAddrs: []string{"localhost:9092"},
+		Timeout:     50 * time.Millisecond, // Very short timeout for tests
+	})
 	consumer := NewConsumer(client)
 
 	// Test with default parameters
@@ -171,5 +179,48 @@ func TestParseFetchResponse(t *testing.T) {
 		if msg.Offset != 0 {
 			t.Errorf("expected message offset 0, got %d", msg.Offset)
 		}
+	}
+}
+
+func TestConsumerFetchValidation(t *testing.T) {
+	config := ClientConfig{
+		BrokerAddrs: []string{"localhost:9092"},
+		Timeout:     50,
+	}
+	client := NewClient(config)
+	consumer := NewConsumer(client)
+
+	// Test with zero MaxBytes (should default to 1MB internally)
+	req := FetchRequest{
+		Topic:     "test-topic",
+		Partition: 0,
+		Offset:    0,
+		MaxBytes:  0, // Should be auto-set to 1MB internally
+	}
+
+	// The Fetch method should handle the zero MaxBytes internally
+	// We don't need to check the original req since it's passed by value
+	_, err := consumer.Fetch(req)
+	if err == nil {
+		t.Error("Expected error when no brokers are available, got nil")
+	}
+
+	// Test with valid MaxBytes
+	validReq := FetchRequest{
+		Topic:     "test-topic",
+		Partition: 0,
+		Offset:    0,
+		MaxBytes:  2048, // Valid size
+	}
+
+	_, err = consumer.Fetch(validReq)
+	if err == nil {
+		t.Error("Expected error when no brokers are available, got nil")
+	}
+
+	// Both should fail with connection error, confirming the method works
+	if !strings.Contains(err.Error(), "failed to get topic metadata") &&
+		!strings.Contains(err.Error(), "failed to connect") {
+		t.Errorf("Expected metadata or connection error, got: %v", err)
 	}
 }
