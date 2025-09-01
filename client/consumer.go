@@ -174,6 +174,7 @@ func (c *Consumer) parseFetchResponse(topic string, partition int32, requestOffs
 func (c *Consumer) fetchFromPartition(req FetchRequest) (*FetchResult, error) {
 	conn, err := c.client.connectForDataOperation(req.Topic, req.Partition, false)
 	if err != nil {
+		// TODO: only do refresh if it's a follower error
 		c.client.refreshTopicMetadata(req.Topic)
 		return nil, fmt.Errorf("failed to connect to partition leader or follower: %v", err)
 	}
@@ -204,6 +205,7 @@ func (c *Consumer) fetchFromPartition(req FetchRequest) (*FetchResult, error) {
 	if _, err := io.ReadFull(conn, responseData); err != nil {
 		return nil, fmt.Errorf("failed to read response data: %v", err)
 	}
+	// TODO: refreshMetadata if it's a follower error
 
 	result, err := c.parseFetchResponse(req.Topic, req.Partition, req.Offset, responseData)
 	if err != nil {

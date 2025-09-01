@@ -44,8 +44,8 @@ type RequestConfig struct {
 
 // requestConfigs maps request types to their configurations
 var requestConfigs = map[int32]RequestConfig{
-	protocol.ControllerDiscoverRequestType: {Type: ControllerRequest, Handler: &ControllerDiscoveryHandler{}}, // CONTROLLER_DISCOVERY_REQUEST
-	protocol.ControllerVerifyRequestType:   {Type: ControllerRequest, Handler: &ControllerVerifyHandler{}},    // CONTROLLER_VERIFY_REQUEST
+	protocol.ControllerDiscoverRequestType: {Type: ControllerRequest, Handler: &ControllerDiscoveryHandler{}},
+	protocol.ControllerVerifyRequestType:   {Type: ControllerRequest, Handler: &ControllerVerifyHandler{}},
 	protocol.CreateTopicRequestType:        {Type: MetadataWriteRequest, Handler: &CreateTopicHandler{}},
 	protocol.DeleteTopicRequestType:        {Type: MetadataWriteRequest, Handler: &DeleteTopicHandler{}},
 	protocol.ListTopicsRequestType:         {Type: MetadataReadRequest, Handler: &ListTopicsHandler{}},
@@ -145,6 +145,7 @@ func (cs *ClientServer) handleRequestByType(conn net.Conn, requestType int32, co
 		return cs.handleMetadataReadRequest(conn, config)
 
 	case DataRequest:
+		// TODO: handle data request
 		return config.Handler.Handle(conn, cs)
 
 	default:
@@ -154,26 +155,25 @@ func (cs *ClientServer) handleRequestByType(conn net.Conn, requestType int32, co
 
 // handleMetadataWriteRequest handles requests that can only be processed by Controller Leader
 func (cs *ClientServer) handleMetadataWriteRequest(conn net.Conn, config RequestConfig) error {
-	// Check if this broker is the controller leader
-	if cs.broker.Controller == nil || !cs.broker.Controller.IsLeaderWithValidation() {
-		return cs.redirectToController(conn, config)
+	leaderID, exists := cs.broker.Controller.GetControlledLeaderID()
+	if !exists {
+		return fmt.Errorf("not controller leader, no leader currently known")
+	}
+	if leaderID != cs.broker.Controller.brokerIDToNodeID(cs.broker.ID) {
+		return fmt.Errorf("not controller leader, please redirect to: %s", cs.getControllerLeaderAddr())
 	}
 
-	// Process on controller leader
 	return config.Handler.Handle(conn, cs)
 }
 
 // handleMetadataReadRequest handles metadata read requests with follower read support
 func (cs *ClientServer) handleMetadataReadRequest(conn net.Conn, config RequestConfig) error {
-	isLeader := cs.broker.Controller != nil && cs.broker.Controller.IsLeaderWithValidation()
-	isFollowerReadEnabled := cs.broker.Config.EnableFollowerRead
-
-	log.Printf("Handling metadata read request: isLeader=%v, followerReadEnabled=%v", isLeader, isFollowerReadEnabled)
-
-	// Leader can always handle metadata read requests
-	if isLeader {
+	leaderID, exists := cs.broker.Controller.GetControlledLeaderID()
+	if exists && leaderID == cs.broker.Controller.brokerIDToNodeID(cs.broker.ID) {
 		return config.Handler.Handle(conn, cs)
 	}
+
+	isFollowerReadEnabled := cs.broker.Config.EnableFollowerRead
 
 	// Follower can handle if follower read is enabled
 	if isFollowerReadEnabled {
@@ -185,19 +185,7 @@ func (cs *ClientServer) handleMetadataReadRequest(conn net.Conn, config RequestC
 		return config.Handler.Handle(conn, cs)
 	}
 
-	// Redirect to controller if follower read is not enabled
-	return cs.redirectToController(conn, config)
-}
-
-// redirectToController redirects the request to the controller leader
-func (cs *ClientServer) redirectToController(conn net.Conn, config RequestConfig) error {
-	// For now, send an error asking client to discover controller
-	// In a more sophisticated implementation, we could forward the request
-	controllerAddr := cs.getControllerLeaderAddr()
-	if controllerAddr == "" {
-		return fmt.Errorf("controller leader not available, please discover controller")
-	}
-	return fmt.Errorf("not controller leader, please redirect to: %s", controllerAddr)
+	return fmt.Errorf("not controller leader, can't do follower read either")
 }
 
 // ensureReadIndexConsistency uses Dragonboat's ReadIndex to ensure read consistency
@@ -205,19 +193,16 @@ func (cs *ClientServer) ensureReadIndexConsistency() error {
 	if cs.broker.Controller == nil {
 		return fmt.Errorf("controller not available")
 	}
-
+	// wait readindex catch up for 5 seconds
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	groupID := cs.broker.Config.RaftConfig.ControllerGroupID
 
-	// Call ReadIndex to ensure consistency
-	_, err := cs.broker.raftManager.ReadIndex(ctx, groupID)
+	_, err := cs.broker.raftManager.EnsureReadIndexConsistency(ctx, groupID)
 	if err != nil {
-		return fmt.Errorf("ReadIndex failed: %v", err)
+		return fmt.Errorf("failed to ensure read index consistency: %v", err)
 	}
-
-	log.Printf("ReadIndex consistency check passed for group %d", groupID)
 	return nil
 }
 
@@ -227,7 +212,7 @@ func (cs *ClientServer) getControllerLeaderAddr() string {
 		return ""
 	}
 
-	leaderID, exists := cs.broker.Controller.GetCachedLeaderID()
+	leaderID, exists := cs.broker.Controller.GetControlledLeaderID()
 	if !exists {
 		return ""
 	}
@@ -246,8 +231,6 @@ func (cs *ClientServer) getControllerLeaderAddr() string {
 
 	return ""
 }
-
-// Utility functions
 
 func (cs *ClientServer) sendErrorResponse(conn net.Conn, err error) {
 	errorResponse := fmt.Sprintf("ERROR: %v", err)
@@ -276,15 +259,13 @@ func (cs *ClientServer) readRequestData(conn net.Conn) ([]byte, error) {
 	return buffer[:n], nil
 }
 
-// Request Handlers
-
 // ControllerDiscoveryHandler handles controller discovery requests
 type ControllerDiscoveryHandler struct{}
 
 func (h *ControllerDiscoveryHandler) Handle(conn net.Conn, cs *ClientServer) error {
 	var controllerAddr string
 
-	if cs.broker.Controller != nil && cs.broker.Controller.IsLeader() {
+	if cs.broker.Controller != nil && cs.broker.Controller.isLeader() {
 		controllerAddr = fmt.Sprintf("%s:%d", cs.broker.Address, cs.broker.Port)
 	} else {
 		controllerAddr = cs.getControllerLeaderAddr()
@@ -309,7 +290,7 @@ func (h *ControllerDiscoveryHandler) Handle(conn net.Conn, cs *ClientServer) err
 type ControllerVerifyHandler struct{}
 
 func (h *ControllerVerifyHandler) Handle(conn net.Conn, cs *ClientServer) error {
-	isLeader := cs.broker.Controller != nil && cs.broker.Controller.IsLeaderWithValidation()
+	isLeader := cs.broker.Controller != nil
 
 	var response []byte
 	if isLeader {
@@ -336,6 +317,7 @@ type CreateTopicHandler struct{}
 
 func (h *CreateTopicHandler) Handle(conn net.Conn, cs *ClientServer) error {
 	// Read request data
+	// TODO: A better way to read request Data
 	requestData, err := cs.readRequestData(conn)
 	if err != nil {
 		return fmt.Errorf("failed to read request data: %v", err)
@@ -368,9 +350,8 @@ func (h *CreateTopicHandler) Handle(conn net.Conn, cs *ClientServer) error {
 		return fmt.Errorf("failed to create topic: %v", err)
 	}
 
-	// Send success response with error code format
 	buf := new(bytes.Buffer)
-	if err := binary.Write(buf, binary.BigEndian, int16(0)); err != nil { // Success error code
+	if err := binary.Write(buf, binary.BigEndian, int16(0)); err != nil { 
 		return fmt.Errorf("failed to write success response: %v", err)
 	}
 
@@ -382,13 +363,11 @@ func (h *CreateTopicHandler) Handle(conn net.Conn, cs *ClientServer) error {
 func (h *CreateTopicHandler) parseCreateTopicRequest(data []byte) (string, int32, int32, error) {
 	buf := bytes.NewReader(data)
 
-	// Read version
 	var version int16
 	if err := binary.Read(buf, binary.BigEndian, &version); err != nil {
 		return "", 0, 0, err
 	}
 
-	// Read topic name
 	var nameLen int16
 	if err := binary.Read(buf, binary.BigEndian, &nameLen); err != nil {
 		return "", 0, 0, err
@@ -398,7 +377,6 @@ func (h *CreateTopicHandler) parseCreateTopicRequest(data []byte) (string, int32
 		return "", 0, 0, err
 	}
 
-	// Read partitions and replicas
 	var partitions, replicas int32
 	if err := binary.Read(buf, binary.BigEndian, &partitions); err != nil {
 		return "", 0, 0, err
@@ -414,7 +392,6 @@ func (h *CreateTopicHandler) parseCreateTopicRequest(data []byte) (string, int32
 type ListTopicsHandler struct{}
 
 func (h *ListTopicsHandler) Handle(conn net.Conn, cs *ClientServer) error {
-	// List topics doesn't need additional request data, just read version
 	var version int16
 	if err := binary.Read(conn, binary.BigEndian, &version); err != nil {
 		return fmt.Errorf("failed to read version: %v", err)
@@ -425,13 +402,11 @@ func (h *ListTopicsHandler) Handle(conn net.Conn, cs *ClientServer) error {
 		return fmt.Errorf("controller not available")
 	}
 
-	// Query topics from controller
 	result, err := cs.broker.Controller.QueryMetadata("get_topics", nil)
 	if err != nil {
 		return fmt.Errorf("failed to get topics: %v", err)
 	}
 
-	// Build response
 	responseData, err := h.buildListTopicsResponse(result)
 	if err != nil {
 		return fmt.Errorf("failed to build response: %v", err)

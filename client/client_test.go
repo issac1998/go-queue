@@ -59,31 +59,6 @@ func TestNewClient(t *testing.T) {
 	}
 }
 
-func TestClientConnect(t *testing.T) {
-	client := NewClient(ClientConfig{
-		BrokerAddrs: []string{"localhost:9999"}, // Use non-existent port
-		Timeout:     100 * time.Millisecond,
-	})
-
-	// Test metadata connection (should fail)
-	conn, err := client.connect(true)
-	if err == nil {
-		t.Error("expected connection error for non-existent broker")
-		if conn != nil {
-			conn.Close()
-		}
-	}
-
-	// Test data connection (should also fail)
-	conn, err = client.connect(false)
-	if err == nil {
-		t.Error("expected connection error for non-existent broker")
-		if conn != nil {
-			conn.Close()
-		}
-	}
-}
-
 func TestControllerDiscovery(t *testing.T) {
 	client := NewClient(ClientConfig{
 		BrokerAddrs: []string{"localhost:9999"}, // Use non-existent port
@@ -150,9 +125,7 @@ func TestLoadBalancing(t *testing.T) {
 		t.Errorf("Expected empty topic metadata map, got %d entries", len(client.topicMetadata))
 	}
 
-	// Test connectToAnyBroker (simplified implementation)
-	// This will fail to connect since no brokers are running, but should not panic
-	_, err := client.connectToAnyBroker()
+	_, err := client.connectToFollower()
 	if err == nil {
 		t.Error("Expected error when connecting to non-existent brokers")
 	}

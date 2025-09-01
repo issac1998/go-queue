@@ -39,11 +39,13 @@ type RaftConfig struct {
 
 // RaftManager manages all Raft Groups for a broker
 type RaftManager struct {
-	config   *RaftConfig
-	dataDir  string
+	config  *RaftConfig
+	dataDir string
+	// nodehost includes leader info
 	nodeHost *dragonboat.NodeHost
 
 	// Active Raft groups
+	// Groups
 	groups map[uint64]*RaftGroup
 	mu     sync.RWMutex
 
@@ -54,6 +56,7 @@ type RaftManager struct {
 
 // RaftGroup represents an active Raft group
 type RaftGroup struct {
+	// Groups或许需要获取Leader接口，用作后续从Leader读Partition
 	GroupID      uint64
 	Members      map[uint64]string // NodeID -> Address
 	StateMachine statemachine.IStateMachine
@@ -367,9 +370,8 @@ func (rm *RaftManager) Close() error {
 	return nil
 }
 
-// ReadIndex performs a ReadIndex operation to ensure read consistency on followers
-// This uses Dragonboat's ReadIndex feature to ensure the follower has applied all committed entries
-func (rm *RaftManager) ReadIndex(ctx context.Context, groupID uint64) (uint64, error) {
+// EnsureReadIndexConsistency ensures read consistency on followers
+func (rm *RaftManager) EnsureReadIndexConsistency(ctx context.Context, groupID uint64) (uint64, error) {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
 
@@ -377,24 +379,20 @@ func (rm *RaftManager) ReadIndex(ctx context.Context, groupID uint64) (uint64, e
 		return 0, fmt.Errorf("NodeHost is not initialized")
 	}
 
-	// Check if the group exists
 	if _, exists := rm.groups[groupID]; !exists {
 		return 0, fmt.Errorf("raft group %d not found", groupID)
 	}
 
-	// Perform ReadIndex operation
-	// ReadIndex returns a RequestState which can be used to check when the read is safe
+
 	result, err := rm.nodeHost.ReadIndex(groupID, 5*time.Second)
 	if err != nil {
 		return 0, fmt.Errorf("ReadIndex operation failed for group %d: %v", groupID, err)
 	}
 
-	// Wait for the ReadIndex operation to complete
 	select {
 	case <-result.AppliedC():
-		// ReadIndex operation completed successfully
 		log.Printf("ReadIndex completed for group %d", groupID)
-		return 0, nil // ReadIndex doesn't return an actual index, just ensures consistency
+		return 0, nil
 	case <-ctx.Done():
 		return 0, fmt.Errorf("ReadIndex operation timeout for group %d: %v", groupID, ctx.Err())
 	}

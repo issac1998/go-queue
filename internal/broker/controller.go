@@ -7,7 +7,6 @@ import (
 	"log"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -17,10 +16,6 @@ import (
 // ControllerManager manages Controller-related functionality
 type ControllerManager struct {
 	broker *Broker
-
-	// Raft state
-	isLeader atomic.Bool
-	leaderID atomic.Value // string
 
 	// State machine reference
 	stateMachine *raft.ControllerStateMachine
@@ -76,7 +71,6 @@ func NewControllerManager(broker *Broker) (*ControllerManager, error) {
 	// Create state machine
 	cm.stateMachine = raft.NewControllerStateMachine(cm)
 
-	// Initialize sub-components
 	cm.healthChecker = &HealthChecker{
 		controller:       cm,
 		checkInterval:    30 * time.Second,
@@ -235,25 +229,13 @@ func (cm *ControllerManager) monitorLeadership() {
 
 // OnBecomeLeader is called when this broker becomes the Controller leader
 func (cm *ControllerManager) OnBecomeLeader() {
-	cm.isLeader.Store(true)
-	cm.leaderID.Store(cm.broker.ID)
-
 	log.Printf("Broker %s became Controller leader", cm.broker.ID)
-
-	// Start leader-specific tasks
 	cm.startLeaderTasks()
 }
 
 // OnLoseLeadership is called when this broker loses Controller leadership
 func (cm *ControllerManager) OnLoseLeadership() {
-	wasLeader := cm.isLeader.Swap(false)
-	if !wasLeader {
-		return // We weren't the leader anyway
-	}
-
 	log.Printf("Broker %s lost Controller leadership", cm.broker.ID)
-
-	// Stop leader-specific tasks
 	cm.stopLeaderTasks()
 }
 
@@ -298,76 +280,24 @@ func (cm *ControllerManager) performFullHealthCheck() {
 }
 
 // IsLeader returns whether this broker is the Controller leader
-func (cm *ControllerManager) IsLeader() bool {
-	return cm.isLeader.Load()
+func (cm *ControllerManager) isLeader() bool {
+	leaderID, exists, _ := cm.broker.raftManager.GetLeaderID(cm.broker.Config.RaftConfig.ControllerGroupID)
+	if exists && leaderID == cm.broker.Controller.brokerIDToNodeID(cm.broker.ID) {
+		return true
+	}
+	return false
 }
 
-// IsLeaderWithValidation returns whether this broker is the Controller leader with Raft validation
-// This is safer for critical operations as it double-checks with the Raft system
-func (cm *ControllerManager) IsLeaderWithValidation() bool {
-	// First check local cache
-	if !cm.isLeader.Load() {
-		return false
-	}
-
-	// Double-check with Raft system to avoid stale leadership state
-	return cm.broker.raftManager.IsLeader(cm.broker.Config.RaftConfig.ControllerGroupID)
-}
-
-// ExecuteAsLeaderSafely executes a function only if we are confirmed leader
-// Returns error if leadership is lost during execution
-func (cm *ControllerManager) ExecuteAsLeaderSafely(operation func() error) error {
-	// Pre-check: are we leader?
-	if !cm.IsLeaderWithValidation() {
-		return fmt.Errorf("not controller leader")
-	}
-
-	// Execute the operation
-	err := operation()
-
-	// Post-check: are we still leader after operation?
-	if !cm.IsLeaderWithValidation() {
-		// We lost leadership during operation - the result might be invalid
-		log.Printf("Warning: Lost leadership during operation execution")
-		if err == nil {
-			// Even if operation succeeded, we can't trust the result
-			return fmt.Errorf("lost leadership during operation")
-		}
-	}
-
-	return err
-}
-
-// ExecuteRaftCommandWithRetry executes a Raft command with leader discovery retry logic
-// This implements the correct pattern: try -> fail -> discover real leader -> retry
+// ExecuteRaftCommandWithRetry executes a Raft command
 func (cm *ControllerManager) ExecuteRaftCommandWithRetry(cmd *raft.ControllerCommand, maxRetries int) error {
 	var lastErr error
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		// Try to execute the command
+		// TODO: DO we really need to retry?
 		err := cm.executeRaftCommand(cmd)
 		if err == nil {
-			return nil // Success
+			return nil
 		}
-
-		// Check if this is a "not leader" error
-		if cm.isNotLeaderError(err) {
-			log.Printf("Attempt %d: Not leader, discovering real leader...", attempt+1)
-
-			// Discover and cache the real leader
-			if discoverErr := cm.discoverAndCacheRealLeader(); discoverErr != nil {
-				log.Printf("Failed to discover real leader: %v", discoverErr)
-			}
-
-			// Update our local state
-			cm.isLeader.Store(false)
-
-			lastErr = fmt.Errorf("not leader, discovered real leader for retry")
-			continue // Retry with updated leader info
-		}
-
-		// For other errors, don't retry
-		return err
 	}
 
 	return fmt.Errorf("failed after %d attempts, last error: %v", maxRetries, lastErr)
@@ -381,7 +311,7 @@ func (cm *ControllerManager) executeRaftCommand(cmd *raft.ControllerCommand) err
 		return fmt.Errorf("failed to marshal command: %v", err)
 	}
 
-	// Submit to Raft - this will fail if we're not the real leader
+	// Submit to Raft , this will fail if we're not the real leader
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -408,33 +338,6 @@ func (cm *ControllerManager) isNotLeaderError(err error) bool {
 		strings.Contains(errStr, "invalid leader")
 }
 
-// discoverAndCacheRealLeader discovers the real leader and updates local cache
-func (cm *ControllerManager) discoverAndCacheRealLeader() error {
-	leaderID, exists, err := cm.broker.raftManager.GetLeaderID(cm.broker.Config.RaftConfig.ControllerGroupID)
-	if err != nil {
-		return fmt.Errorf("failed to get leader ID: %v", err)
-	}
-
-	if !exists || leaderID == 0 {
-		return fmt.Errorf("no leader currently known")
-	}
-
-	brokers, err := cm.broker.discovery.DiscoverBrokers()
-	if err != nil {
-		return fmt.Errorf("failed to discover brokers: %v", err)
-	}
-
-	for _, broker := range brokers {
-		if cm.brokerIDToNodeID(broker.ID) == leaderID {
-			cm.leaderID.Store(broker.ID)
-			log.Printf("Discovered real leader: %s (NodeID: %d)", broker.ID, leaderID)
-			return nil
-		}
-	}
-
-	return fmt.Errorf("leader node %d not found in broker list", leaderID)
-}
-
 // ExecuteCommand executes a controller command through Raft with retry logic
 // This is the main public interface for executing Raft commands
 func (cm *ControllerManager) ExecuteCommand(cmd *raft.ControllerCommand) error {
@@ -442,25 +345,10 @@ func (cm *ControllerManager) ExecuteCommand(cmd *raft.ControllerCommand) error {
 	return cm.ExecuteRaftCommandWithRetry(cmd, 3) // Max 3 attempts
 }
 
-// GetLeaderID returns the current Controller leader ID
-func (cm *ControllerManager) GetLeaderID() string {
-	if leaderID := cm.leaderID.Load(); leaderID != nil {
-		return leaderID.(string)
-	}
-	return ""
-}
-
-// GetCachedLeaderID returns the current Controller leader NodeID and whether it exists
-func (cm *ControllerManager) GetCachedLeaderID() (uint64, bool) {
-	// First check if we have a cached leader ID from Raft
-	leaderNodeID, exists, err := cm.broker.raftManager.GetLeaderID(cm.broker.Config.RaftConfig.ControllerGroupID)
-	if err != nil || !exists || leaderNodeID == 0 {
-		// No leader known in Raft, check our local cache
-		if leaderID := cm.leaderID.Load(); leaderID != nil {
-			// Convert broker ID to node ID
-			nodeID := cm.brokerIDToNodeID(leaderID.(string))
-			return nodeID, true
-		}
+// GetControlledLeaderID returns the current Controller leader NodeID and whether it exists
+func (cm *ControllerManager) GetControlledLeaderID() (uint64, bool) {
+	leaderNodeID, valid, _ := cm.broker.raftManager.GetLeaderID(cm.broker.Config.RaftConfig.ControllerGroupID)
+	if !valid {
 		return 0, false
 	}
 	return leaderNodeID, true
@@ -482,7 +370,7 @@ func (cm *ControllerManager) QueryMetadata(queryType string, params map[string]i
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-
+	// We use sync Read, or just read it from stateMachine?
 	result, err := cm.broker.raftManager.SyncRead(
 		ctx,
 		cm.broker.Config.RaftConfig.ControllerGroupID,
@@ -519,7 +407,7 @@ func (cm *ControllerManager) RegisterBroker() error {
 
 // CreateTopic creates a new topic
 func (cm *ControllerManager) CreateTopic(topicName string, partitions int32, replicationFactor int32) error {
-	if !cm.IsLeader() {
+	if !cm.isLeader() {
 		return fmt.Errorf("not controller leader")
 	}
 
@@ -584,15 +472,9 @@ func (hc *HealthChecker) startHealthCheck() {
 			return
 		case <-ticker.C:
 			// Use safer leader validation for critical background tasks
-			if hc.controller.IsLeaderWithValidation() {
-				// Execute health check safely
-				err := hc.controller.ExecuteAsLeaderSafely(func() error {
-					hc.performHealthCheck()
-					return nil
-				})
-				if err != nil {
-					log.Printf("Health check skipped: %v", err)
-				}
+			if hc.controller.isLeader() {
+				hc.performHealthCheck()
+
 			}
 		}
 	}
@@ -653,16 +535,8 @@ func (lm *LoadMonitor) startMonitoring() {
 		case <-lm.controller.ctx.Done():
 			return
 		case <-ticker.C:
-			// Use safer leader validation for critical background tasks
-			if lm.controller.IsLeaderWithValidation() {
-				// Execute load monitoring safely
-				err := lm.controller.ExecuteAsLeaderSafely(func() error {
-					lm.updateLoadMetrics()
-					return nil
-				})
-				if err != nil {
-					log.Printf("Load monitoring skipped: %v", err)
-				}
+			if lm.controller.isLeader() {
+				lm.updateLoadMetrics()
 			}
 		}
 	}
@@ -700,16 +574,8 @@ func (fd *FailureDetector) startDetection() {
 		case <-fd.controller.ctx.Done():
 			return
 		case <-ticker.C:
-			// Use safer leader validation for critical background tasks
-			if fd.controller.IsLeaderWithValidation() {
-				// Execute failure detection safely
-				err := fd.controller.ExecuteAsLeaderSafely(func() error {
-					fd.detectFailures()
-					return nil
-				})
-				if err != nil {
-					log.Printf("Failure detection skipped: %v", err)
-				}
+			if fd.controller.isLeader() {
+				fd.detectFailures()
 			}
 		}
 	}
