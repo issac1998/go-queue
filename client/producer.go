@@ -63,7 +63,6 @@ func (p *Producer) SendBatch(messages []ProduceMessage) (*ProduceResult, error) 
 func (p *Producer) sendToPartitionLeader(topic string, partition int32, messages []ProduceMessage) (*ProduceResult, error) {
 	conn, err := p.client.connectForDataOperation(topic, partition, true)
 	if err != nil {
-		// TODO: only do refresh if it's a follower error
 		p.client.refreshTopicMetadata(topic)
 		return nil, fmt.Errorf("failed to connect to partition leader: %v", err)
 	}

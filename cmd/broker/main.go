@@ -84,7 +84,6 @@ func main() {
 
 // hashBrokerID converts a broker ID string to a uint64 node ID
 func hashBrokerID(brokerID string) uint64 {
-	// Simple hash function to convert string to uint64
 	hash := uint64(0)
 	for _, b := range []byte(brokerID) {
 		hash = hash*31 + uint64(b)

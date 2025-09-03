@@ -25,8 +25,7 @@ type BrokerInfo struct {
 	Address     string            `json:"address"`
 	Port        int               `json:"port"`
 	RaftAddress string            `json:"raft_address"`
-	RaftPort    int               `json:"raft_port"`
-	Status      string            `json:"status"` 
+	Status      string            `json:"status"`
 	LoadMetrics *LoadMetrics      `json:"load_metrics,omitempty"`
 	LastSeen    time.Time         `json:"last_seen"`
 	Metadata    map[string]string `json:"metadata,omitempty"`
@@ -44,7 +43,7 @@ type LoadMetrics struct {
 
 // DiscoveryConfig contains service discovery configuration
 type DiscoveryConfig struct {
-	Type      string   `yaml:"type"` 
+	Type      string   `yaml:"type"`
 	Endpoints []string `yaml:"endpoints"`
 	Username  string   `yaml:"username"`
 	Password  string   `yaml:"password"`

@@ -606,7 +606,6 @@ func (m *Manager) GetTopicInfo(topicName string) (*TopicInfo, error) {
 	return topicInfo, nil
 }
 
-
 func (m *Manager) startBackgroundTasks() {
 	go m.flushTask()
 
