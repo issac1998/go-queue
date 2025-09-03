@@ -117,37 +117,32 @@ func (b *Broker) Start() error {
 		return fmt.Errorf("config validation failed: %v", err)
 	}
 
-	// 2. Initialize logging
-	if err := b.initLogging(); err != nil {
-		return fmt.Errorf("logging init failed: %v", err)
-	}
-
-	// 3. Create data directories
+	// 2. Create data directories
 	if err := b.createDataDirectories(); err != nil {
 		return fmt.Errorf("data directory creation failed: %v", err)
 	}
 
-	// 4. Initialize Raft NodeHost
+	// 3. Initialize Raft NodeHost
 	if err := b.initRaft(); err != nil {
 		return fmt.Errorf("raft init failed: %v", err)
 	}
 
-	// 5. Initialize service discovery
+	// 4. Initialize service discovery
 	if err := b.initServiceDiscovery(); err != nil {
 		return fmt.Errorf("service discovery init failed: %v", err)
 	}
 
-	// 6. Register to service discovery
+	// 5. Register to service discovery
 	if err := b.registerBroker(); err != nil {
 		return fmt.Errorf("broker registration failed: %v", err)
 	}
 
-	// 7. Initialize Controller
+	// 6. Initialize Controller
 	if err := b.initController(); err != nil {
 		return fmt.Errorf("controller init failed: %v", err)
 	}
 
-	// 8. Start client server
+	// 7. Start client server
 	if err := b.startClientServer(); err != nil {
 		return fmt.Errorf("client server start failed: %v", err)
 	}
@@ -160,25 +155,20 @@ func (b *Broker) Start() error {
 func (b *Broker) Stop() error {
 	log.Printf("Stopping Broker %s...", b.ID)
 
-	// Cancel context to stop all goroutines
 	b.cancel()
 
-	// Stop client server
 	if b.ClientServer != nil {
 		b.ClientServer.Stop()
 	}
 
-	// Stop controller
 	if b.Controller != nil {
 		b.Controller.Stop()
 	}
 
-	// Stop partition manager
 	if b.PartitionManager != nil {
 		b.PartitionManager.Stop()
 	}
 
-	// Stop Raft manager
 	if b.raftManager != nil {
 		b.raftManager.Close()
 	}
@@ -192,7 +182,6 @@ func (b *Broker) Stop() error {
 
 // loadAndValidateConfig loads and validates the configuration
 func (b *Broker) loadAndValidateConfig() error {
-	// Validate required fields
 	if b.Config.NodeID == "" {
 		return fmt.Errorf("node_id is required")
 	}
@@ -263,7 +252,6 @@ func (b *Broker) registerBroker() error {
 		Address:     b.Address,
 		Port:        b.Port,
 		RaftAddress: b.Config.RaftConfig.RaftAddr, // Use actual Raft address
-		RaftPort:    0,                            // Port is included in RaftAddress
 		Status:      "starting",
 	}
 

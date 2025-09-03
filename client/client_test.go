@@ -85,20 +85,20 @@ func TestIsMetadataRequest(t *testing.T) {
 		expected    bool
 	}{
 		{"CREATE_TOPIC", 2, true},    // CreateTopicRequestType
-		{"LIST_TOPICS", 10, true},    // ListTopicsRequestType
-		{"DESCRIBE_TOPIC", 11, true}, // DescribeTopicRequestType
-		{"DELETE_TOPIC", 12, true},   // DeleteTopicRequestType
-		{"GET_TOPIC_INFO", 13, true}, // GetTopicInfoRequestType
-		{"JOIN_GROUP", 3, true},      // JoinGroupRequestType
-		{"LEAVE_GROUP", 4, true},     // LeaveGroupRequestType
-		{"LIST_GROUPS", 8, true},     // ListGroupsRequestType
-		{"DESCRIBE_GROUP", 9, true},  // DescribeGroupRequestType
+		{"LIST_TOPICS", 3, true},     // ListTopicsRequestType
+		{"DELETE_TOPIC", 4, true},    // DeleteTopicRequestType
+		{"JOIN_GROUP", 5, true},      // JoinGroupRequestType
+		{"LEAVE_GROUP", 6, true},     // LeaveGroupRequestType
+		{"DESCRIBE_TOPIC", 10, true}, // DescribeTopicRequestType
+		{"GET_TOPIC_INFO", 12, true}, // GetTopicInfoRequestType
+		{"LIST_GROUPS", 20, true},    // ListGroupsRequestType
+		{"DESCRIBE_GROUP", 21, true}, // DescribeGroupRequestType
 		{"CONTROLLER_DISCOVERY", 1000, true},
 		{"PRODUCE", 0, false},       // ProduceRequestType (data operation)
 		{"FETCH", 1, false},         // FetchRequestType (data operation)
-		{"HEARTBEAT", 5, false},     // HeartbeatRequestType (not metadata)
-		{"COMMIT_OFFSET", 6, false}, // CommitOffsetRequestType (not metadata)
-		{"FETCH_OFFSET", 7, false},  // FetchOffsetRequestType (not metadata)
+		{"HEARTBEAT", 7, false},     // HeartbeatRequestType (not metadata)
+		{"COMMIT_OFFSET", 8, false}, // CommitOffsetRequestType (not metadata)
+		{"FETCH_OFFSET", 9, false},  // FetchOffsetRequestType (not metadata)
 		{"UNKNOWN", 9999, false},
 	}
 
@@ -306,9 +306,9 @@ func TestMetadataReadWriteClassification(t *testing.T) {
 		description string
 	}{
 		{2, "CREATE_TOPIC"},
-		{12, "DELETE_TOPIC"},
-		{3, "JOIN_GROUP"},
-		{4, "LEAVE_GROUP"},
+		{4, "DELETE_TOPIC"},
+		{5, "JOIN_GROUP"},
+		{6, "LEAVE_GROUP"},
 	}
 
 	for _, op := range writeOperations {
@@ -323,11 +323,11 @@ func TestMetadataReadWriteClassification(t *testing.T) {
 		requestType int32
 		description string
 	}{
-		{10, "LIST_TOPICS"},
-		{11, "DESCRIBE_TOPIC"},
-		{13, "GET_TOPIC_INFO"},
-		{8, "LIST_GROUPS"},
-		{9, "DESCRIBE_GROUP"},
+		{3, "LIST_TOPICS"},
+		{10, "DESCRIBE_TOPIC"},
+		{12, "GET_TOPIC_INFO"},
+		{20, "LIST_GROUPS"},
+		{21, "DESCRIBE_GROUP"},
 		{1002, "GET_TOPIC_METADATA"},
 		{1000, "CONTROLLER_DISCOVERY"},
 		{1001, "CONTROLLER_VERIFY"},

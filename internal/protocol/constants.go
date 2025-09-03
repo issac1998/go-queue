@@ -1,5 +1,11 @@
 package protocol
 
+import (
+	"fmt"
+	"net"
+	"time"
+)
+
 // ProtocolVersion defines the current version of the communication protocol
 const (
 	ProtocolVersion = 1
@@ -7,26 +13,31 @@ const (
 
 // Request type constants define different types of requests that can be made to the queue system
 const (
-	ProduceRequestType = 0
-	FetchRequestType   = 1
+	// Client request types
+	ProduceRequestType            int32 = 0
+	FetchRequestType              int32 = 1
+	CreateTopicRequestType        int32 = 2
+	ListTopicsRequestType         int32 = 3
+	DeleteTopicRequestType        int32 = 4
+	JoinGroupRequestType          int32 = 5
+	LeaveGroupRequestType         int32 = 6
+	HeartbeatRequestType          int32 = 7
+	CommitOffsetRequestType       int32 = 8
+	FetchOffsetRequestType        int32 = 9
+	DescribeTopicRequestType      int32 = 10
+	DiscoverControllerRequestType int32 = 11
+	GetTopicInfoRequestType       int32 = 12
 
-	CreateTopicRequestType  = 2
-	ListTopicsRequestType   = 10
-	DeleteTopicRequestType  = 11
-	GetTopicInfoRequestType = 12
-
-	JoinGroupRequestType     = 3
-	LeaveGroupRequestType    = 4
-	HeartbeatRequestType     = 5
-	CommitOffsetRequestType  = 6
-	FetchOffsetRequestType   = 7
-	ListGroupsRequestType    = 8
-	DescribeGroupRequestType = 9
+	// Group management request types
+	ListGroupsRequestType    int32 = 20
+	DescribeGroupRequestType int32 = 21
 
 	ControllerDiscoverRequestType = 1000
 	ControllerVerifyRequestType   = 1001
 
-	GetTopicMetadataRequestType = 1002
+	GetTopicMetadataRequestType        = 1002
+	StartPartitionRaftGroupRequestType = 1003
+	StopPartitionRaftGroupRequestType  = 1004
 )
 
 // Error code constants define different types of errors that can occur
@@ -105,19 +116,18 @@ func GetErrorCodeName(errorCode int16) string {
 }
 
 const (
-	RaftCmdRegisterBroker   = "register_broker"
-	RaftCmdUnregisterBroker = "unregister_broker"
-
-	RaftCmdCreateTopic = "create_topic"
-	RaftCmdDeleteTopic = "delete_topic"
-
-	RaftCmdJoinGroup  = "join_group"
-	RaftCmdLeaveGroup = "leave_group"
-
+	// Raft command types
+	RaftCmdRegisterBroker            = "register_broker"
+	RaftCmdUnregisterBroker          = "unregister_broker"
+	RaftCmdCreateTopic               = "create_topic"
+	RaftCmdDeleteTopic               = "delete_topic"
+	RaftCmdJoinGroup                 = "join_group"
+	RaftCmdLeaveGroup                = "leave_group"
 	RaftCmdMigrateLeader             = "migrate_leader"
 	RaftCmdUpdatePartitionAssignment = "update_partition_assignment"
 	RaftCmdUpdateBrokerLoad          = "update_broker_load"
 	RaftCmdMarkBrokerFailed          = "mark_broker_failed"
+	RaftCmdRebalancePartitions       = "rebalance_partitions"
 )
 
 const (
@@ -134,3 +144,18 @@ const (
 
 	RaftQueryGetClusterMetadata = "get_cluster_metadata"
 )
+
+// ConnectToSpecificBroker connects to a specific broker address
+// This replicates the simple and effective logic from client/client_connect.go
+func ConnectToSpecificBroker(brokerAddr string, timeout time.Duration) (net.Conn, error) {
+	if brokerAddr == "" {
+		return nil, fmt.Errorf("failed to connect to broker: missing address")
+	}
+
+	conn, err := net.DialTimeout("tcp", brokerAddr, timeout)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to broker %s: %v", brokerAddr, err)
+	}
+
+	return conn, nil
+}

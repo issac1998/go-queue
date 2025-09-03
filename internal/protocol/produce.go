@@ -5,9 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
-
-	"github.com/issac1998/go-queue/internal/metadata"
 )
 
 // ProduceRequest represents a request to produce messages to a topic partition
@@ -107,88 +104,3 @@ func (res *ProduceResponse) Write(w io.Writer) error {
 }
 
 // HandleProduceRequest processes a produce request and writes the response
-func HandleProduceRequest(conn io.ReadWriter, manager *metadata.Manager) error {
-	req, err := ReadProduceRequest(conn)
-	if err != nil {
-		return fmt.Errorf("invalid produce request: %v", err)
-	}
-
-	if req.Topic == "" {
-		return writeErrorResponse(conn, ErrorInvalidTopic)
-	}
-	if len(req.Messages) == 0 {
-		return writeErrorResponse(conn, ErrorInvalidMessage)
-	}
-
-	var firstOffset int64 = -1
-	for _, msg := range req.Messages {
-		offset, err := manager.WriteMessage(req.Topic, req.Partition, msg)
-		if err != nil {
-			return writeErrorResponse(conn, ErrorMessageTooLarge)
-		}
-		if firstOffset == -1 {
-			firstOffset = offset
-		}
-	}
-
-	response := &ProduceResponse{
-		BaseOffset: firstOffset,
-		ErrorCode:  0,
-	}
-	return response.Write(conn)
-}
-
-// writeErrorResponse is a helper function to write an error response
-func writeErrorResponse(w io.Writer, errorCode int16) error {
-	response := &ProduceResponse{
-		ErrorCode: errorCode,
-	}
-	return response.Write(w)
-}
-
-// HandleCreateTopicRequest processes a create topic request
-func HandleCreateTopicRequest(conn net.Conn, manager *metadata.Manager) {
-	var version int16
-	if err := binary.Read(conn, binary.BigEndian, &version); err != nil {
-		writeErrorResponse(conn, ErrorInvalidRequest)
-		return
-	}
-
-	var nameLen int16
-	if err := binary.Read(conn, binary.BigEndian, &nameLen); err != nil {
-		writeErrorResponse(conn, ErrorInvalidRequest)
-		return
-	}
-
-	nameBuf := make([]byte, nameLen)
-	if _, err := io.ReadFull(conn, nameBuf); err != nil {
-		writeErrorResponse(conn, ErrorInvalidRequest)
-		return
-	}
-	topicName := string(nameBuf)
-
-	var partitions int32
-	if err := binary.Read(conn, binary.BigEndian, &partitions); err != nil {
-		writeErrorResponse(conn, ErrorInvalidRequest)
-		return
-	}
-
-	var replicas int32 = 1
-	binary.Read(conn, binary.BigEndian, &replicas)
-
-	_, err := manager.CreateTopic(topicName, &metadata.TopicConfig{
-		Partitions: partitions,
-		Replicas:   replicas,
-	})
-	if err != nil {
-		writeErrorResponse(conn, ErrorInvalidRequest)
-		return
-	}
-
-	writeSuccessResponse(conn)
-}
-
-// writeSuccessResponse is a helper function to write a success response
-func writeSuccessResponse(conn net.Conn) {
-	writeErrorResponse(conn, 0)
-}

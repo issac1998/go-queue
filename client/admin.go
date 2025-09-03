@@ -175,7 +175,6 @@ func (a *Admin) ListTopicsFromController() ([]TopicInfo, error) {
 	return a.parseListTopicsResponse(responseData)
 }
 
-
 // DeleteTopic deletes a topic
 func (a *Admin) DeleteTopic(topicName string) error {
 	requestData, err := a.buildDeleteTopicRequest(topicName)

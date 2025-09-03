@@ -8,12 +8,30 @@ import (
 
 	"github.com/issac1998/go-queue/internal/compression"
 	"github.com/issac1998/go-queue/internal/deduplication"
-	"github.com/issac1998/go-queue/internal/metadata"
 )
 
 // BrokerConfig represents the complete broker configuration
 type BrokerConfig struct {
-	*metadata.Config
+	// Legacy storage configuration (for compatibility with existing tests)
+	DataDir            string        `json:"data_dir"`
+	MaxTopicPartitions int           `json:"max_topic_partitions"`
+	SegmentSize        int64         `json:"segment_size"`
+	RetentionTime      time.Duration `json:"retention_time"`
+	MaxStorageSize     int64         `json:"max_storage_size"`
+	FlushInterval      time.Duration `json:"flush_interval"`
+	CleanupInterval    time.Duration `json:"cleanup_interval"`
+	MaxMessageSize     int           `json:"max_message_size"`
+
+	// Compression configuration
+	CompressionEnabled   bool                        `json:"compression_enabled"`
+	CompressionType      compression.CompressionType `json:"compression_type"`
+	CompressionThreshold int                         `json:"compression_threshold"`
+
+	// Deduplication configuration
+	DeduplicationEnabled bool                  `json:"deduplication_enabled"`
+	DeduplicationConfig  *deduplication.Config `json:"deduplication_config"`
+
+	// Server configuration
 	Server ServerConfig `json:"server"`
 
 	// FollowerRead configuration
@@ -119,24 +137,22 @@ func LoadBrokerConfig(configPath string) (*BrokerConfig, error) {
 
 	// Create the final config
 	config := &BrokerConfig{
-		Config: &metadata.Config{
-			DataDir:            configJSON.DataDir,
-			MaxTopicPartitions: configJSON.MaxTopicPartitions,
-			SegmentSize:        configJSON.SegmentSize,
-			RetentionTime:      retentionTime,
-			MaxStorageSize:     configJSON.MaxStorageSize,
-			FlushInterval:      flushInterval,
-			CleanupInterval:    cleanupInterval,
-			MaxMessageSize:     configJSON.MaxMessageSize,
+		DataDir:            configJSON.DataDir,
+		MaxTopicPartitions: configJSON.MaxTopicPartitions,
+		SegmentSize:        configJSON.SegmentSize,
+		RetentionTime:      retentionTime,
+		MaxStorageSize:     configJSON.MaxStorageSize,
+		FlushInterval:      flushInterval,
+		CleanupInterval:    cleanupInterval,
+		MaxMessageSize:     configJSON.MaxMessageSize,
 
-			CompressionEnabled:   configJSON.CompressionEnabled,
-			CompressionType:      configJSON.CompressionType,
-			CompressionThreshold: configJSON.CompressionThreshold,
+		CompressionEnabled:   configJSON.CompressionEnabled,
+		CompressionType:      configJSON.CompressionType,
+		CompressionThreshold: configJSON.CompressionThreshold,
 
-			DeduplicationEnabled: configJSON.DeduplicationEnabled,
-			DeduplicationConfig:  dedupConfig,
-		},
-		Server: configJSON.Server,
+		DeduplicationEnabled: configJSON.DeduplicationEnabled,
+		DeduplicationConfig:  dedupConfig,
+		Server:               configJSON.Server,
 	}
 
 	// Set defaults if not provided

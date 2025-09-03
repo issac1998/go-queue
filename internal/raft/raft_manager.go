@@ -97,7 +97,6 @@ func NewRaftManager(raftConfig *RaftConfig, dataDir string) (*RaftManager, error
 // initNodeHost initializes the Dragonboat NodeHost
 func (rm *RaftManager) initNodeHost() error {
 	nhConfig := config.NodeHostConfig{
-		WALDir:         filepath.Join(rm.dataDir, "wal"),
 		NodeHostDir:    filepath.Join(rm.dataDir, "nodehost"),
 		RTTMillisecond: rm.config.RTTMillisecond,
 		RaftAddress:    rm.config.RaftAddr,
