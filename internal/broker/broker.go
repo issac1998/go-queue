@@ -263,7 +263,6 @@ func (b *Broker) registerBroker() error {
 		Address:     b.Address,
 		Port:        b.Port,
 		RaftAddress: b.Config.RaftConfig.RaftAddr, // Use actual Raft address
-		RaftPort:    0,                            // Port is included in RaftAddress
 		Status:      "starting",
 	}
 

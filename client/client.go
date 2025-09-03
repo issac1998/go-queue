@@ -22,42 +22,42 @@ type Client struct {
 	mu             sync.RWMutex
 
 	// Partition routing metadata cache
-	topicMetadata map[string]*TopicMetadata 
-	metadataTTL   time.Duration             
+	topicMetadata map[string]*TopicMetadata
+	metadataTTL   time.Duration
 }
 
 var metadataRequestTypes = map[int32]bool{
-	protocol.CreateTopicRequestType:        true, 
-	protocol.ListTopicsRequestType:         true, 
-	protocol.DeleteTopicRequestType:        true, 
-	protocol.GetTopicInfoRequestType:       true, 
-	protocol.JoinGroupRequestType:          true, 
-	protocol.LeaveGroupRequestType:         true, 
-	protocol.ListGroupsRequestType:         true, 
-	protocol.DescribeGroupRequestType:      true, 
-	protocol.ControllerDiscoverRequestType: true, 
-	protocol.ControllerVerifyRequestType:   true, 
-	protocol.GetTopicMetadataRequestType:   true, 
+	protocol.CreateTopicRequestType:        true,
+	protocol.ListTopicsRequestType:         true,
+	protocol.DeleteTopicRequestType:        true,
+	protocol.GetTopicInfoRequestType:       true,
+	protocol.JoinGroupRequestType:          true,
+	protocol.LeaveGroupRequestType:         true,
+	protocol.ListGroupsRequestType:         true,
+	protocol.DescribeGroupRequestType:      true,
+	protocol.ControllerDiscoverRequestType: true,
+	protocol.ControllerVerifyRequestType:   true,
+	protocol.GetTopicMetadataRequestType:   true,
 }
 
 var writeRequestTypes = map[int32]bool{
-	protocol.CreateTopicRequestType: true, 
-	protocol.DeleteTopicRequestType: true, 
-	protocol.JoinGroupRequestType:   true, 
-	protocol.LeaveGroupRequestType:  true, 
+	protocol.CreateTopicRequestType: true,
+	protocol.DeleteTopicRequestType: true,
+	protocol.JoinGroupRequestType:   true,
+	protocol.LeaveGroupRequestType:  true,
 }
 
 // TopicMetadata holds partition-to-broker mapping for a topic
 type TopicMetadata struct {
 	Topic       string
-	Partitions  map[int32]PartitionMetadata 
+	Partitions  map[int32]PartitionMetadata
 	RefreshTime time.Time
 }
 
 // PartitionMetadata holds broker information for a specific partition
 type PartitionMetadata struct {
-	Leader   string   
-	Replicas []string 
+	Leader   string
+	Replicas []string
 }
 
 // ClientConfig client configuration
@@ -83,7 +83,7 @@ func NewClient(config ClientConfig) *Client {
 		brokerAddrs:   brokerAddrs,
 		timeout:       timeout,
 		topicMetadata: make(map[string]*TopicMetadata),
-		metadataTTL:   5 * time.Minute, 
+		metadataTTL:   5 * time.Minute,
 	}
 }
 
@@ -285,7 +285,7 @@ func (c *Client) tryRefreshTopicMetadata(topic string) (*TopicMetadata, error) {
 		}
 	}
 
-	conn, err := c.connectToSpecificBroker(controllerAddr)
+	conn, err := protocol.ConnectToSpecificBroker(controllerAddr, c.timeout)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to controller %s: %v", controllerAddr, err)
 	}

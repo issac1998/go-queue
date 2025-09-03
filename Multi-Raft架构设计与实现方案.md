@@ -811,7 +811,7 @@ func (cm *ControllerManager) OnBecomeLeader() {
     log.Printf("Broker %s became Controller leader", cm.broker.ID)
     
     // 启动 Controller 任务
-    go cm.startLeaderTasks()
+    go cm.StartLeaderTasks()
 }
 
 func (cm *ControllerManager) OnLoseLeadership() {
@@ -820,10 +820,10 @@ func (cm *ControllerManager) OnLoseLeadership() {
     log.Printf("Broker %s lost Controller leadership", cm.broker.ID)
     
     // 停止 Controller 任务
-    cm.stopLeaderTasks()
+    cm.StopLeaderTasks()
 }
 
-func (cm *ControllerManager) startLeaderTasks() {
+func (cm *ControllerManager) StartLeaderTasks() {
     // 1. 启动负载监控
     go cm.monitor.StartMonitoring()
     

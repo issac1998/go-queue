@@ -3,12 +3,8 @@ package protocol
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
-
-	"github.com/issac1998/go-queue/internal/metadata"
-	"github.com/issac1998/go-queue/internal/storage"
 )
 
 // FetchRequest represents a request to fetch messages from a topic partition
@@ -110,86 +106,3 @@ func (res *FetchResponse) Write(w io.Writer) error {
 	return nil
 }
 
-// HandleFetchRequest processes a fetch request and writes the response
-func HandleFetchRequest(conn io.ReadWriter, manager *metadata.Manager) error {
-
-	req, err := ReadFetchRequest(conn)
-	if err != nil {
-		return sendFetchError(conn, ErrorInvalidRequest, err.Error())
-	}
-
-	messages, nextOffset, err := manager.ReadMessage(req.Topic, req.Partition, req.Offset, req.MaxBytes)
-	if err != nil {
-		return sendFetchError(conn, ErrorOffsetOutOfRange, err.Error())
-	}
-
-	response := &FetchResponse{
-		Topic:      req.Topic,
-		Partition:  req.Partition,
-		ErrorCode:  ErrorNone,
-		Messages:   messages,
-		NextOffset: nextOffset,
-	}
-	return response.Write(conn)
-}
-
-// findSegmentAndPosition
-func findSegmentAndPosition(p *metadata.Partition, offset int64) (*storage.Segment, int64, error) {
-	for _, seg := range p.Segments {
-		if offset >= seg.BaseOffset && offset < seg.BaseOffset+seg.MaxBytes {
-			pos, err := seg.FindPosition(offset)
-			return seg, pos, err
-		}
-	}
-	return nil, 0, errors.New("offset out of range")
-}
-
-// readMessagesFromSegment
-func readMessagesFromSegment(
-	seg *storage.Segment,
-	startPos int64,
-	maxBytes int64,
-) ([][]byte, int64, error) {
-	var messages [][]byte
-	currentPos := startPos
-	totalBytes := int64(0)
-
-	for totalBytes < maxBytes {
-		var msgSize int32
-		lenBuf := make([]byte, 4)
-		if _, err := seg.ReadAt(currentPos, lenBuf); err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			return nil, 0, err
-		}
-		msgSize = int32(binary.BigEndian.Uint32(lenBuf))
-
-		currentPos += 4
-
-		if msgSize <= 0 || int64(msgSize) > (maxBytes-totalBytes) {
-			break
-		}
-
-		msg := make([]byte, msgSize)
-		if _, err := seg.ReadAt(currentPos, msg); err != nil {
-			return nil, 0, err
-		}
-		messages = append(messages, msg)
-		currentPos += int64(msgSize)
-		totalBytes += int64(msgSize) + 4
-	}
-
-	return messages, seg.BaseOffset + currentPos, nil
-}
-
-// sendFetchError
-func sendFetchError(w io.Writer, code int16, message string) error {
-	response := &FetchResponse{
-		ErrorCode: code,
-	}
-	if err := response.Write(w); err != nil {
-		return fmt.Errorf("failed to send error response: %v", err)
-	}
-	return fmt.Errorf("fetch error %d: %s", code, message)
-}

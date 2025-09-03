@@ -1,357 +1,261 @@
 package protocol
 
 import (
-	"bytes"
 	"encoding/binary"
-	"fmt"
 	"io"
-	"net"
 	"time"
-
-	"github.com/issac1998/go-queue/internal/metadata"
 )
 
-// ListTopicsRequest represents a request to list all available topics
-type ListTopicsRequest struct {
+// CreateTopicRequest represents a request to create a topic
+type CreateTopicRequest struct {
+	TopicName         string
+	Partitions        int32
+	ReplicationFactor int32
+	Config            map[string]string
 }
 
-// ListTopicsResponse represents the response containing all available topics
-type ListTopicsResponse struct {
-	// ErrorCode indicates whether the operation succeeded (0) or failed (non-zero)
+// CreateTopicResponse represents the response from a create topic operation
+type CreateTopicResponse struct {
 	ErrorCode int16
-	// Topics contains the list of all topics with their information
-	Topics []metadata.TopicInfo
+	ErrorMsg  string
 }
 
-// TopicInfo contains detailed information about a topic (protocol-level definition)
-type TopicInfo struct {
-	// Name is the topic name
-	Name string
-	// Partitions is the number of partitions in the topic
-	Partitions int32
-	// Replicas is the number of replicas per partition
-	Replicas int32
-	// CreatedAt is when the topic was created
-	CreatedAt time.Time
-	// Size is the total size of the topic in bytes
-	Size int64
-	// MessageCount is the total number of messages in the topic
-	MessageCount int64
-	// PartitionDetails contains detailed information about each partition
-	PartitionDetails []PartitionInfo
+// Write serializes the CreateTopicResponse to the writer
+func (r *CreateTopicResponse) Write(w io.Writer) error {
+	if err := binary.Write(w, binary.BigEndian, r.ErrorCode); err != nil {
+		return err
+	}
+
+	msgBytes := []byte(r.ErrorMsg)
+	if err := binary.Write(w, binary.BigEndian, int32(len(msgBytes))); err != nil {
+		return err
+	}
+	_, err := w.Write(msgBytes)
+	return err
 }
 
-// PartitionInfo contains detailed information about a partition (protocol-level definition)
-type PartitionInfo struct {
-	// ID is the partition identifier
-	ID int32
-	// Leader is the leader replica ID
-	Leader int32
-	// Replicas is the list of replica IDs
-	Replicas []int32
-	// ISR is the list of in-sync replica IDs
-	ISR []int32
-	// Size is the partition size in bytes
-	Size int64
-	// MessageCount is the number of messages in the partition
-	MessageCount int64
-	// StartOffset is the earliest available offset
-	StartOffset int64
-	// EndOffset is the next offset to be assigned
-	EndOffset int64
-}
+// ReadCreateTopicRequest reads a CreateTopicRequest from the reader
+func ReadCreateTopicRequest(r io.Reader) (*CreateTopicRequest, error) {
+	var nameLen int32
+	if err := binary.Read(r, binary.BigEndian, &nameLen); err != nil {
+		return nil, err
+	}
 
-// GetTopicRequest represents a request to get detailed information about a topic
-type GetTopicRequest struct {
-	TopicName string
-}
+	nameBytes := make([]byte, nameLen)
+	if _, err := io.ReadFull(r, nameBytes); err != nil {
+		return nil, err
+	}
 
-// GetTopicResponse represents the response containing detailed topic information
-type GetTopicResponse struct {
-	ErrorCode int16
-	Topic     *metadata.TopicInfo
+	var partitions int32
+	if err := binary.Read(r, binary.BigEndian, &partitions); err != nil {
+		return nil, err
+	}
+
+	var replicationFactor int32
+	if err := binary.Read(r, binary.BigEndian, &replicationFactor); err != nil {
+		return nil, err
+	}
+
+	return &CreateTopicRequest{
+		TopicName:         string(nameBytes),
+		Partitions:        partitions,
+		ReplicationFactor: replicationFactor,
+		Config:            make(map[string]string),
+	}, nil
 }
 
 // DeleteTopicRequest represents a request to delete a topic
 type DeleteTopicRequest struct {
-	// TopicName is the name of the topic to delete
 	TopicName string
 }
 
-// DeleteTopicResponse represents the response after deleting a topic
+// DeleteTopicResponse represents the response from a delete topic operation
 type DeleteTopicResponse struct {
-	// ErrorCode indicates whether the operation succeeded (0) or failed (non-zero)
 	ErrorCode int16
-	// TopicName is the name of the deleted topic
+	ErrorMsg  string
+}
+
+// Write serializes the DeleteTopicResponse to the writer
+func (r *DeleteTopicResponse) Write(w io.Writer) error {
+	if err := binary.Write(w, binary.BigEndian, r.ErrorCode); err != nil {
+		return err
+	}
+
+	msgBytes := []byte(r.ErrorMsg)
+	if err := binary.Write(w, binary.BigEndian, int32(len(msgBytes))); err != nil {
+		return err
+	}
+	_, err := w.Write(msgBytes)
+	return err
+}
+
+// ReadDeleteTopicRequest reads a DeleteTopicRequest from the reader
+func ReadDeleteTopicRequest(r io.Reader) (*DeleteTopicRequest, error) {
+	var nameLen int32
+	if err := binary.Read(r, binary.BigEndian, &nameLen); err != nil {
+		return nil, err
+	}
+
+	nameBytes := make([]byte, nameLen)
+	if _, err := io.ReadFull(r, nameBytes); err != nil {
+		return nil, err
+	}
+
+	return &DeleteTopicRequest{
+		TopicName: string(nameBytes),
+	}, nil
+}
+
+// ListTopicsRequest represents a request to list all topics
+type ListTopicsRequest struct {
+	// Version is the protocol version
+	Version int16
+}
+
+// ListTopicsResponse represents the response from a list topics operation
+type ListTopicsResponse struct {
+	ErrorCode int16
+	Topics    []TopicInfo
+}
+
+// TopicInfo contains basic information about a topic
+type TopicInfo struct {
+	Name              string
+	Partitions        int32
+	ReplicationFactor int32
+}
+
+// Write serializes the ListTopicsResponse to the writer
+func (r *ListTopicsResponse) Write(w io.Writer) error {
+	if err := binary.Write(w, binary.BigEndian, r.ErrorCode); err != nil {
+		return err
+	}
+
+	if err := binary.Write(w, binary.BigEndian, int32(len(r.Topics))); err != nil {
+		return err
+	}
+
+	for _, topic := range r.Topics {
+		nameBytes := []byte(topic.Name)
+		if err := binary.Write(w, binary.BigEndian, int32(len(nameBytes))); err != nil {
+			return err
+		}
+		if _, err := w.Write(nameBytes); err != nil {
+			return err
+		}
+
+		if err := binary.Write(w, binary.BigEndian, topic.Partitions); err != nil {
+			return err
+		}
+
+		if err := binary.Write(w, binary.BigEndian, topic.ReplicationFactor); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// ReadListTopicsRequest reads a ListTopicsRequest from the reader
+func ReadListTopicsRequest(r io.Reader) (*ListTopicsRequest, error) {
+	var version int16
+	if err := binary.Read(r, binary.BigEndian, &version); err != nil {
+		return nil, err
+	}
+
+	return &ListTopicsRequest{
+		Version: version,
+	}, nil
+}
+
+// GetTopicInfoRequest represents a request to get detailed information about a topic
+type GetTopicInfoRequest struct {
 	TopicName string
 }
 
-func ReadListTopicsRequest(r io.Reader) (*ListTopicsRequest, error) {
-	req := &ListTopicsRequest{}
-
-	var version int16
-	if err := binary.Read(r, binary.BigEndian, &version); err != nil {
-		return nil, fmt.Errorf("failed to read version: %v", err)
-	}
-
-	return req, nil
+// GetTopicInfoResponse represents the response from a get topic info operation
+type GetTopicInfoResponse struct {
+	ErrorCode int16
+	Topic     TopicDetailInfo
 }
 
-func (res *ListTopicsResponse) Write(w io.Writer) error {
-	buf := new(bytes.Buffer)
+// TopicDetailInfo contains detailed information about a topic
+type TopicDetailInfo struct {
+	Name              string
+	Partitions        int32
+	ReplicationFactor int32
+	CreatedAt         time.Time
+	Config            map[string]string
+}
 
-	if err := binary.Write(buf, binary.BigEndian, res.ErrorCode); err != nil {
+// Write serializes the GetTopicInfoResponse to the writer
+func (r *GetTopicInfoResponse) Write(w io.Writer) error {
+	if err := binary.Write(w, binary.BigEndian, r.ErrorCode); err != nil {
 		return err
 	}
 
-	if err := binary.Write(buf, binary.BigEndian, int32(len(res.Topics))); err != nil {
+	nameBytes := []byte(r.Topic.Name)
+	if err := binary.Write(w, binary.BigEndian, int32(len(nameBytes))); err != nil {
+		return err
+	}
+	if _, err := w.Write(nameBytes); err != nil {
 		return err
 	}
 
-	for _, topic := range res.Topics {
-
-		if err := binary.Write(buf, binary.BigEndian, int16(len(topic.Name))); err != nil {
-			return err
-		}
-		if _, err := buf.WriteString(topic.Name); err != nil {
-			return err
-		}
-
-		if err := binary.Write(buf, binary.BigEndian, topic.Partitions); err != nil {
-			return err
-		}
-		if err := binary.Write(buf, binary.BigEndian, topic.Replicas); err != nil {
-			return err
-		}
-		if err := binary.Write(buf, binary.BigEndian, topic.CreatedAt.Unix()); err != nil {
-			return err
-		}
-		if err := binary.Write(buf, binary.BigEndian, topic.Size); err != nil {
-			return err
-		}
-		if err := binary.Write(buf, binary.BigEndian, topic.MessageCount); err != nil {
-			return err
-		}
-	}
-
-	totalLen := int32(buf.Len())
-	if err := binary.Write(w, binary.BigEndian, totalLen); err != nil {
+	if err := binary.Write(w, binary.BigEndian, r.Topic.Partitions); err != nil {
 		return err
 	}
-	if _, err := w.Write(buf.Bytes()); err != nil {
+
+	if err := binary.Write(w, binary.BigEndian, r.Topic.ReplicationFactor); err != nil {
 		return err
+	}
+
+	createdAtUnix := r.Topic.CreatedAt.Unix()
+	if err := binary.Write(w, binary.BigEndian, createdAtUnix); err != nil {
+		return err
+	}
+
+	if err := binary.Write(w, binary.BigEndian, int32(len(r.Topic.Config))); err != nil {
+		return err
+	}
+
+	for key, value := range r.Topic.Config {
+		keyBytes := []byte(key)
+		if err := binary.Write(w, binary.BigEndian, int32(len(keyBytes))); err != nil {
+			return err
+		}
+		if _, err := w.Write(keyBytes); err != nil {
+			return err
+		}
+
+		valueBytes := []byte(value)
+		if err := binary.Write(w, binary.BigEndian, int32(len(valueBytes))); err != nil {
+			return err
+		}
+		if _, err := w.Write(valueBytes); err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
-func ReadDescribeTopicRequest(r io.Reader) (*GetTopicRequest, error) {
-	req := &GetTopicRequest{}
-
-	var version int16
-	if err := binary.Read(r, binary.BigEndian, &version); err != nil {
-		return nil, fmt.Errorf("failed to read version: %v", err)
+// ReadGetTopicInfoRequest reads a GetTopicInfoRequest from the reader
+func ReadGetTopicInfoRequest(r io.Reader) (*GetTopicInfoRequest, error) {
+	var nameLen int32
+	if err := binary.Read(r, binary.BigEndian, &nameLen); err != nil {
+		return nil, err
 	}
 
-	var topicLen int16
-	if err := binary.Read(r, binary.BigEndian, &topicLen); err != nil {
-		return nil, fmt.Errorf("failed to read topic length: %v", err)
+	nameBytes := make([]byte, nameLen)
+	if _, err := io.ReadFull(r, nameBytes); err != nil {
+		return nil, err
 	}
-	topicBytes := make([]byte, topicLen)
-	if _, err := io.ReadFull(r, topicBytes); err != nil {
-		return nil, fmt.Errorf("failed to read topic name: %v", err)
-	}
-	req.TopicName = string(topicBytes)
 
-	return req, nil
+	return &GetTopicInfoRequest{
+		TopicName: string(nameBytes),
+	}, nil
 }
 
-func (res *GetTopicResponse) Write(w io.Writer) error {
-	buf := new(bytes.Buffer)
-
-	if err := binary.Write(buf, binary.BigEndian, res.ErrorCode); err != nil {
-		return err
-	}
-
-	if res.ErrorCode == ErrorNone && res.Topic != nil {
-		topic := res.Topic
-
-		if err := binary.Write(buf, binary.BigEndian, int16(len(topic.Name))); err != nil {
-			return err
-		}
-		if _, err := buf.WriteString(topic.Name); err != nil {
-			return err
-		}
-
-		if err := binary.Write(buf, binary.BigEndian, topic.Partitions); err != nil {
-			return err
-		}
-		if err := binary.Write(buf, binary.BigEndian, topic.Replicas); err != nil {
-			return err
-		}
-		if err := binary.Write(buf, binary.BigEndian, topic.CreatedAt.Unix()); err != nil {
-			return err
-		}
-		if err := binary.Write(buf, binary.BigEndian, topic.Size); err != nil {
-			return err
-		}
-		if err := binary.Write(buf, binary.BigEndian, topic.MessageCount); err != nil {
-			return err
-		}
-
-		if err := binary.Write(buf, binary.BigEndian, int32(len(topic.PartitionDetails))); err != nil {
-			return err
-		}
-
-		for _, partition := range topic.PartitionDetails {
-			if err := binary.Write(buf, binary.BigEndian, partition.ID); err != nil {
-				return err
-			}
-			if err := binary.Write(buf, binary.BigEndian, partition.Leader); err != nil {
-				return err
-			}
-			if err := binary.Write(buf, binary.BigEndian, partition.Size); err != nil {
-				return err
-			}
-			if err := binary.Write(buf, binary.BigEndian, partition.MessageCount); err != nil {
-				return err
-			}
-			if err := binary.Write(buf, binary.BigEndian, partition.StartOffset); err != nil {
-				return err
-			}
-			if err := binary.Write(buf, binary.BigEndian, partition.EndOffset); err != nil {
-				return err
-			}
-		}
-	}
-
-	totalLen := int32(buf.Len())
-	if err := binary.Write(w, binary.BigEndian, totalLen); err != nil {
-		return err
-	}
-	if _, err := w.Write(buf.Bytes()); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func ReadDeleteTopicRequest(r io.Reader) (*DeleteTopicRequest, error) {
-	req := &DeleteTopicRequest{}
-
-	var version int16
-	if err := binary.Read(r, binary.BigEndian, &version); err != nil {
-		return nil, fmt.Errorf("failed to read version: %v", err)
-	}
-
-	var topicLen int16
-	if err := binary.Read(r, binary.BigEndian, &topicLen); err != nil {
-		return nil, fmt.Errorf("failed to read topic length: %v", err)
-	}
-	topicBytes := make([]byte, topicLen)
-	if _, err := io.ReadFull(r, topicBytes); err != nil {
-		return nil, fmt.Errorf("failed to read topic name: %v", err)
-	}
-	req.TopicName = string(topicBytes)
-
-	return req, nil
-}
-
-func (res *DeleteTopicResponse) Write(w io.Writer) error {
-	buf := new(bytes.Buffer)
-
-	if err := binary.Write(buf, binary.BigEndian, res.ErrorCode); err != nil {
-		return err
-	}
-
-	if err := binary.Write(buf, binary.BigEndian, int16(len(res.TopicName))); err != nil {
-		return err
-	}
-	if _, err := buf.WriteString(res.TopicName); err != nil {
-		return err
-	}
-
-	totalLen := int32(buf.Len())
-	if err := binary.Write(w, binary.BigEndian, totalLen); err != nil {
-		return err
-	}
-	if _, err := w.Write(buf.Bytes()); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// HandleListTopicsRequest processes a list topics request and writes the response
-func HandleListTopicsRequest(conn net.Conn, manager *metadata.Manager) error {
-	defer conn.Close()
-
-	_, err := ReadListTopicsRequest(conn)
-	if err != nil {
-		return sendTopicError(conn, ErrorInvalidRequest, "Failed to read request")
-	}
-
-	topics, err := manager.ListTopicsDetailed()
-	if err != nil {
-		return sendTopicError(conn, ErrorBrokerNotAvailable, "Failed to list topics")
-	}
-
-	response := &ListTopicsResponse{
-		ErrorCode: ErrorNone,
-		Topics:    topics,
-	}
-
-	return response.Write(conn)
-}
-
-// HandleDescribeTopicRequest processes a describe topic request and writes the response
-func HandleGetTopicInfoRequest(conn net.Conn, manager *metadata.Manager) error {
-	defer conn.Close()
-
-	req, err := ReadDescribeTopicRequest(conn)
-	if err != nil {
-		return sendTopicError(conn, ErrorInvalidRequest, "Failed to read request")
-	}
-
-	topic, err := manager.GetTopicInfo(req.TopicName)
-	if err != nil {
-		return sendTopicError(conn, ErrorInvalidTopic, "Topic not found")
-	}
-
-	response := &GetTopicResponse{
-		ErrorCode: ErrorNone,
-		Topic:     topic,
-	}
-
-	return response.Write(conn)
-}
-
-// HandleDeleteTopicRequest processes a delete topic request and writes the response
-func HandleDeleteTopicRequest(conn net.Conn, manager *metadata.Manager) error {
-	defer conn.Close()
-
-	req, err := ReadDeleteTopicRequest(conn)
-	if err != nil {
-		return sendTopicError(conn, ErrorInvalidRequest, "Failed to read request")
-	}
-
-	err = manager.DeleteTopic(req.TopicName)
-	if err != nil {
-		return sendTopicError(conn, ErrorInvalidTopic, "Failed to delete topic")
-	}
-
-	response := &DeleteTopicResponse{
-		ErrorCode: ErrorNone,
-		TopicName: req.TopicName,
-	}
-
-	return response.Write(conn)
-}
-
-func sendTopicError(conn net.Conn, errorCode int16, message string) error {
-	response := &ListTopicsResponse{
-		ErrorCode: errorCode,
-		Topics:    nil,
-	}
-	return response.Write(conn)
-}
+// Legacy handlers removed - these are replaced by the new Raft-based broker handlers
+// The protocol data structures above are still used by the new broker implementation

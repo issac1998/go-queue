@@ -17,21 +17,22 @@ import (
 type ControllerManager struct {
 	broker *Broker
 
-	// State machine reference
 	stateMachine *raft.ControllerStateMachine
 
-	// Background tasks
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	// Health check and monitoring
+	// Leader-specific context and cancellation
+	leaderCtx    context.Context
+	leaderCancel context.CancelFunc
+	leaderWg     sync.WaitGroup
+
 	healthChecker   *HealthChecker
 	leaderScheduler *LeaderScheduler
 	loadMonitor     *LoadMonitor
 	failureDetector *FailureDetector
 
-	// Synchronization
 	mu sync.RWMutex
 }
 
@@ -68,8 +69,7 @@ func NewControllerManager(broker *Broker) (*ControllerManager, error) {
 		cancel: cancel,
 	}
 
-	// Create state machine
-	cm.stateMachine = raft.NewControllerStateMachine(cm)
+	cm.stateMachine = raft.NewMultiRaftControllerStateMachine(cm, broker.raftManager)
 
 	cm.healthChecker = &HealthChecker{
 		controller:       cm,
@@ -168,7 +168,7 @@ func (cm *ControllerManager) initControllerRaftGroup() error {
 	}
 
 	if cm.broker.raftManager.IsLeader(cm.broker.Config.RaftConfig.ControllerGroupID) {
-		cm.OnBecomeLeader()
+		go cm.StartLeaderTasks()
 	}
 
 	cm.startBackgroundTasks()
@@ -207,9 +207,9 @@ func (cm *ControllerManager) monitorLeadership() {
 			isLeader := cm.broker.raftManager.IsLeader(cm.broker.Config.RaftConfig.ControllerGroupID)
 			if isLeader != wasLeader {
 				if isLeader {
-					cm.OnBecomeLeader()
+					go cm.StartLeaderTasks()
 				} else {
-					cm.OnLoseLeadership()
+					go cm.StopLeaderTasks()
 				}
 				wasLeader = isLeader
 			}
@@ -217,42 +217,44 @@ func (cm *ControllerManager) monitorLeadership() {
 	}
 }
 
-// OnBecomeLeader is called when this broker becomes the Controller leader
-func (cm *ControllerManager) OnBecomeLeader() {
-	log.Printf("Broker %s became Controller leader", cm.broker.ID)
-	cm.startLeaderTasks()
-}
+// StartLeaderTasks starts tasks that only the leader should perform
+func (cm *ControllerManager) StartLeaderTasks() {
+	log.Printf("Starting leader tasks for broker %s", cm.broker.ID)
 
-// OnLoseLeadership is called when this broker loses Controller leadership
-func (cm *ControllerManager) OnLoseLeadership() {
-	log.Printf("Broker %s lost Controller leadership", cm.broker.ID)
-	cm.stopLeaderTasks()
-}
+	// Create a new context for leader tasks
+	cm.leaderCtx, cm.leaderCancel = context.WithCancel(cm.ctx)
 
-// startLeaderTasks starts tasks that only the leader should perform
-func (cm *ControllerManager) startLeaderTasks() {
-	cm.wg.Add(1)
+	cm.leaderWg.Add(1)
 	go cm.healthChecker.startHealthCheck()
 
-	cm.wg.Add(1)
+	cm.leaderWg.Add(1)
 	go cm.loadMonitor.startMonitoring()
 
-	cm.wg.Add(1)
+	cm.leaderWg.Add(1)
 	go cm.failureDetector.startDetection()
 
-	cm.wg.Add(1)
+	cm.leaderWg.Add(1)
 	go cm.performFullHealthCheck()
+
+	log.Printf("Leader tasks started for broker %s", cm.broker.ID)
 }
 
-// stopLeaderTasks stops leader-specific tasks
-func (cm *ControllerManager) stopLeaderTasks() {
-	// Tasks will stop when context is cancelled or leadership changes
+// StopLeaderTasks stops leader-specific tasks
+func (cm *ControllerManager) StopLeaderTasks() {
 	log.Printf("Stopping leader tasks for broker %s", cm.broker.ID)
+
+	if cm.leaderCancel != nil {
+		cm.leaderCancel()
+	}
+
+	cm.leaderWg.Wait()
+
+	log.Printf("All leader tasks stopped for broker %s", cm.broker.ID)
 }
 
 // performFullHealthCheck performs a comprehensive health check
 func (cm *ControllerManager) performFullHealthCheck() {
-	defer cm.wg.Done()
+	defer cm.leaderWg.Done()
 
 	log.Printf("Performing full cluster health check...")
 	// TODO:implement
@@ -260,12 +262,14 @@ func (cm *ControllerManager) performFullHealthCheck() {
 		log.Printf("Failed to register current broker: %v", err)
 	}
 
+	log.Printf("Full health check completed")
 }
 
 // IsLeader returns whether this broker is the Controller leader
 func (cm *ControllerManager) isLeader() bool {
 	leaderID, exists, _ := cm.broker.raftManager.GetLeaderID(cm.broker.Config.RaftConfig.ControllerGroupID)
-	if exists && leaderID == cm.broker.Controller.brokerIDToNodeID(cm.broker.ID) {
+	nodeID := cm.brokerIDToNodeID(cm.broker.ID)
+	if exists && leaderID == nodeID {
 		return true
 	}
 	return false
@@ -364,7 +368,6 @@ func (cm *ControllerManager) RegisterBroker() error {
 			"address":      cm.broker.Address,
 			"port":         cm.broker.Port,
 			"raft_address": cm.broker.Config.RaftConfig.RaftAddr,
-			"raft_port":    cm.broker.Config.RaftConfig.NodeID, // Simplified
 		},
 	}
 
@@ -372,41 +375,116 @@ func (cm *ControllerManager) RegisterBroker() error {
 }
 
 // CreateTopic creates a new topic
+// CreateTopic creates a new topic with proper partition allocation (ONLY for Controller Leader)
 func (cm *ControllerManager) CreateTopic(topicName string, partitions int32, replicationFactor int32) error {
+	// CRITICAL: Only Controller Leader should execute this
 	if !cm.isLeader() {
-		return fmt.Errorf("not controller leader")
+		return fmt.Errorf("only controller leader can create topics")
 	}
 
+	log.Printf("Controller Leader creating topic %s with %d partitions (replication factor: %d)",
+		topicName, partitions, replicationFactor)
+
+	// Step 1: Get available brokers
+	availableBrokers, err := cm.getAvailableBrokers()
+	if err != nil {
+		return fmt.Errorf("failed to get available brokers: %w", err)
+	}
+	if len(availableBrokers) == 0 {
+		return fmt.Errorf("no available brokers for topic creation")
+	}
+
+	// Step 2: Perform partition allocation (Leader responsibility)
+	partitionAssigner, err := cm.getPartitionAssigner()
+	if err != nil {
+		return fmt.Errorf("failed to get partition assigner: %w", err)
+	}
+
+	assignments, err := partitionAssigner.AllocatePartitions(topicName, partitions, replicationFactor, availableBrokers)
+	if err != nil {
+		return fmt.Errorf("failed to allocate partitions: %w", err)
+	}
+
+	log.Printf("Allocated %d partitions for topic %s", len(assignments), topicName)
+
+	// Step 3: Start Raft groups for all partitions (Leader responsibility)
+	err = partitionAssigner.StartPartitionRaftGroups(assignments)
+	if err != nil {
+		return fmt.Errorf("failed to start partition Raft groups: %w", err)
+	}
+
+	log.Printf("Started Raft groups for topic %s", topicName)
+
+	// Step 4: Propose metadata update through Raft (so all nodes get the same metadata)
 	cmd := &raft.ControllerCommand{
 		Type:      protocol.RaftCmdCreateTopic,
 		ID:        uuid.New().String(),
 		Timestamp: time.Now(),
 		Data: map[string]interface{}{
 			"topic_name":         topicName,
-			"partitions":         partitions,
-			"replication_factor": replicationFactor,
+			"partitions":         float64(partitions),
+			"replication_factor": float64(replicationFactor),
+			"assignments":        cm.assignmentsToMap(assignments), // Pre-allocated assignments
 		},
 	}
 
-	return cm.ExecuteCommand(cmd)
+	err = cm.ExecuteCommand(cmd)
+	if err != nil {
+		return fmt.Errorf("failed to update topic metadata: %w", err)
+	}
+
+	log.Printf("Topic %s created successfully with %d partitions", topicName, len(assignments))
+	return nil
 }
 
-// DeleteTopic deletes an existing topic
+// DeleteTopic deletes an existing topic (ONLY for Controller Leader)
 func (cm *ControllerManager) DeleteTopic(topicName string) error {
 	if !cm.isLeader() {
-		return fmt.Errorf("not controller leader")
+		return fmt.Errorf("only controller leader can delete topics")
 	}
+
+	log.Printf("Controller Leader deleting topic %s", topicName)
+
+	topicAssignments, err := cm.getTopicAssignments(topicName)
+	if err != nil {
+		return fmt.Errorf("failed to get topic assignments: %w", err)
+	}
+
+	if len(topicAssignments) == 0 {
+		return fmt.Errorf("topic %s not found or has no partitions", topicName)
+	}
+
+	partitionAssigner, err := cm.getPartitionAssigner()
+	if err != nil {
+		return fmt.Errorf("failed to get partition assigner: %w", err)
+	}
+
+	log.Printf("Stopping %d Raft groups for topic %s", len(topicAssignments), topicName)
+	err = partitionAssigner.StopPartitionRaftGroups(topicAssignments)
+	if err != nil {
+		log.Printf("Warning: failed to stop some Raft groups for topic %s: %v", topicName, err)
+	}
+
+	log.Printf("Stopped Raft groups for topic %s", topicName)
 
 	cmd := &raft.ControllerCommand{
 		Type:      protocol.RaftCmdDeleteTopic,
 		ID:        uuid.New().String(),
 		Timestamp: time.Now(),
 		Data: map[string]interface{}{
-			"topic_name": topicName,
+			"topic_name":          topicName,
+			"assignments":         cm.assignmentsToMap(topicAssignments), // Assignments to be deleted
+			"raft_groups_stopped": true,                                  // Indicate that Raft groups are already stopped
 		},
 	}
 
-	return cm.ExecuteCommand(cmd)
+	err = cm.ExecuteCommand(cmd)
+	if err != nil {
+		return fmt.Errorf("failed to update topic metadata: %w", err)
+	}
+
+	log.Printf("Topic %s deleted successfully", topicName)
+	return nil
 }
 
 // GetTopic gets detailed information about a topic
@@ -428,8 +506,6 @@ func (cm *ControllerManager) GetTopic(topicName string) (*raft.TopicMetadata, er
 
 // GetTopicInfo gets basic information about a topic
 func (cm *ControllerManager) GetTopicInfo(topicName string) (*raft.TopicMetadata, error) {
-	// For now, this is the same as DescribeTopic
-	// In the future, this might return a lighter version
 	return cm.GetTopic(topicName)
 }
 
@@ -510,11 +586,75 @@ func (cm *ControllerManager) GetPartitionLeader(topic string, partition int32) (
 	return "", fmt.Errorf("partition leader not found")
 }
 
-// Helper methods
+// MigrateLeader migrates partition leader
+func (cm *ControllerManager) MigrateLeader(partitionKey, newLeader string) error {
+	if !cm.isLeader() {
+		return fmt.Errorf("not controller leader")
+	}
 
-// brokerIDToNodeID converts a broker ID string to a uint64 node ID
+	assignment, err := cm.getPartitionAssignment(partitionKey)
+	if err != nil {
+		return fmt.Errorf("failed to get partition assignment: %w", err)
+	}
+
+	if !cm.isValidReplica(assignment, newLeader) {
+		return fmt.Errorf("broker %s is not a replica of partition %s", newLeader, partitionKey)
+	}
+
+	if cm.broker.raftManager == nil {
+		return fmt.Errorf("no raftManger")
+	}
+
+	return cm.executeDirectLeaderTransfer(assignment, newLeader)
+
+}
+
+// executeDirectLeaderTransfer directly calls dragonboat TransferLeadership
+func (cm *ControllerManager) executeDirectLeaderTransfer(assignment *raft.PartitionAssignment, newLeader string) error {
+	targetNodeID := cm.brokerIDToNodeID(newLeader)
+
+	err := cm.broker.raftManager.TransferLeadership(assignment.RaftGroupID, targetNodeID)
+	if err != nil {
+		return fmt.Errorf("failed to transfer leadership: %w", err)
+	}
+
+	log.Printf("Successfully initiated leader transfer for partition %s (group %d) to broker %s",
+		fmt.Sprintf("%s-%d", assignment.TopicName, assignment.PartitionID),
+		assignment.RaftGroupID, newLeader)
+
+	return nil
+}
+
+// Helper functions
+func (cm *ControllerManager) getPartitionAssignment(partitionKey string) (*raft.PartitionAssignment, error) {
+	result, err := cm.QueryMetadata(protocol.RaftQueryGetPartitionAssignments, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var assignments map[string]*raft.PartitionAssignment
+	if err := json.Unmarshal(result, &assignments); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal assignments: %w", err)
+	}
+
+	assignment, exists := assignments[partitionKey]
+	if !exists {
+		return nil, fmt.Errorf("partition %s not found", partitionKey)
+	}
+
+	return assignment, nil
+}
+
+func (cm *ControllerManager) isValidReplica(assignment *raft.PartitionAssignment, brokerID string) bool {
+	for _, replica := range assignment.Replicas {
+		if replica == brokerID {
+			return true
+		}
+	}
+	return false
+}
+
 func (cm *ControllerManager) brokerIDToNodeID(brokerID string) uint64 {
-	// Simple hash function to convert string to uint64
 	hash := uint64(0)
 	for _, b := range []byte(brokerID) {
 		hash = hash*31 + uint64(b)
@@ -524,20 +664,19 @@ func (cm *ControllerManager) brokerIDToNodeID(brokerID string) uint64 {
 
 // Health checker implementation
 func (hc *HealthChecker) startHealthCheck() {
-	defer hc.controller.wg.Done()
+	defer hc.controller.leaderWg.Done()
 
 	ticker := time.NewTicker(hc.checkInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-hc.controller.ctx.Done():
+		case <-hc.controller.leaderCtx.Done():
+			log.Printf("Health checker stopped due to leadership change")
 			return
 		case <-ticker.C:
-			// Use safer leader validation for critical background tasks
 			if hc.controller.isLeader() {
 				hc.performHealthCheck()
-
 			}
 		}
 	}
@@ -588,14 +727,15 @@ func (hc *HealthChecker) handleBrokerFailure(brokerID string) {
 
 // Load monitor implementation
 func (lm *LoadMonitor) startMonitoring() {
-	defer lm.controller.wg.Done()
+	defer lm.controller.leaderWg.Done()
 
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-lm.controller.ctx.Done():
+		case <-lm.controller.leaderCtx.Done():
+			log.Printf("Load monitor stopped due to leadership change")
 			return
 		case <-ticker.C:
 			if lm.controller.isLeader() {
@@ -627,14 +767,15 @@ func (lm *LoadMonitor) updateLoadMetrics() {
 
 // Failure detector implementation
 func (fd *FailureDetector) startDetection() {
-	defer fd.controller.wg.Done()
+	defer fd.controller.leaderWg.Done()
 
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-fd.controller.ctx.Done():
+		case <-fd.controller.leaderCtx.Done():
+			log.Printf("Failure detector stopped due to leadership change")
 			return
 		case <-ticker.C:
 			if fd.controller.isLeader() {
@@ -663,4 +804,116 @@ func (ls *LeaderScheduler) MigrateLeader(partitionKey, fromBroker, toBroker stri
 	}
 
 	return ls.controller.ExecuteCommand(cmd)
+}
+
+// getAvailableBrokers returns list of available brokers
+func (cm *ControllerManager) getAvailableBrokers() ([]*raft.BrokerInfo, error) {
+	// Query current cluster metadata to get available brokers
+	queryData := map[string]interface{}{
+		"type": "get_brokers",
+	}
+
+	queryBytes, err := json.Marshal(queryData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal query: %w", err)
+	}
+
+	result, err := cm.broker.raftManager.SyncRead(context.Background(), uint64(1), queryBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query brokers: %w", err)
+	}
+
+	var brokersMap map[string]*raft.BrokerInfo
+	if err := json.Unmarshal(result.([]byte), &brokersMap); err != nil {
+		return nil, fmt.Errorf("failed to parse brokers: %w", err)
+	}
+
+	var available []*raft.BrokerInfo
+	for _, broker := range brokersMap {
+		if broker.Status == "active" {
+			available = append(available, broker)
+		}
+	}
+
+	return available, nil
+}
+
+// getPartitionAssigner returns the partition assigner
+func (cm *ControllerManager) getPartitionAssigner() (*raft.PartitionAssigner, error) {
+	// Access the partition assigner from the state machine
+	// Since partitionAssigner is private, we need to add a getter method to ControllerStateMachine
+	// For now, create a new instance using the same parameters
+
+	// Get current metadata first
+	queryData := map[string]interface{}{
+		"type": "get_cluster_metadata",
+	}
+
+	queryBytes, err := json.Marshal(queryData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal metadata query: %w", err)
+	}
+
+	result, err := cm.broker.raftManager.SyncRead(context.Background(), uint64(1), queryBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query metadata: %w", err)
+	}
+
+	var metadata raft.ClusterMetadata
+	if err := json.Unmarshal(result.([]byte), &metadata); err != nil {
+		return nil, fmt.Errorf("failed to parse metadata: %w", err)
+	}
+
+	// Create partition assigner with current metadata and raft manager
+	partitionAssigner := raft.NewPartitionAssigner(&metadata, cm.broker.raftManager)
+	return partitionAssigner, nil
+}
+
+// assignmentsToMap converts PartitionAssignment slice to map format for JSON serialization
+func (cm *ControllerManager) assignmentsToMap(assignments []*raft.PartitionAssignment) []map[string]interface{} {
+	var result []map[string]interface{}
+	for _, assignment := range assignments {
+		assignmentMap := map[string]interface{}{
+			"topic_name":       assignment.TopicName,
+			"partition_id":     float64(assignment.PartitionID),
+			"raft_group_id":    float64(assignment.RaftGroupID),
+			"replicas":         assignment.Replicas,
+			"leader":           assignment.Leader,
+			"preferred_leader": assignment.PreferredLeader,
+		}
+		result = append(result, assignmentMap)
+	}
+	return result
+}
+
+// getTopicAssignments returns all partition assignments for a specific topic
+func (cm *ControllerManager) getTopicAssignments(topicName string) ([]*raft.PartitionAssignment, error) {
+	// Query current partition assignments
+	queryData := map[string]interface{}{
+		"type": "get_partition_assignments",
+	}
+
+	queryBytes, err := json.Marshal(queryData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal query: %w", err)
+	}
+
+	result, err := cm.broker.raftManager.SyncRead(context.Background(), uint64(1), queryBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query assignments: %w", err)
+	}
+
+	var assignmentsMap map[string]*raft.PartitionAssignment
+	if err := json.Unmarshal(result.([]byte), &assignmentsMap); err != nil {
+		return nil, fmt.Errorf("failed to parse assignments: %w", err)
+	}
+
+	var topicAssignments []*raft.PartitionAssignment
+	for _, assignment := range assignmentsMap {
+		if assignment.TopicName == topicName {
+			topicAssignments = append(topicAssignments, assignment)
+		}
+	}
+
+	return topicAssignments, nil
 }

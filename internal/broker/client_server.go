@@ -34,6 +34,7 @@ const (
 	MetadataReadRequest
 	DataRequest
 	ControllerRequest
+	InterBrokerRequest
 )
 
 // RequestConfig defines configuration for each request type
@@ -44,17 +45,17 @@ type RequestConfig struct {
 
 // requestConfigs maps request types to their configurations
 var requestConfigs = map[int32]RequestConfig{
-	protocol.ControllerDiscoverRequestType: {Type: ControllerRequest, Handler: &ControllerDiscoveryHandler{}},
-	protocol.ControllerVerifyRequestType:   {Type: ControllerRequest, Handler: &ControllerVerifyHandler{}},
-	protocol.CreateTopicRequestType:        {Type: MetadataWriteRequest, Handler: &CreateTopicHandler{}},
-	protocol.DeleteTopicRequestType:        {Type: MetadataWriteRequest, Handler: &DeleteTopicHandler{}},
-	protocol.ListTopicsRequestType:         {Type: MetadataReadRequest, Handler: &ListTopicsHandler{}},
-	protocol.GetTopicInfoRequestType:       {Type: MetadataReadRequest, Handler: &GetTopicInfoHandler{}},
-	protocol.GetTopicMetadataRequestType:   {Type: MetadataReadRequest, Handler: &GetTopicMetadataHandler{}},
-	protocol.JoinGroupRequestType:          {Type: MetadataWriteRequest, Handler: &JoinGroupHandler{}},
-	protocol.LeaveGroupRequestType:         {Type: MetadataWriteRequest, Handler: &LeaveGroupHandler{}},
-	protocol.ProduceRequestType:            {Type: DataRequest, Handler: &ProduceHandler{}},
-	protocol.FetchRequestType:              {Type: DataRequest, Handler: &FetchHandler{}},
+	protocol.DiscoverControllerRequestType:      {Type: ControllerRequest, Handler: &ControllerDiscoveryHandler{}},
+	protocol.CreateTopicRequestType:             {Type: MetadataWriteRequest, Handler: &CreateTopicHandler{}},
+	protocol.DeleteTopicRequestType:             {Type: MetadataWriteRequest, Handler: &DeleteTopicHandler{}},
+	protocol.ListTopicsRequestType:              {Type: MetadataReadRequest, Handler: &ListTopicsHandler{}},
+	protocol.GetTopicInfoRequestType:            {Type: MetadataReadRequest, Handler: &GetTopicInfoHandler{}},
+	protocol.JoinGroupRequestType:               {Type: MetadataWriteRequest, Handler: &JoinGroupHandler{}},
+	protocol.LeaveGroupRequestType:              {Type: MetadataWriteRequest, Handler: &LeaveGroupHandler{}},
+	protocol.ProduceRequestType:                 {Type: DataRequest, Handler: &ProduceHandler{}},
+	protocol.FetchRequestType:                   {Type: DataRequest, Handler: &FetchHandler{}},
+	protocol.StartPartitionRaftGroupRequestType: {Type: InterBrokerRequest, Handler: &StartPartitionRaftGroupHandler{}},
+	protocol.StopPartitionRaftGroupRequestType:  {Type: InterBrokerRequest, Handler: &StopPartitionRaftGroupHandler{}},
 }
 
 // NewClientServer creates a new ClientServer
@@ -147,6 +148,9 @@ func (cs *ClientServer) handleRequestByType(conn net.Conn, requestType int32, co
 		// TODO: handle data request
 		return config.Handler.Handle(conn, cs)
 
+	case InterBrokerRequest:
+		return cs.handleInterBrokerRequest(conn, config)
+
 	default:
 		return fmt.Errorf("unknown request type category")
 	}
@@ -182,8 +186,8 @@ func (cs *ClientServer) handleMetadataReadRequest(conn net.Conn, config RequestC
 
 	isFollowerReadEnabled := cs.broker.Config.EnableFollowerRead
 
-	// Follower can handle if follower read is enabled
 	if isFollowerReadEnabled {
+		// wait readIndex
 		if err := cs.ensureReadIndexConsistency(); err != nil {
 			log.Printf("ReadIndex failed: %v", err)
 			return fmt.Errorf("read consistency check failed: %v", err)
@@ -253,16 +257,24 @@ func (cs *ClientServer) sendSuccessResponse(conn net.Conn, data []byte) {
 	conn.Write(data)
 }
 
+// readRequestData reads variable-length request data from the connection
+// This uses io.ReadAll with size limits to handle data of any size safely
 func (cs *ClientServer) readRequestData(conn net.Conn) ([]byte, error) {
-	// For simple requests, we may not have explicit length
-	// Try to read what's available with a reasonable timeout
-	buffer := make([]byte, 4096)
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	n, err := conn.Read(buffer)
+
+	const maxRequestSize = 10 * 1024 * 1024
+	limitedReader := io.LimitReader(conn, maxRequestSize)
+
+	requestData, err := io.ReadAll(limitedReader)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read request data: %v", err)
 	}
-	return buffer[:n], nil
+
+	if len(requestData) == maxRequestSize {
+		return nil, fmt.Errorf("request data too large (exceeded %d bytes)", maxRequestSize)
+	}
+
+	return requestData, nil
 }
 
 // ControllerDiscoveryHandler handles controller discovery requests
@@ -322,8 +334,6 @@ func (h *ControllerVerifyHandler) Handle(conn net.Conn, cs *ClientServer) error 
 type CreateTopicHandler struct{}
 
 func (h *CreateTopicHandler) Handle(conn net.Conn, cs *ClientServer) error {
-	// Read request data
-	// TODO: A better way to read request Data
 	requestData, err := cs.readRequestData(conn)
 	if err != nil {
 		return fmt.Errorf("failed to read request data: %v", err)
@@ -428,13 +438,11 @@ func (h *ListTopicsHandler) buildListTopicsResponse(topicsData []byte) ([]byte, 
 		topics = make(map[string]*raft.TopicMetadata)
 	}
 
-	// Write topic count
 	topicCount := int32(len(topics))
 	if err := binary.Write(buf, binary.BigEndian, topicCount); err != nil {
 		return nil, err
 	}
 
-	// Write each topic
 	for topicName, topicMeta := range topics {
 		nameBytes := []byte(topicName)
 		if err := binary.Write(buf, binary.BigEndian, int16(len(nameBytes))); err != nil {
@@ -469,7 +477,6 @@ func (h *ListTopicsHandler) buildListTopicsResponse(topicsData []byte) ([]byte, 
 type DeleteTopicHandler struct{}
 
 func (h *DeleteTopicHandler) Handle(conn net.Conn, cs *ClientServer) error {
-		
 	requestData, err := cs.readRequestData(conn)
 	if err != nil {
 		return fmt.Errorf("failed to read request data: %v", err)
@@ -523,8 +530,6 @@ func (h *DeleteTopicHandler) parseDeleteTopicRequest(data []byte) (string, error
 
 	return string(nameBytes), nil
 }
-
-
 
 // GetTopicInfoHandler handles get topic info requests
 type GetTopicInfoHandler struct{}
@@ -808,14 +813,242 @@ func (h *GetTopicMetadataHandler) buildGetTopicMetadataResponse(topicMetadata *r
 type ProduceHandler struct{}
 
 func (h *ProduceHandler) Handle(conn net.Conn, cs *ClientServer) error {
-	// TODO: Implement produce - this is a data operation, not metadata
-	return fmt.Errorf("produce not implemented yet")
+	requestData, err := cs.readRequestData(conn)
+	if err != nil {
+		log.Printf("Failed to read produce request: %v", err)
+		cs.sendErrorResponse(conn, fmt.Errorf("Failed to read request: %v", err))
+		return err
+	}
+
+	var produceReq ProduceRequest
+	if err := json.Unmarshal(requestData, &produceReq); err != nil {
+		log.Printf("Failed to unmarshal produce request: %v", err)
+		cs.sendErrorResponse(conn, fmt.Errorf("Invalid request format: %v", err))
+		return err
+	}
+
+	log.Printf("Handling produce request for topic %s, partition %d", produceReq.Topic, produceReq.Partition)
+
+	partitionKey := fmt.Sprintf("%s-%d", produceReq.Topic, produceReq.Partition)
+	leader, err := cs.findPartitionLeader(partitionKey)
+	if err != nil {
+		log.Printf("Failed to find partition leader: %v", err)
+		cs.sendErrorResponse(conn, fmt.Errorf("Partition leader not found: %v", err))
+		return err
+	}
+	//must be leader
+	if leader != cs.broker.ID {
+		log.Printf("Not the leader for partition %s, leader is %s", partitionKey, leader)
+		cs.sendErrorResponse(conn, fmt.Errorf("Not the leader, leader is %s", leader))
+		return fmt.Errorf("not the leader")
+	}
+
+	response, err := cs.handleProduceToRaft(&produceReq)
+	if err != nil {
+		log.Printf("Failed to produce to Raft: %v", err)
+		cs.sendErrorResponse(conn, fmt.Errorf("Failed to produce: %v", err))
+		return err
+	}
+
+	return cs.sendProduceResponse(conn, response)
 }
 
 // FetchHandler handles fetch requests
 type FetchHandler struct{}
 
 func (h *FetchHandler) Handle(conn net.Conn, cs *ClientServer) error {
-	// TODO: Implement fetch - this is a data operation, not metadata
-	return fmt.Errorf("fetch not implemented yet")
+	// Read the fetch request data
+	requestData, err := cs.readRequestData(conn)
+	if err != nil {
+		log.Printf("Failed to read fetch request: %v", err)
+		cs.sendErrorResponse(conn, fmt.Errorf("Failed to read request: %v", err))
+		return err
+	}
+
+	// Parse the fetch request
+	var fetchReq FetchRequest
+	if err := json.Unmarshal(requestData, &fetchReq); err != nil {
+		log.Printf("Failed to unmarshal fetch request: %v", err)
+		cs.sendErrorResponse(conn, fmt.Errorf("Invalid request format: %v", err))
+		return err
+	}
+
+	log.Printf("Handling fetch request for topic %s, partition %d, offset %d",
+		fetchReq.Topic, fetchReq.Partition, fetchReq.Offset)
+
+	// Find the partition (can read from followers using ReadIndex)
+	partitionKey := fmt.Sprintf("%s-%d", fetchReq.Topic, fetchReq.Partition)
+	response, err := cs.handleFetchFromRaft(&fetchReq, partitionKey)
+	if err != nil {
+		log.Printf("Failed to fetch from Raft: %v", err)
+		cs.sendErrorResponse(conn, fmt.Errorf("Failed to fetch: %v", err))
+		return err
+	}
+
+	// Send fetch response
+	return cs.sendFetchResponse(conn, response)
+}
+
+// handleInterBrokerRequest handles inter-broker communication requests
+func (cs *ClientServer) handleInterBrokerRequest(conn net.Conn, config RequestConfig) error {
+
+	log.Printf("Handling inter-broker request from %s", conn.RemoteAddr())
+	return config.Handler.Handle(conn, cs)
+}
+
+// StartPartitionRaftGroupHandler handles requests to start partition Raft groups
+type StartPartitionRaftGroupHandler struct{}
+
+func (h *StartPartitionRaftGroupHandler) Handle(conn net.Conn, cs *ClientServer) error {
+	// Read request data length
+	var dataLength int32
+	if err := binary.Read(conn, binary.BigEndian, &dataLength); err != nil {
+		return fmt.Errorf("failed to read data length: %v", err)
+	}
+
+	// Read request data
+	requestData := make([]byte, dataLength)
+	if _, err := io.ReadFull(conn, requestData); err != nil {
+		return fmt.Errorf("failed to read request data: %v", err)
+	}
+
+	// Parse request
+	var request raft.StartPartitionRaftGroupRequest
+	if err := json.Unmarshal(requestData, &request); err != nil {
+		return fmt.Errorf("failed to parse request: %v", err)
+	}
+
+	log.Printf("Received StartPartitionRaftGroup request: GroupID=%d, Topic=%s, Partition=%d, Join=%t",
+		request.RaftGroupID, request.TopicName, request.PartitionID, request.Join)
+
+	// Start the partition Raft group
+	response := h.startPartitionRaftGroup(cs, &request)
+
+	// Send response
+	return h.sendResponse(conn, response)
+}
+
+func (h *StartPartitionRaftGroupHandler) startPartitionRaftGroup(
+	cs *ClientServer,
+	request *raft.StartPartitionRaftGroupRequest,
+) *raft.StartPartitionRaftGroupResponse {
+	// Create partition state machine (use broker's data directory)
+	stateMachine, err := raft.NewPartitionStateMachine(request.TopicName, request.PartitionID, cs.broker.Config.DataDir)
+	if err != nil {
+		return &raft.StartPartitionRaftGroupResponse{
+			Success: false,
+			Error:   fmt.Sprintf("Failed to create partition state machine: %v", err),
+		}
+	}
+
+	// Start the Raft group
+	err = cs.broker.raftManager.StartRaftGroup(
+		request.RaftGroupID,
+		request.NodeMembers,
+		stateMachine,
+		request.Join,
+	)
+
+	if err != nil {
+		log.Printf("Failed to start Raft group %d: %v", request.RaftGroupID, err)
+		return &raft.StartPartitionRaftGroupResponse{
+			Success: false,
+			Error:   err.Error(),
+		}
+	}
+
+	log.Printf("Successfully started Raft group %d for partition %s-%d (join=%t)",
+		request.RaftGroupID, request.TopicName, request.PartitionID, request.Join)
+
+	return &raft.StartPartitionRaftGroupResponse{
+		Success: true,
+		Message: fmt.Sprintf("Raft group %d started successfully", request.RaftGroupID),
+	}
+}
+
+func (h *StartPartitionRaftGroupHandler) sendResponse(conn net.Conn, response *raft.StartPartitionRaftGroupResponse) error {
+	// Serialize response
+	responseData, err := json.Marshal(response)
+	if err != nil {
+		return fmt.Errorf("failed to serialize response: %v", err)
+	}
+
+	// Send response length
+	if err := binary.Write(conn, binary.BigEndian, int32(len(responseData))); err != nil {
+		return fmt.Errorf("failed to write response length: %v", err)
+	}
+
+	// Send response data
+	if _, err := conn.Write(responseData); err != nil {
+		return fmt.Errorf("failed to write response data: %v", err)
+	}
+
+	return nil
+}
+
+// StopPartitionRaftGroupHandler handles requests to stop partition Raft groups
+type StopPartitionRaftGroupHandler struct{}
+
+func (h *StopPartitionRaftGroupHandler) Handle(conn net.Conn, cs *ClientServer) error {
+	var dataLength int32
+	if err := binary.Read(conn, binary.BigEndian, &dataLength); err != nil {
+		return fmt.Errorf("failed to read data length: %v", err)
+	}
+
+	requestData := make([]byte, dataLength)
+	if _, err := io.ReadFull(conn, requestData); err != nil {
+		return fmt.Errorf("failed to read request data: %v", err)
+	}
+
+	var request raft.StopPartitionRaftGroupRequest
+	if err := json.Unmarshal(requestData, &request); err != nil {
+		return fmt.Errorf("failed to parse request: %v", err)
+	}
+
+	log.Printf("Received StopPartitionRaftGroup request: GroupID=%d, Topic=%s, Partition=%d",
+		request.RaftGroupID, request.TopicName, request.PartitionID)
+
+	response := h.stopPartitionRaftGroup(cs, &request)
+
+	return h.sendResponse(conn, response)
+}
+
+func (h *StopPartitionRaftGroupHandler) stopPartitionRaftGroup(
+	cs *ClientServer,
+	request *raft.StopPartitionRaftGroupRequest,
+) *raft.StopPartitionRaftGroupResponse {
+	err := cs.broker.raftManager.StopRaftGroup(request.RaftGroupID)
+
+	if err != nil {
+		log.Printf("Failed to stop Raft group %d: %v", request.RaftGroupID, err)
+		return &raft.StopPartitionRaftGroupResponse{
+			Success: false,
+			Error:   err.Error(),
+		}
+	}
+
+	log.Printf("Successfully stopped Raft group %d for partition %s-%d",
+		request.RaftGroupID, request.TopicName, request.PartitionID)
+
+	return &raft.StopPartitionRaftGroupResponse{
+		Success: true,
+		Message: fmt.Sprintf("Raft group %d stopped successfully", request.RaftGroupID),
+	}
+}
+
+func (h *StopPartitionRaftGroupHandler) sendResponse(conn net.Conn, response *raft.StopPartitionRaftGroupResponse) error {
+	responseData, err := json.Marshal(response)
+	if err != nil {
+		return fmt.Errorf("failed to serialize response: %v", err)
+	}
+
+	if err := binary.Write(conn, binary.BigEndian, int32(len(responseData))); err != nil {
+		return fmt.Errorf("failed to write response length: %v", err)
+	}
+
+	if _, err := conn.Write(responseData); err != nil {
+		return fmt.Errorf("failed to write response data: %v", err)
+	}
+
+	return nil
 }
