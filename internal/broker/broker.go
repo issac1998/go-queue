@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"time"
 
+	"github.com/issac1998/go-queue/internal/compression"
+	"github.com/issac1998/go-queue/internal/deduplication"
 	"github.com/issac1998/go-queue/internal/discovery"
 	"github.com/issac1998/go-queue/internal/raft"
 	"github.com/lni/dragonboat/v3"
@@ -24,8 +27,8 @@ type Broker struct {
 	// Controller functionality
 	Controller *ControllerManager
 
-	// Partition management
-	PartitionManager *PartitionManager
+	// Consumer Group management
+	ConsumerGroupManager *ConsumerGroupManager
 
 	// Client service
 	ClientServer *ClientServer
@@ -43,6 +46,13 @@ type Broker struct {
 
 	// Service discovery
 	discovery discovery.Discovery
+
+	systemMetrics *SystemMetrics
+	LoadMetrics   *LoadMetrics
+
+	compressor   compression.Compressor
+	deduplicator *deduplication.Deduplicator
+	mu           sync.RWMutex
 }
 
 // BrokerConfig contains all broker configuration
@@ -65,7 +75,16 @@ type BrokerConfig struct {
 	Performance *PerformanceConfig `yaml:"performance"`
 
 	// FollowerRead configuration
-	EnableFollowerRead bool `yaml:"enable_follower_read"` // Enable follower read for this broker
+	EnableFollowerRead bool `yaml:"enable_follower_read"`
+
+	// Compression configuration
+	CompressionEnabled   bool   `yaml:"compression_enabled"`
+	CompressionType      string `yaml:"compression_type"`
+	CompressionThreshold int    `yaml:"compression_threshold"`
+
+	DeduplicationEnabled bool `yaml:"deduplication_enabled"`
+	DeduplicationTTL     int  `yaml:"deduplication_ttl"`
+	DeduplicationMaxSize int  `yaml:"deduplication_max_size"`
 }
 
 // PerformanceConfig contains performance tuning configuration
@@ -117,24 +136,24 @@ func (b *Broker) Start() error {
 		return fmt.Errorf("config validation failed: %v", err)
 	}
 
-	// 2. Create data directories
-	if err := b.createDataDirectories(); err != nil {
-		return fmt.Errorf("data directory creation failed: %v", err)
-	}
-
-	// 3. Initialize Raft NodeHost
+	// 2. Initialize Raft NodeHost
 	if err := b.initRaft(); err != nil {
 		return fmt.Errorf("raft init failed: %v", err)
 	}
 
-	// 4. Initialize service discovery
+	// 3. Initialize service discovery
 	if err := b.initServiceDiscovery(); err != nil {
 		return fmt.Errorf("service discovery init failed: %v", err)
 	}
 
-	// 5. Register to service discovery
+	// 4. Register to service discovery
 	if err := b.registerBroker(); err != nil {
 		return fmt.Errorf("broker registration failed: %v", err)
+	}
+
+	// 5. Initialize message processing components
+	if err := b.initMessageProcessing(); err != nil {
+		return fmt.Errorf("message processing init failed: %v", err)
 	}
 
 	// 6. Initialize Controller
@@ -142,13 +161,33 @@ func (b *Broker) Start() error {
 		return fmt.Errorf("controller init failed: %v", err)
 	}
 
-	// 7. Start client server
+	// 7. Initialize Consumer Group Manager
+	if err := b.initConsumerGroupManager(); err != nil {
+		return fmt.Errorf("consumer group manager init failed: %v", err)
+	}
+
+	// 8. Start client server
 	if err := b.startClientServer(); err != nil {
 		return fmt.Errorf("client server start failed: %v", err)
 	}
 
+	// 9. Start system metrics collection
+	if err := b.startSystemMetrics(); err != nil {
+		return fmt.Errorf("system metrics start failed: %v", err)
+	}
+
 	log.Printf("Broker %s started successfully", b.ID)
 	return nil
+}
+
+// GetCompressor returns the broker's compressor (implements BrokerInterface)
+func (b *Broker) GetCompressor() compression.Compressor {
+	return b.compressor
+}
+
+// GetDeduplicator returns the broker's deduplicator (implements BrokerInterface)
+func (b *Broker) GetDeduplicator() *deduplication.Deduplicator {
+	return b.deduplicator
 }
 
 // Stop gracefully shuts down the broker
@@ -165,15 +204,21 @@ func (b *Broker) Stop() error {
 		b.Controller.Stop()
 	}
 
-	if b.PartitionManager != nil {
-		b.PartitionManager.Stop()
+	if b.ConsumerGroupManager != nil {
+		b.ConsumerGroupManager.Stop()
 	}
 
 	if b.raftManager != nil {
 		b.raftManager.Close()
 	}
 
-	// Wait for all goroutines to finish
+	if b.deduplicator != nil {
+		b.deduplicator.Close()
+	}
+	if zstdCompressor, ok := b.compressor.(*compression.ZstdCompression); ok {
+		zstdCompressor.Close()
+	}
+
 	b.wg.Wait()
 
 	log.Printf("Broker %s stopped successfully", b.ID)
@@ -195,20 +240,6 @@ func (b *Broker) loadAndValidateConfig() error {
 		b.Config.BindPort = 9092
 	}
 
-	return nil
-}
-
-// initLogging initializes the logging system
-func (b *Broker) initLogging() error {
-	// TODO: Initialize structured logging
-	log.Printf("Initializing logging for broker %s", b.ID)
-	return nil
-}
-
-// createDataDirectories creates necessary data directories
-func (b *Broker) createDataDirectories() error {
-	// TODO: Create data directories
-	log.Printf("Creating data directories at %s", b.Config.DataDir)
 	return nil
 }
 
@@ -251,7 +282,7 @@ func (b *Broker) registerBroker() error {
 		ID:          b.ID,
 		Address:     b.Address,
 		Port:        b.Port,
-		RaftAddress: b.Config.RaftConfig.RaftAddr, // Use actual Raft address
+		RaftAddress: b.Config.RaftConfig.RaftAddr,
 		Status:      "starting",
 	}
 
@@ -279,7 +310,24 @@ func (b *Broker) initController() error {
 		return fmt.Errorf("failed to start controller: %v", err)
 	}
 
+	// Set broker reference in PartitionAssigner for accessing compression/deduplication components
+	if b.Controller.stateMachine != nil {
+		if partitionAssigner := b.Controller.stateMachine.GetPartitionAssigner(); partitionAssigner != nil {
+			partitionAssigner.SetBroker(b)
+		}
+	}
+
 	log.Printf("Controller initialized successfully")
+	return nil
+}
+
+// initConsumerGroupManager initializes the ConsumerGroupManager
+func (b *Broker) initConsumerGroupManager() error {
+	log.Printf("Initializing Consumer Group Manager...")
+
+	b.ConsumerGroupManager = NewConsumerGroupManager(b)
+
+	log.Printf("Consumer Group Manager initialized successfully")
 	return nil
 }
 
@@ -322,6 +370,72 @@ func validateConfig(config *BrokerConfig) error {
 
 	if config.Discovery == nil {
 		return fmt.Errorf("discovery config is required")
+	}
+
+	return nil
+}
+
+func (b *Broker) startSystemMetrics() error {
+	log.Printf("Starting system metrics collection for broker %s", b.ID)
+
+	b.systemMetrics = NewSystemMetrics(b)
+	return b.systemMetrics.Start()
+}
+
+// initMessageProcessing initializes compression and deduplication components
+func (b *Broker) initMessageProcessing() error {
+	log.Printf("Initializing message processing components for broker %s", b.ID)
+
+	if b.Config.CompressionEnabled {
+		var compressionType compression.CompressionType
+		switch b.Config.CompressionType {
+		case "gzip":
+			compressionType = compression.Gzip
+		case "zlib":
+			compressionType = compression.Zlib
+		case "snappy":
+			compressionType = compression.Snappy
+		case "zstd":
+			compressionType = compression.Zstd
+		default:
+			compressionType = compression.Snappy
+		}
+
+		compressor, err := compression.GetCompressor(compressionType)
+		if err != nil {
+			return fmt.Errorf("failed to initialize compressor: %v", err)
+		}
+		b.compressor = compressor
+		log.Printf("Compression enabled with type: %s", compressionType.String())
+	} else {
+		b.compressor, _ = compression.GetCompressor(compression.None)
+		log.Printf("Compression disabled")
+	}
+
+	if b.Config.DeduplicationEnabled {
+		dedupConfig := &deduplication.Config{
+			HashType:   deduplication.SHA256,
+			MaxEntries: b.Config.DeduplicationMaxSize,
+			TTL:        time.Duration(b.Config.DeduplicationTTL) * time.Hour,
+			Enabled:    true,
+		}
+
+		if dedupConfig.MaxEntries <= 0 {
+			dedupConfig.MaxEntries = 100000
+		}
+		if dedupConfig.TTL <= 0 {
+			dedupConfig.TTL = 24 * time.Hour
+		}
+
+		b.deduplicator = deduplication.NewDeduplicator(dedupConfig)
+		log.Printf("Deduplication enabled with max entries: %d, TTL: %v",
+			dedupConfig.MaxEntries, dedupConfig.TTL)
+	} else {
+		dedupConfig := &deduplication.Config{
+			Enabled: false,
+		}
+		b.deduplicator = deduplication.NewDeduplicator(dedupConfig)
+		log.Printf("Deduplication disabled")
 	}
 
 	return nil

@@ -80,7 +80,7 @@ func (a *Admin) CreateTopic(req CreateTopicRequest) (*CreateTopicResult, error) 
 		return nil, fmt.Errorf("failed to build request: %v", err)
 	}
 
-	responseData, err := a.client.sendRequest(protocol.CreateTopicRequestType, requestData)
+	responseData, err := a.client.sendMetaRequest(protocol.CreateTopicRequestType, requestData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send request: %v", err)
 	}
@@ -100,7 +100,7 @@ func (a *Admin) ListTopics() ([]TopicInfo, error) {
 		return nil, fmt.Errorf("failed to build request: %v", err)
 	}
 
-	responseData, err := a.client.sendRequest(protocol.ListTopicsRequestType, requestData)
+	responseData, err := a.client.sendMetaRequest(protocol.ListTopicsRequestType, requestData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send request: %v", err)
 	}
@@ -111,68 +111,6 @@ func (a *Admin) ListTopics() ([]TopicInfo, error) {
 	}
 
 	return topics, nil
-}
-
-// ListTopicsWithFollowerRead lists all topics using follower read optimization
-func (a *Admin) ListTopicsWithFollowerRead() ([]TopicInfo, error) {
-	requestData, err := a.buildListTopicsRequest()
-	if err != nil {
-		return nil, fmt.Errorf("failed to build request: %v", err)
-	}
-
-	// Use follower read optimization for list operations
-	responseData, err := a.client.sendRequestWithType(protocol.ListTopicsRequestType, requestData, true)
-	if err != nil {
-		return nil, fmt.Errorf("failed to send request: %v", err)
-	}
-
-	topics, err := a.parseListTopicsResponse(responseData)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse response: %v", err)
-	}
-
-	return topics, nil
-}
-
-// ListTopicsFromController explicitly lists topics from controller leader (for consistency)
-func (a *Admin) ListTopicsFromController() ([]TopicInfo, error) {
-	// Connect directly to controller for consistent reads
-	conn, err := a.client.connectToController()
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to controller: %v", err)
-	}
-	defer conn.Close()
-
-	conn.SetDeadline(time.Now().Add(a.client.timeout))
-
-	// Send request type
-	requestType := protocol.ListTopicsRequestType
-	if err := binary.Write(conn, binary.BigEndian, requestType); err != nil {
-		return nil, fmt.Errorf("failed to send request type: %v", err)
-	}
-
-	// Build and send request data
-	requestData, err := a.buildListTopicsRequest()
-	if err != nil {
-		return nil, fmt.Errorf("failed to build request: %v", err)
-	}
-
-	if _, err := conn.Write(requestData); err != nil {
-		return nil, fmt.Errorf("failed to send request data: %v", err)
-	}
-
-	// Read response
-	var responseLen int32
-	if err := binary.Read(conn, binary.BigEndian, &responseLen); err != nil {
-		return nil, fmt.Errorf("failed to read response length: %v", err)
-	}
-
-	responseData := make([]byte, responseLen)
-	if _, err := io.ReadFull(conn, responseData); err != nil {
-		return nil, fmt.Errorf("failed to read response data: %v", err)
-	}
-
-	return a.parseListTopicsResponse(responseData)
 }
 
 // DeleteTopic deletes a topic
@@ -182,7 +120,7 @@ func (a *Admin) DeleteTopic(topicName string) error {
 		return fmt.Errorf("failed to build request: %v", err)
 	}
 
-	responseData, err := a.client.sendRequest(protocol.DeleteTopicRequestType, requestData)
+	responseData, err := a.client.sendMetaRequest(protocol.DeleteTopicRequestType, requestData)
 	if err != nil {
 		return fmt.Errorf("failed to send request: %v", err)
 	}
@@ -202,7 +140,7 @@ func (a *Admin) GetTopicInfo(topicName string) (*TopicInfo, error) {
 		return nil, fmt.Errorf("failed to build request: %v", err)
 	}
 
-	responseData, err := a.client.sendRequest(protocol.GetTopicInfoRequestType, requestData)
+	responseData, err := a.client.sendMetaRequest(protocol.GetTopicInfoRequestType, requestData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send request: %v", err)
 	}

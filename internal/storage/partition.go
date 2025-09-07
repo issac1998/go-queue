@@ -57,7 +57,6 @@ func NewPartition(dataDir string, config *PartitionConfig) (*Partition, error) {
 		return nil, fmt.Errorf("failed to load segments: %w", err)
 	}
 
-	// Create initial segment if none exist
 	if len(p.segments) == 0 {
 		if err := p.createNewSegment(0); err != nil {
 			return nil, fmt.Errorf("failed to create initial segment: %w", err)
@@ -166,19 +165,16 @@ func (p *Partition) ReadAt(offset int64) ([]byte, error) {
 		return nil, ErrPartitionClosed
 	}
 
-	// Find the segment containing this offset
 	segment := p.findSegmentForOffset(offset)
 	if segment == nil {
 		return nil, ErrOffsetOutOfRange
 	}
 
-	// Find the position within the segment
 	position, err := segment.FindPosition(offset)
 	if err != nil {
 		return nil, err
 	}
 
-	// Read message length first
 	lengthBuf := make([]byte, 4)
 	if _, err := segment.ReadAt(position, lengthBuf); err != nil {
 		return nil, fmt.Errorf("failed to read message length: %w", err)
@@ -189,7 +185,6 @@ func (p *Partition) ReadAt(offset int64) ([]byte, error) {
 		return nil, errors.New("invalid message length")
 	}
 
-	// Read the actual message
 	messageBuf := make([]byte, messageLength)
 	if _, err := segment.ReadAt(position+4, messageBuf); err != nil {
 		return nil, fmt.Errorf("failed to read message data: %w", err)
@@ -226,7 +221,7 @@ func (p *Partition) ReadRange(startOffset int64, maxBytes int32) ([][]byte, int6
 		messageData, err := p.ReadAt(currentOffset)
 		if err != nil {
 			if err == ErrOffsetOutOfRange {
-				break // No more messages
+				break 
 			}
 			return messages, currentOffset, err
 		}
@@ -377,7 +372,6 @@ func (p *Partition) removeSegment(segmentToRemove *Segment) error {
 		return err
 	}
 
-	// Remove files
 	baseOffset := segmentToRemove.BaseOffset
 	logPath := filepath.Join(p.DataDir, fmt.Sprintf("%020d.log", baseOffset))
 	indexPath := filepath.Join(p.DataDir, fmt.Sprintf("%020d.index", baseOffset))
@@ -387,7 +381,6 @@ func (p *Partition) removeSegment(segmentToRemove *Segment) error {
 	os.Remove(indexPath)
 	os.Remove(timeIndexPath)
 
-	// Remove from segments slice
 	for i, segment := range p.segments {
 		if segment == segmentToRemove {
 			p.segments = append(p.segments[:i], p.segments[i+1:]...)

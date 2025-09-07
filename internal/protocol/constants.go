@@ -27,6 +27,7 @@ const (
 	DescribeTopicRequestType      int32 = 10
 	DiscoverControllerRequestType int32 = 11
 	GetTopicInfoRequestType       int32 = 12
+	FetchAssignmentRequestType    int32 = 13
 
 	// Group management request types
 	ListGroupsRequestType    int32 = 20
@@ -51,12 +52,20 @@ const (
 	ErrorMessageTooLarge  = 5
 	ErrorOffsetOutOfRange = 6
 
-	ErrorBrokerNotAvailable = 100
-	ErrorFetchFailed        = 101
-	ErrorProduceFailed      = 102
+	// Broker and network errors
+	ErrorBrokerNotAvailable = 10
+	ErrorFetchFailed        = 11
+	ErrorProduceFailed      = 12
 
-	ErrorUnauthorized  = 200
-	ErrorQuotaExceeded = 201
+	// Authentication and authorization
+	ErrorUnauthorized  = 20
+	ErrorQuotaExceeded = 21
+
+	// Consumer group and rebalancing errors
+	ErrorUnknownGroup        = 30
+	ErrorUnknownMember       = 31
+	ErrorRebalanceInProgress = 32
+	ErrorGenerationMismatch  = 33
 )
 
 const (
@@ -68,19 +77,20 @@ const (
 
 // RequestTypeNames maps request type constants to human-readable names
 var RequestTypeNames = map[int32]string{
-	ProduceRequestType:       "PRODUCE",
-	FetchRequestType:         "FETCH",
-	CreateTopicRequestType:   "CREATE_TOPIC",
-	JoinGroupRequestType:     "JOIN_GROUP",
-	LeaveGroupRequestType:    "LEAVE_GROUP",
-	HeartbeatRequestType:     "HEARTBEAT",
-	CommitOffsetRequestType:  "COMMIT_OFFSET",
-	FetchOffsetRequestType:   "FETCH_OFFSET",
-	ListGroupsRequestType:    "LIST_GROUPS",
-	DescribeGroupRequestType: "DESCRIBE_GROUP",
-	ListTopicsRequestType:    "LIST_TOPICS",
-	DeleteTopicRequestType:   "DELETE_TOPIC",
-	GetTopicInfoRequestType:  "GET_TOPIC_INFO",
+	ProduceRequestType:         "PRODUCE",
+	FetchRequestType:           "FETCH",
+	CreateTopicRequestType:     "CREATE_TOPIC",
+	JoinGroupRequestType:       "JOIN_GROUP",
+	LeaveGroupRequestType:      "LEAVE_GROUP",
+	HeartbeatRequestType:       "HEARTBEAT",
+	CommitOffsetRequestType:    "COMMIT_OFFSET",
+	FetchOffsetRequestType:     "FETCH_OFFSET",
+	ListGroupsRequestType:      "LIST_GROUPS",
+	DescribeGroupRequestType:   "DESCRIBE_GROUP",
+	ListTopicsRequestType:      "LIST_TOPICS",
+	DeleteTopicRequestType:     "DELETE_TOPIC",
+	GetTopicInfoRequestType:    "GET_TOPIC_INFO",
+	FetchAssignmentRequestType: "FETCH_ASSIGNMENT",
 }
 
 // GetRequestTypeName returns the human-readable name for a request type
@@ -93,18 +103,22 @@ func GetRequestTypeName(requestType int32) string {
 
 // ErrorCodeNames maps error code constants to human-readable names
 var ErrorCodeNames = map[int16]string{
-	ErrorNone:               "NONE",
-	ErrorInvalidRequest:     "INVALID_REQUEST",
-	ErrorInvalidTopic:       "INVALID_TOPIC",
-	ErrorUnknownPartition:   "UNKNOWN_PARTITION",
-	ErrorInvalidMessage:     "INVALID_MESSAGE",
-	ErrorMessageTooLarge:    "MESSAGE_TOO_LARGE",
-	ErrorOffsetOutOfRange:   "OFFSET_OUT_OF_RANGE",
-	ErrorBrokerNotAvailable: "BROKER_NOT_AVAILABLE",
-	ErrorFetchFailed:        "FETCH_FAILED",
-	ErrorProduceFailed:      "PRODUCE_FAILED",
-	ErrorUnauthorized:       "UNAUTHORIZED",
-	ErrorQuotaExceeded:      "QUOTA_EXCEEDED",
+	ErrorNone:                "NONE",
+	ErrorInvalidRequest:      "INVALID_REQUEST",
+	ErrorInvalidTopic:        "INVALID_TOPIC",
+	ErrorUnknownPartition:    "UNKNOWN_PARTITION",
+	ErrorInvalidMessage:      "INVALID_MESSAGE",
+	ErrorMessageTooLarge:     "MESSAGE_TOO_LARGE",
+	ErrorOffsetOutOfRange:    "OFFSET_OUT_OF_RANGE",
+	ErrorBrokerNotAvailable:  "BROKER_NOT_AVAILABLE",
+	ErrorFetchFailed:         "FETCH_FAILED",
+	ErrorProduceFailed:       "PRODUCE_FAILED",
+	ErrorUnauthorized:        "UNAUTHORIZED",
+	ErrorQuotaExceeded:       "QUOTA_EXCEEDED",
+	ErrorUnknownGroup:        "UNKNOWN_GROUP",
+	ErrorUnknownMember:       "UNKNOWN_MEMBER",
+	ErrorRebalanceInProgress: "REBALANCE_IN_PROGRESS",
+	ErrorGenerationMismatch:  "GENERATION_MISMATCH",
 }
 
 // GetErrorCodeName returns the human-readable name for an error code
@@ -117,17 +131,19 @@ func GetErrorCodeName(errorCode int16) string {
 
 const (
 	// Raft command types
-	RaftCmdRegisterBroker            = "register_broker"
-	RaftCmdUnregisterBroker          = "unregister_broker"
-	RaftCmdCreateTopic               = "create_topic"
-	RaftCmdDeleteTopic               = "delete_topic"
-	RaftCmdJoinGroup                 = "join_group"
-	RaftCmdLeaveGroup                = "leave_group"
-	RaftCmdMigrateLeader             = "migrate_leader"
-	RaftCmdUpdatePartitionAssignment = "update_partition_assignment"
-	RaftCmdUpdateBrokerLoad          = "update_broker_load"
-	RaftCmdMarkBrokerFailed          = "mark_broker_failed"
-	RaftCmdRebalancePartitions       = "rebalance_partitions"
+	RaftCmdRegisterBroker             = "register_broker"
+	RaftCmdUnregisterBroker           = "unregister_broker"
+	RaftCmdCreateTopic                = "create_topic"
+	RaftCmdDeleteTopic                = "delete_topic"
+	RaftCmdJoinGroup                  = "join_group"
+	RaftCmdLeaveGroup                 = "leave_group"
+	RaftCmdMigrateLeader              = "migrate_leader"
+	RaftCmdUpdatePartitionAssignments = "update_partition_assignments"
+	RaftCmdMarkBrokerFailed           = "mark_broker_failed"
+	RaftCmdRebalancePartitions        = "rebalance_partitions"
+	RaftCmdCommitOffset               = "commit_offset"
+	RaftCmdUpdateSubscription         = "update_subscription"
+	RaftCmdUpdateTopicAssignment      = "update_topic_assignment"
 )
 
 const (
@@ -139,8 +155,9 @@ const (
 	RaftQueryGetGroups = "get_groups"
 	RaftQueryGetGroup  = "get_group"
 
-	RaftQueryGetPartitionAssignments = "get_partition_assignments"
 	RaftQueryGetPartitionLeader      = "get_partition_leader"
+	RaftQueryGetPartitionAssignments = "get_partition_assignments"
+	RaftQueryGetCommittedOffset      = "get_committed_offset"
 
 	RaftQueryGetClusterMetadata = "get_cluster_metadata"
 )

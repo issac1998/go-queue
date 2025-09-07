@@ -45,22 +45,23 @@ type RequestConfig struct {
 
 // requestConfigs maps request types to their configurations
 var requestConfigs = map[int32]RequestConfig{
-	protocol.ControllerDiscoverRequestType: {Type: ControllerRequest, Handler: &ControllerDiscoveryHandler{}},
-	protocol.ControllerVerifyRequestType:   {Type: ControllerRequest, Handler: &ControllerVerifyHandler{}},
-	protocol.CreateTopicRequestType:        {Type: MetadataWriteRequest, Handler: &CreateTopicHandler{}},
-	protocol.DeleteTopicRequestType:        {Type: MetadataWriteRequest, Handler: &DeleteTopicHandler{}},
-	protocol.ListTopicsRequestType:         {Type: MetadataReadRequest, Handler: &ListTopicsHandler{}},
-	protocol.GetTopicInfoRequestType:       {Type: MetadataReadRequest, Handler: &GetTopicInfoHandler{}},
-	// protocol.DescribeTopicRequestType:           {Type: MetadataReadRequest, Handler: &DescribeTopicHandler{}},
-	protocol.JoinGroupRequestType:  {Type: MetadataWriteRequest, Handler: &JoinGroupHandler{}},
-	protocol.LeaveGroupRequestType: {Type: MetadataWriteRequest, Handler: &LeaveGroupHandler{}},
-	// protocol.ListGroupsRequestType:              {Type: MetadataReadRequest, Handler: &ListGroupsHandler{}},
-	// protocol.DescribeGroupRequestType:           {Type: MetadataReadRequest, Handler: &DescribeGroupHandler{}},
+	protocol.ControllerDiscoverRequestType:      {Type: ControllerRequest, Handler: &ControllerDiscoveryHandler{}},
+	protocol.ControllerVerifyRequestType:        {Type: ControllerRequest, Handler: &ControllerVerifyHandler{}},
+	protocol.CreateTopicRequestType:             {Type: MetadataWriteRequest, Handler: &CreateTopicHandler{}},
+	protocol.DeleteTopicRequestType:             {Type: MetadataWriteRequest, Handler: &DeleteTopicHandler{}},
+	protocol.ListTopicsRequestType:              {Type: MetadataReadRequest, Handler: &ListTopicsHandler{}},
+	protocol.GetTopicInfoRequestType:            {Type: MetadataReadRequest, Handler: &GetTopicInfoHandler{}},
+	protocol.JoinGroupRequestType:               {Type: MetadataWriteRequest, Handler: &JoinGroupHandler{}},
+	protocol.LeaveGroupRequestType:              {Type: MetadataWriteRequest, Handler: &LeaveGroupHandler{}},
 	protocol.ProduceRequestType:                 {Type: DataRequest, Handler: &ProduceHandler{}},
 	protocol.FetchRequestType:                   {Type: DataRequest, Handler: &FetchHandler{}},
 	protocol.GetTopicMetadataRequestType:        {Type: MetadataReadRequest, Handler: &GetTopicMetadataHandler{}},
 	protocol.StartPartitionRaftGroupRequestType: {Type: InterBrokerRequest, Handler: &StartPartitionRaftGroupHandler{}},
 	protocol.StopPartitionRaftGroupRequestType:  {Type: InterBrokerRequest, Handler: &StopPartitionRaftGroupHandler{}},
+	protocol.HeartbeatRequestType:               {Type: MetadataWriteRequest, Handler: &HeartbeatHandler{}},
+	protocol.CommitOffsetRequestType:            {Type: MetadataWriteRequest, Handler: &CommitOffsetHandler{}},
+	protocol.FetchOffsetRequestType:             {Type: MetadataReadRequest, Handler: &FetchOffsetHandler{}},
+	protocol.FetchAssignmentRequestType:         {Type: MetadataReadRequest, Handler: &FetchAssignmentHandler{}},
 }
 
 // NewClientServer creates a new ClientServer
@@ -140,21 +141,20 @@ func (cs *ClientServer) handleConnection(conn net.Conn) {
 // handleRequestByType handles requests based on their type and configuration
 func (cs *ClientServer) handleRequestByType(conn net.Conn, requestType int32, config RequestConfig) error {
 	switch config.Type {
+	// MetaRead check raft role first, as it known which raft group it is.
+	// for featuch and request ,group ID is in request data.
+	// We can only known it after
 	case ControllerRequest:
-		return config.Handler.Handle(conn, cs)
-
+		fallthrough
 	case MetadataWriteRequest:
 		return cs.handleMetadataWriteRequest(conn, config)
-
 	case MetadataReadRequest:
 		return cs.handleMetadataReadRequest(conn, config)
-
 	case DataRequest:
-		// TODO: handle data request
 		return config.Handler.Handle(conn, cs)
 
 	case InterBrokerRequest:
-		return cs.handleInterBrokerRequest(conn, config)
+		return config.Handler.Handle(conn, cs)
 
 	default:
 		return fmt.Errorf("unknown request type category")
@@ -185,9 +185,11 @@ func (cs *ClientServer) handleMetadataWriteRequest(conn net.Conn, config Request
 // handleMetadataReadRequest handles metadata read requests with follower read support
 func (cs *ClientServer) handleMetadataReadRequest(conn net.Conn, config RequestConfig) error {
 	leaderID, exists := cs.broker.Controller.GetControlledLeaderID()
+	// leader
 	if exists && leaderID == cs.broker.Controller.brokerIDToNodeID(cs.broker.ID) {
 		return config.Handler.Handle(conn, cs)
 	}
+	// follower
 
 	isFollowerReadEnabled := cs.broker.Config.EnableFollowerRead
 
@@ -622,7 +624,7 @@ func (h *JoinGroupHandler) Handle(conn net.Conn, cs *ClientServer) error {
 		return fmt.Errorf("failed to read request data: %v", err)
 	}
 
-	groupID, memberID, err := h.parseJoinGroupRequest(requestData)
+	groupID, memberID, clientID, topics, sessionTimeoutMs, err := h.parseJoinGroupRequest(requestData)
 	if err != nil {
 		return fmt.Errorf("failed to parse request: %v", err)
 	}
@@ -634,48 +636,164 @@ func (h *JoinGroupHandler) Handle(conn net.Conn, cs *ClientServer) error {
 		return fmt.Errorf("member ID cannot be empty")
 	}
 
-	err = cs.broker.Controller.JoinGroup(groupID, memberID)
+	sessionTimeout := time.Duration(sessionTimeoutMs) * time.Millisecond
+	response, err := cs.broker.ConsumerGroupManager.JoinGroup(groupID, memberID, clientID, topics, sessionTimeout)
 	if err != nil {
 		return fmt.Errorf("failed to join group: %v", err)
 	}
 
-	buf := new(bytes.Buffer)
-	if err := binary.Write(buf, binary.BigEndian, int16(0)); err != nil {
-		return fmt.Errorf("failed to write success response: %v", err)
+	responseData, err := h.buildJoinGroupResponse(response)
+	if err != nil {
+		return fmt.Errorf("failed to build response: %v", err)
 	}
 
-	cs.sendSuccessResponse(conn, buf.Bytes())
+	cs.sendSuccessResponse(conn, responseData)
 	log.Printf("Successfully joined group '%s' with member '%s'", groupID, memberID)
 	return nil
 }
 
-func (h *JoinGroupHandler) parseJoinGroupRequest(data []byte) (string, string, error) {
+func (h *JoinGroupHandler) parseJoinGroupRequest(data []byte) (string, string, string, []string, int32, error) {
 	buf := bytes.NewReader(data)
 
 	var version int16
 	if err := binary.Read(buf, binary.BigEndian, &version); err != nil {
-		return "", "", err
+		return "", "", "", nil, 0, err
 	}
 
 	var groupIDLen int16
 	if err := binary.Read(buf, binary.BigEndian, &groupIDLen); err != nil {
-		return "", "", err
+		return "", "", "", nil, 0, err
 	}
 	groupIDBytes := make([]byte, groupIDLen)
 	if _, err := io.ReadFull(buf, groupIDBytes); err != nil {
-		return "", "", err
+		return "", "", "", nil, 0, err
 	}
 
 	var memberIDLen int16
 	if err := binary.Read(buf, binary.BigEndian, &memberIDLen); err != nil {
-		return "", "", err
+		return "", "", "", nil, 0, err
 	}
 	memberIDBytes := make([]byte, memberIDLen)
 	if _, err := io.ReadFull(buf, memberIDBytes); err != nil {
-		return "", "", err
+		return "", "", "", nil, 0, err
 	}
 
-	return string(groupIDBytes), string(memberIDBytes), nil
+	var clientIDLen int16
+	if err := binary.Read(buf, binary.BigEndian, &clientIDLen); err != nil {
+		return "", "", "", nil, 0, err
+	}
+	clientIDBytes := make([]byte, clientIDLen)
+	if _, err := io.ReadFull(buf, clientIDBytes); err != nil {
+		return "", "", "", nil, 0, err
+	}
+
+	var topicsCount int32
+	if err := binary.Read(buf, binary.BigEndian, &topicsCount); err != nil {
+		return "", "", "", nil, 0, err
+	}
+
+	topics := make([]string, topicsCount)
+	for i := int32(0); i < topicsCount; i++ {
+		var topicLen int16
+		if err := binary.Read(buf, binary.BigEndian, &topicLen); err != nil {
+			return "", "", "", nil, 0, err
+		}
+		topicBytes := make([]byte, topicLen)
+		if _, err := io.ReadFull(buf, topicBytes); err != nil {
+			return "", "", "", nil, 0, err
+		}
+		topics[i] = string(topicBytes)
+	}
+
+	var sessionTimeoutMs int32
+	if err := binary.Read(buf, binary.BigEndian, &sessionTimeoutMs); err != nil {
+		return "", "", "", nil, 0, err
+	}
+
+	return string(groupIDBytes), string(memberIDBytes), string(clientIDBytes), topics, sessionTimeoutMs, nil
+}
+
+func (h *JoinGroupHandler) buildJoinGroupResponse(response *JoinGroupResponse) ([]byte, error) {
+	buf := new(bytes.Buffer)
+
+	// Error code
+	if err := binary.Write(buf, binary.BigEndian, response.ErrorCode); err != nil {
+		return nil, err
+	}
+
+	// Generation
+	if err := binary.Write(buf, binary.BigEndian, response.Generation); err != nil {
+		return nil, err
+	}
+
+	// Group ID
+	if err := binary.Write(buf, binary.BigEndian, int16(len(response.GroupID))); err != nil {
+		return nil, err
+	}
+	if _, err := buf.WriteString(response.GroupID); err != nil {
+		return nil, err
+	}
+
+	// Member ID
+	if err := binary.Write(buf, binary.BigEndian, int16(len(response.MemberID))); err != nil {
+		return nil, err
+	}
+	if _, err := buf.WriteString(response.MemberID); err != nil {
+		return nil, err
+	}
+
+	// Leader ID
+	if err := binary.Write(buf, binary.BigEndian, int16(len(response.LeaderID))); err != nil {
+		return nil, err
+	}
+	if _, err := buf.WriteString(response.LeaderID); err != nil {
+		return nil, err
+	}
+
+	// Members count
+	if err := binary.Write(buf, binary.BigEndian, int32(len(response.Members))); err != nil {
+		return nil, err
+	}
+	for _, member := range response.Members {
+		if err := binary.Write(buf, binary.BigEndian, int16(len(member.MemberID))); err != nil {
+			return nil, err
+		}
+		if _, err := buf.WriteString(member.MemberID); err != nil {
+			return nil, err
+		}
+		if err := binary.Write(buf, binary.BigEndian, int16(len(member.ClientID))); err != nil {
+			return nil, err
+		}
+		if _, err := buf.WriteString(member.ClientID); err != nil {
+			return nil, err
+		}
+	}
+
+	// Assignment count (for this member only, assuming single topic)
+	if err := binary.Write(buf, binary.BigEndian, int32(1)); err != nil { // Assume single topic for now
+		return nil, err
+	}
+
+	// Topic name (hardcoded for now, should be from request)
+	topicName := "consumer-group-topic" // This should come from the actual topics
+	if err := binary.Write(buf, binary.BigEndian, int16(len(topicName))); err != nil {
+		return nil, err
+	}
+	if _, err := buf.WriteString(topicName); err != nil {
+		return nil, err
+	}
+
+	// Partition count for this member
+	if err := binary.Write(buf, binary.BigEndian, int32(len(response.Assignment))); err != nil {
+		return nil, err
+	}
+	for _, partition := range response.Assignment {
+		if err := binary.Write(buf, binary.BigEndian, partition); err != nil {
+			return nil, err
+		}
+	}
+
+	return buf.Bytes(), nil
 }
 
 // LeaveGroupHandler handles leave group requests
@@ -699,7 +817,7 @@ func (h *LeaveGroupHandler) Handle(conn net.Conn, cs *ClientServer) error {
 		return fmt.Errorf("member ID cannot be empty")
 	}
 
-	err = cs.broker.Controller.LeaveGroup(groupID, memberID)
+	err = cs.broker.ConsumerGroupManager.LeaveGroup(groupID, memberID)
 	if err != nil {
 		return fmt.Errorf("failed to leave group: %v", err)
 	}
@@ -881,7 +999,6 @@ func (h *FetchHandler) Handle(conn net.Conn, cs *ClientServer) error {
 	log.Printf("Handling fetch request for topic %s, partition %d, offset %d",
 		fetchReq.Topic, fetchReq.Partition, fetchReq.Offset)
 
-	// Find the partition (can read from followers using ReadIndex)
 	partitionKey := fmt.Sprintf("%s-%d", fetchReq.Topic, fetchReq.Partition)
 	response, err := cs.handleFetchFromRaft(&fetchReq, partitionKey)
 	if err != nil {
@@ -892,13 +1009,6 @@ func (h *FetchHandler) Handle(conn net.Conn, cs *ClientServer) error {
 
 	// Send fetch response
 	return cs.sendFetchResponse(conn, response)
-}
-
-// handleInterBrokerRequest handles inter-broker communication requests
-func (cs *ClientServer) handleInterBrokerRequest(conn net.Conn, config RequestConfig) error {
-
-	log.Printf("Handling inter-broker request from %s", conn.RemoteAddr())
-	return config.Handler.Handle(conn, cs)
 }
 
 // StartPartitionRaftGroupHandler handles requests to start partition Raft groups
@@ -938,7 +1048,13 @@ func (h *StartPartitionRaftGroupHandler) startPartitionRaftGroup(
 	request *raft.StartPartitionRaftGroupRequest,
 ) *raft.StartPartitionRaftGroupResponse {
 	// Create partition state machine (use broker's data directory)
-	stateMachine, err := raft.NewPartitionStateMachine(request.TopicName, request.PartitionID, cs.broker.Config.DataDir)
+	stateMachine, err := raft.NewPartitionStateMachine(
+		request.TopicName,
+		request.PartitionID,
+		cs.broker.Config.DataDir,
+		cs.broker.GetCompressor(),
+		cs.broker.GetDeduplicator(),
+	)
 	if err != nil {
 		return &raft.StartPartitionRaftGroupResponse{
 			Success: false,
@@ -972,18 +1088,15 @@ func (h *StartPartitionRaftGroupHandler) startPartitionRaftGroup(
 }
 
 func (h *StartPartitionRaftGroupHandler) sendResponse(conn net.Conn, response *raft.StartPartitionRaftGroupResponse) error {
-	// Serialize response
 	responseData, err := json.Marshal(response)
 	if err != nil {
 		return fmt.Errorf("failed to serialize response: %v", err)
 	}
 
-	// Send response length
 	if err := binary.Write(conn, binary.BigEndian, int32(len(responseData))); err != nil {
 		return fmt.Errorf("failed to write response length: %v", err)
 	}
 
-	// Send response data
 	if _, err := conn.Write(responseData); err != nil {
 		return fmt.Errorf("failed to write response data: %v", err)
 	}
@@ -1056,4 +1169,331 @@ func (h *StopPartitionRaftGroupHandler) sendResponse(conn net.Conn, response *ra
 	}
 
 	return nil
+}
+
+// HeartbeatHandler handles heartbeat requests
+type HeartbeatHandler struct{}
+
+func (h *HeartbeatHandler) Handle(conn net.Conn, cs *ClientServer) error {
+	requestData, err := cs.readRequestData(conn)
+	if err != nil {
+		return fmt.Errorf("failed to read request data: %v", err)
+	}
+
+	groupID, memberID, generation, err := h.parseHeartbeatRequest(requestData)
+	if err != nil {
+		return fmt.Errorf("failed to parse request: %v", err)
+	}
+
+	response, err := cs.broker.ConsumerGroupManager.Heartbeat(groupID, memberID, generation)
+	if err != nil {
+		return fmt.Errorf("failed to process heartbeat: %v", err)
+	}
+
+	buf := new(bytes.Buffer)
+
+	if err := binary.Write(buf, binary.BigEndian, response.ErrorCode); err != nil {
+		return fmt.Errorf("failed to write error code: %v", err)
+	}
+
+	if err := binary.Write(buf, binary.BigEndian, response.Generation); err != nil {
+		return fmt.Errorf("failed to write generation: %v", err)
+	}
+
+	rebalanceFlag := int8(0)
+	if response.NeedRebalance {
+		rebalanceFlag = 1
+	}
+	if err := binary.Write(buf, binary.BigEndian, rebalanceFlag); err != nil {
+		return fmt.Errorf("failed to write rebalance flag: %v", err)
+	}
+
+	if err := binary.Write(buf, binary.BigEndian, response.MemberCount); err != nil {
+		return fmt.Errorf("failed to write member count: %v", err)
+	}
+
+	leaderIDBytes := []byte(response.LeaderID)
+	if err := binary.Write(buf, binary.BigEndian, int16(len(leaderIDBytes))); err != nil {
+		return fmt.Errorf("failed to write leader ID length: %v", err)
+	}
+	if _, err := buf.Write(leaderIDBytes); err != nil {
+		return fmt.Errorf("failed to write leader ID: %v", err)
+	}
+
+	cs.sendSuccessResponse(conn, buf.Bytes())
+	return nil
+}
+
+func (h *HeartbeatHandler) parseHeartbeatRequest(data []byte) (string, string, int32, error) {
+	buf := bytes.NewReader(data)
+
+	var version int16
+	if err := binary.Read(buf, binary.BigEndian, &version); err != nil {
+		return "", "", 0, err
+	}
+
+	var groupIDLen int16
+	if err := binary.Read(buf, binary.BigEndian, &groupIDLen); err != nil {
+		return "", "", 0, err
+	}
+	groupIDBytes := make([]byte, groupIDLen)
+	if _, err := io.ReadFull(buf, groupIDBytes); err != nil {
+		return "", "", 0, err
+	}
+
+	var memberIDLen int16
+	if err := binary.Read(buf, binary.BigEndian, &memberIDLen); err != nil {
+		return "", "", 0, err
+	}
+	memberIDBytes := make([]byte, memberIDLen)
+	if _, err := io.ReadFull(buf, memberIDBytes); err != nil {
+		return "", "", 0, err
+	}
+
+	var generation int32
+	if err := binary.Read(buf, binary.BigEndian, &generation); err != nil {
+		return "", "", 0, err
+	}
+
+	return string(groupIDBytes), string(memberIDBytes), generation, nil
+}
+
+// CommitOffsetHandler handles commit offset requests
+type CommitOffsetHandler struct{}
+
+func (h *CommitOffsetHandler) Handle(conn net.Conn, cs *ClientServer) error {
+	requestData, err := cs.readRequestData(conn)
+	if err != nil {
+		return fmt.Errorf("failed to read request data: %v", err)
+	}
+
+	groupID, topic, partition, offset, metadata, err := h.parseCommitOffsetRequest(requestData)
+	if err != nil {
+		return fmt.Errorf("failed to parse request: %v", err)
+	}
+
+	err = cs.broker.ConsumerGroupManager.CommitOffset(groupID, topic, partition, offset, metadata)
+	if err != nil {
+		return fmt.Errorf("failed to commit offset: %v", err)
+	}
+
+	buf := new(bytes.Buffer)
+	if err := binary.Write(buf, binary.BigEndian, int16(0)); err != nil {
+		return fmt.Errorf("failed to write success response: %v", err)
+	}
+
+	cs.sendSuccessResponse(conn, buf.Bytes())
+	log.Printf("Successfully committed offset: group=%s, topic=%s, partition=%d, offset=%d", groupID, topic, partition, offset)
+	return nil
+}
+
+func (h *CommitOffsetHandler) parseCommitOffsetRequest(data []byte) (string, string, int32, int64, string, error) {
+	buf := bytes.NewReader(data)
+
+	var version int16
+	if err := binary.Read(buf, binary.BigEndian, &version); err != nil {
+		return "", "", 0, 0, "", err
+	}
+
+	var groupIDLen int16
+	if err := binary.Read(buf, binary.BigEndian, &groupIDLen); err != nil {
+		return "", "", 0, 0, "", err
+	}
+	groupIDBytes := make([]byte, groupIDLen)
+	if _, err := io.ReadFull(buf, groupIDBytes); err != nil {
+		return "", "", 0, 0, "", err
+	}
+
+	var topicLen int16
+	if err := binary.Read(buf, binary.BigEndian, &topicLen); err != nil {
+		return "", "", 0, 0, "", err
+	}
+	topicBytes := make([]byte, topicLen)
+	if _, err := io.ReadFull(buf, topicBytes); err != nil {
+		return "", "", 0, 0, "", err
+	}
+
+	var partition int32
+	if err := binary.Read(buf, binary.BigEndian, &partition); err != nil {
+		return "", "", 0, 0, "", err
+	}
+
+	var offset int64
+	if err := binary.Read(buf, binary.BigEndian, &offset); err != nil {
+		return "", "", 0, 0, "", err
+	}
+
+	var metadataLen int16
+	if err := binary.Read(buf, binary.BigEndian, &metadataLen); err != nil {
+		return "", "", 0, 0, "", err
+	}
+	metadataBytes := make([]byte, metadataLen)
+	if _, err := io.ReadFull(buf, metadataBytes); err != nil {
+		return "", "", 0, 0, "", err
+	}
+
+	return string(groupIDBytes), string(topicBytes), partition, offset, string(metadataBytes), nil
+}
+
+// FetchOffsetHandler handles fetch offset requests
+type FetchOffsetHandler struct{}
+
+func (h *FetchOffsetHandler) Handle(conn net.Conn, cs *ClientServer) error {
+	requestData, err := cs.readRequestData(conn)
+	if err != nil {
+		return fmt.Errorf("failed to read request data: %v", err)
+	}
+
+	groupID, topic, partition, err := h.parseFetchOffsetRequest(requestData)
+	if err != nil {
+		return fmt.Errorf("failed to parse request: %v", err)
+	}
+
+	offset, err := cs.broker.ConsumerGroupManager.FetchCommittedOffset(groupID, topic, partition)
+	if err != nil {
+		return fmt.Errorf("failed to fetch offset: %v", err)
+	}
+
+	buf := new(bytes.Buffer)
+	if err := binary.Write(buf, binary.BigEndian, int16(0)); err != nil {
+		return fmt.Errorf("failed to write success response: %v", err)
+	}
+	if err := binary.Write(buf, binary.BigEndian, offset); err != nil {
+		return fmt.Errorf("failed to write offset: %v", err)
+	}
+
+	cs.sendSuccessResponse(conn, buf.Bytes())
+	return nil
+}
+
+func (h *FetchOffsetHandler) parseFetchOffsetRequest(data []byte) (string, string, int32, error) {
+	buf := bytes.NewReader(data)
+
+	var version int16
+	if err := binary.Read(buf, binary.BigEndian, &version); err != nil {
+		return "", "", 0, err
+	}
+
+	var groupIDLen int16
+	if err := binary.Read(buf, binary.BigEndian, &groupIDLen); err != nil {
+		return "", "", 0, err
+	}
+	groupIDBytes := make([]byte, groupIDLen)
+	if _, err := io.ReadFull(buf, groupIDBytes); err != nil {
+		return "", "", 0, err
+	}
+
+	var topicLen int16
+	if err := binary.Read(buf, binary.BigEndian, &topicLen); err != nil {
+		return "", "", 0, err
+	}
+	topicBytes := make([]byte, topicLen)
+	if _, err := io.ReadFull(buf, topicBytes); err != nil {
+		return "", "", 0, err
+	}
+
+	var partition int32
+	if err := binary.Read(buf, binary.BigEndian, &partition); err != nil {
+		return "", "", 0, err
+	}
+
+	return string(groupIDBytes), string(topicBytes), partition, nil
+}
+
+type FetchAssignmentHandler struct{}
+
+func (h *FetchAssignmentHandler) Handle(conn net.Conn, cs *ClientServer) error {
+	requestData, err := cs.readRequestData(conn)
+	if err != nil {
+		return fmt.Errorf("failed to read request data: %v", err)
+	}
+
+	groupID, memberID, generation, err := h.parseFetchAssignmentRequest(requestData)
+	if err != nil {
+		return fmt.Errorf("failed to parse request: %v", err)
+	}
+
+	response, err := cs.broker.ConsumerGroupManager.FetchAssignment(groupID, memberID, generation)
+	if err != nil {
+		return fmt.Errorf("failed to fetch assignment: %v", err)
+	}
+
+	responseData, err := h.buildFetchAssignmentResponse(response)
+	if err != nil {
+		return fmt.Errorf("failed to build response: %v", err)
+	}
+
+	cs.sendSuccessResponse(conn, responseData)
+	return nil
+}
+
+func (h *FetchAssignmentHandler) parseFetchAssignmentRequest(data []byte) (string, string, int32, error) {
+	buf := bytes.NewReader(data)
+
+	var version int16
+	if err := binary.Read(buf, binary.BigEndian, &version); err != nil {
+		return "", "", 0, err
+	}
+
+	var groupIDLen int16
+	if err := binary.Read(buf, binary.BigEndian, &groupIDLen); err != nil {
+		return "", "", 0, err
+	}
+	groupIDBytes := make([]byte, groupIDLen)
+	if _, err := io.ReadFull(buf, groupIDBytes); err != nil {
+		return "", "", 0, err
+	}
+
+	var memberIDLen int16
+	if err := binary.Read(buf, binary.BigEndian, &memberIDLen); err != nil {
+		return "", "", 0, err
+	}
+	memberIDBytes := make([]byte, memberIDLen)
+	if _, err := io.ReadFull(buf, memberIDBytes); err != nil {
+		return "", "", 0, err
+	}
+
+	var generation int32
+	if err := binary.Read(buf, binary.BigEndian, &generation); err != nil {
+		return "", "", 0, err
+	}
+
+	return string(groupIDBytes), string(memberIDBytes), generation, nil
+}
+
+func (h *FetchAssignmentHandler) buildFetchAssignmentResponse(response *FetchAssignmentResponse) ([]byte, error) {
+	buf := new(bytes.Buffer)
+
+	if err := binary.Write(buf, binary.BigEndian, response.ErrorCode); err != nil {
+		return nil, err
+	}
+
+	if err := binary.Write(buf, binary.BigEndian, response.Generation); err != nil {
+		return nil, err
+	}
+
+	if err := binary.Write(buf, binary.BigEndian, int32(len(response.Assignment))); err != nil {
+		return nil, err
+	}
+
+	for topic, partitions := range response.Assignment {
+		if err := binary.Write(buf, binary.BigEndian, int16(len(topic))); err != nil {
+			return nil, err
+		}
+		if _, err := buf.WriteString(topic); err != nil {
+			return nil, err
+		}
+
+		if err := binary.Write(buf, binary.BigEndian, int32(len(partitions))); err != nil {
+			return nil, err
+		}
+
+		for _, partition := range partitions {
+			if err := binary.Write(buf, binary.BigEndian, partition); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	return buf.Bytes(), nil
 }

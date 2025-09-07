@@ -196,37 +196,6 @@ func TestCreateTopic(t *testing.T) {
 	}
 }
 
-func TestFollowerReadListTopics(t *testing.T) {
-	config := ClientConfig{
-		BrokerAddrs: []string{"localhost:9092", "localhost:9093", "localhost:9094"},
-		Timeout:     50,
-	}
-	client := NewClient(config)
-	admin := NewAdmin(client)
-
-	// Test regular ListTopics (backward compatibility)
-	_, err := admin.ListTopics()
-	if err == nil {
-		t.Error("Expected error when no broker is running, got nil")
-	}
-
-	// Test follower read optimized ListTopics
-	_, err = admin.ListTopicsWithFollowerRead()
-	if err == nil {
-		t.Error("Expected error when no broker is running, got nil")
-	}
-
-	// Test direct controller access
-	_, err = admin.ListTopicsFromController()
-	if err == nil {
-		t.Error("Expected error when no controller is running, got nil")
-	}
-
-	// Verify that follower read error contains relevant information
-	if !strings.Contains(err.Error(), "failed to") {
-		t.Errorf("Expected connection-related error, got: %v", err)
-	}
-}
 
 func TestClientFollowerReadClassification(t *testing.T) {
 	config := ClientConfig{

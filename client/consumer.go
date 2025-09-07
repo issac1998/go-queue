@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	"github.com/issac1998/go-queue/internal/protocol"
@@ -13,13 +14,18 @@ import (
 
 // Consumer message consumer
 type Consumer struct {
-	client *Client
+	client           *Client
+	subscribedTopics []string
+	topicOffsets     map[string]map[int32]int64 
+	mu               sync.RWMutex
 }
 
 // NewConsumer creates a new consumer
 func NewConsumer(client *Client) *Consumer {
 	return &Consumer{
-		client: client,
+		client:           client,
+		subscribedTopics: make([]string, 0),
+		topicOffsets:     make(map[string]map[int32]int64),
 	}
 }
 
@@ -54,7 +60,6 @@ func (c *Consumer) Fetch(req FetchRequest) (*FetchResult, error) {
 		req.MaxBytes = 1024 * 1024
 	}
 
-	// Use partition-aware routing for data operations
 	return c.fetchFromPartition(req)
 }
 
@@ -215,8 +220,8 @@ func (c *Consumer) fetchFromPartition(req FetchRequest) (*FetchResult, error) {
 	return result, nil
 }
 
-// Subscribe simple consumer subscription (starting from latest position)
-func (c *Consumer) Subscribe(ctx context.Context, topic string, partition int32, handler func(Message) error) error {
+// SubscribePartition simple consumer subscription for a single partition (starting from latest position)
+func (c *Consumer) SubscribePartition(ctx context.Context, topic string, partition int32, handler func(Message) error) error {
 	offset := int64(0)
 
 	for {
@@ -250,3 +255,135 @@ func (c *Consumer) Subscribe(ctx context.Context, topic string, partition int32,
 		}
 	}
 }
+
+// Subscribe subscribes to topics for automatic consumption
+func (c *Consumer) Subscribe(topics []string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.subscribedTopics = topics
+
+	// Initialize offsets for new topics
+	for _, topic := range topics {
+		if c.topicOffsets[topic] == nil {
+			c.topicOffsets[topic] = make(map[int32]int64)
+		}
+	}
+
+	return nil
+}
+
+// Unsubscribe unsubscribes from topics
+func (c *Consumer) Unsubscribe(topics []string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for _, topicToRemove := range topics {
+		for i, subscribedTopic := range c.subscribedTopics {
+			if subscribedTopic == topicToRemove {
+				c.subscribedTopics = append(c.subscribedTopics[:i], c.subscribedTopics[i+1:]...)
+				break
+			}
+		}
+		delete(c.topicOffsets, topicToRemove)
+	}
+
+	return nil
+}
+
+// GetSubscription returns currently subscribed topics
+func (c *Consumer) GetSubscription() []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	result := make([]string, len(c.subscribedTopics))
+	copy(result, c.subscribedTopics)
+	return result
+}
+
+// Poll polls messages from subscribed topics
+func (c *Consumer) Poll(timeout time.Duration) ([]*Message, error) {
+	c.mu.RLock()
+	topics := make([]string, len(c.subscribedTopics))
+	copy(topics, c.subscribedTopics)
+	c.mu.RUnlock()
+
+	if len(topics) == 0 {
+		return nil, fmt.Errorf("no topics subscribed")
+	}
+
+	var allMessages []*Message
+
+	for _, topic := range topics {
+		messages, err := c.pollTopic(topic, timeout)
+		if err != nil {
+			continue
+		}
+		allMessages = append(allMessages, messages...)
+	}
+
+	return allMessages, nil
+}
+
+// pollTopic polls messages from a specific topic
+func (c *Consumer) pollTopic(topic string, timeout time.Duration) ([]*Message, error) {
+	admin := NewAdmin(c.client)
+	topicInfo, err := admin.GetTopicInfo(topic)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get topic info for %s: %w", topic, err)
+	}
+
+	var allMessages []*Message
+
+	for i := int32(0); i < topicInfo.Partitions; i++ {
+		partitionID := i
+		c.mu.Lock()
+		if c.topicOffsets[topic] == nil {
+			c.topicOffsets[topic] = make(map[int32]int64)
+		}
+		offset := c.topicOffsets[topic][partitionID] 
+		c.mu.Unlock()
+
+		fetchResult, err := c.Fetch(FetchRequest{
+			Topic:     topic,
+			Partition: partitionID,
+			Offset:    offset,
+			MaxBytes:  1024 * 1024, 
+		})
+		if err != nil {
+			continue
+		}
+		if fetchResult.Error != nil {
+			continue
+		}
+
+		for _, msg := range fetchResult.Messages {
+			allMessages = append(allMessages, &Message{
+				Topic:     msg.Topic,
+				Partition: msg.Partition,
+				Offset:    msg.Offset,
+				Value:     msg.Value,
+			})
+
+			c.mu.Lock()
+			c.topicOffsets[topic][partitionID] = msg.Offset + 1
+			c.mu.Unlock()
+		}
+	}
+
+	return allMessages, nil
+}
+
+// Seek sets the offset for a specific topic partition
+func (c *Consumer) Seek(topic string, partition int32, offset int64) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.topicOffsets[topic] == nil {
+		c.topicOffsets[topic] = make(map[int32]int64)
+	}
+	c.topicOffsets[topic][partition] = offset
+
+	return nil
+}
+
