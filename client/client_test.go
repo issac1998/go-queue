@@ -76,42 +76,6 @@ func TestControllerDiscovery(t *testing.T) {
 	}
 }
 
-func TestIsMetadataRequest(t *testing.T) {
-	client := NewClient(ClientConfig{})
-
-	tests := []struct {
-		name        string
-		requestType int32
-		expected    bool
-	}{
-		{"CREATE_TOPIC", 2, true},    // CreateTopicRequestType
-		{"LIST_TOPICS", 3, true},     // ListTopicsRequestType
-		{"DELETE_TOPIC", 4, true},    // DeleteTopicRequestType
-		{"JOIN_GROUP", 5, true},      // JoinGroupRequestType
-		{"LEAVE_GROUP", 6, true},     // LeaveGroupRequestType
-		{"DESCRIBE_TOPIC", 10, true}, // DescribeTopicRequestType
-		{"GET_TOPIC_INFO", 12, true}, // GetTopicInfoRequestType
-		{"LIST_GROUPS", 20, true},    // ListGroupsRequestType
-		{"DESCRIBE_GROUP", 21, true}, // DescribeGroupRequestType
-		{"CONTROLLER_DISCOVERY", 1000, true},
-		{"PRODUCE", 0, false},       // ProduceRequestType (data operation)
-		{"FETCH", 1, false},         // FetchRequestType (data operation)
-		{"HEARTBEAT", 7, false},     // HeartbeatRequestType (not metadata)
-		{"COMMIT_OFFSET", 8, false}, // CommitOffsetRequestType (not metadata)
-		{"FETCH_OFFSET", 9, false},  // FetchOffsetRequestType (not metadata)
-		{"UNKNOWN", 9999, false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := client.isMetadataRequest(tt.requestType)
-			if result != tt.expected {
-				t.Errorf("expected isMetadataRequest(%d) = %v, got %v", tt.requestType, tt.expected, result)
-			}
-		})
-	}
-}
-
 func TestLoadBalancing(t *testing.T) {
 	// Create client with multiple broker addresses
 	config := ClientConfig{

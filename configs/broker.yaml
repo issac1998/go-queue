@@ -22,6 +22,16 @@ discovery:
   endpoints: []
   timeout: "5s"
 
+# Compression configuration
+compression_enabled: true
+compression_type: "snappy"  # "gzip", "zlib", "snappy", "zstd"
+compression_threshold: 1024  # Compress messages larger than 1KB
+
+# Deduplication configuration
+deduplication_enabled: true
+deduplication_ttl: 24  # TTL in hours
+deduplication_max_size: 100000  # Maximum number of entries
+
 # Performance tuning
 performance:
   max_batch_size: 500

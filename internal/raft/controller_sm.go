@@ -115,29 +115,9 @@ type ControllerManager interface {
 	StopLeaderTasks()
 }
 
-// NewControllerStateMachine creates a new controller state machine (deprecated - use NewMultiRaftControllerStateMachine)
-func NewControllerStateMachine(manager ControllerManager) *ControllerStateMachine {
-	metadata := &ClusterMetadata{
-		ClusterID:            fmt.Sprintf("cluster-%d", time.Now().Unix()),
-		Brokers:              make(map[string]*BrokerInfo),
-		Topics:               make(map[string]*TopicMetadata),
-		PartitionAssignments: make(map[string]*PartitionAssignment),
-		LeaderAssignments:    make(map[string]string),
-		ConsumerGroups:       make(map[string]*ConsumerGroupInfo),
-		Version:              1,
-		UpdateTime:           time.Now(),
-	}
-
-	return &ControllerStateMachine{
-		manager:           manager,
-		metadata:          metadata,
-		partitionAssigner: nil, // Legacy mode - partition assigner not supported
-	}
-}
-
-// NewMultiRaftControllerStateMachine creates a controller state machine with Multi-Raft support
+// NewControllerStateMachine creates a controller state machine with Multi-Raft support
 // TODO: KV?
-func NewMultiRaftControllerStateMachine(manager ControllerManager, raftManager *RaftManager) *ControllerStateMachine {
+func NewControllerStateMachine(manager ControllerManager, raftManager *RaftManager) *ControllerStateMachine {
 	metadata := &ClusterMetadata{
 		ClusterID:            fmt.Sprintf("cluster-%d", time.Now().Unix()),
 		Brokers:              make(map[string]*BrokerInfo),
@@ -198,8 +178,7 @@ func (csm *ControllerStateMachine) executeCommand(cmd *ControllerCommand) (inter
 		return csm.joinGroup(cmd.Data)
 	case protocol.RaftCmdLeaveGroup:
 		return csm.leaveGroup(cmd.Data)
-	case protocol.RaftCmdUpdateBrokerLoad:
-		return csm.updateBrokerLoad(cmd.Data)
+
 	case protocol.RaftCmdMarkBrokerFailed:
 		return csm.markBrokerFailed(cmd.Data)
 	case protocol.RaftCmdRebalancePartitions:
@@ -795,4 +774,12 @@ func (csm *ControllerStateMachine) GetHash() uint64 {
 	defer csm.mu.RUnlock()
 
 	return uint64(csm.metadata.Version)
+}
+
+// GetPartitionAssigner returns the partition assigner instance
+func (csm *ControllerStateMachine) GetPartitionAssigner() *PartitionAssigner {
+	csm.mu.RLock()
+	defer csm.mu.RUnlock()
+
+	return csm.partitionAssigner
 }

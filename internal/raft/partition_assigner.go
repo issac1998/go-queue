@@ -12,8 +12,16 @@ import (
 	"sort"
 	"time"
 
+	"github.com/issac1998/go-queue/internal/compression"
+	"github.com/issac1998/go-queue/internal/deduplication"
 	"github.com/issac1998/go-queue/internal/protocol"
 )
+
+// BrokerInterface defines the interface to access broker components
+type BrokerInterface interface {
+	GetCompressor() compression.Compressor
+	GetDeduplicator() *deduplication.Deduplicator
+}
 
 // StartPartitionRaftGroupRequest represents the request to start a partition Raft group
 type StartPartitionRaftGroupRequest struct {
@@ -50,6 +58,7 @@ type StopPartitionRaftGroupResponse struct {
 type PartitionAssigner struct {
 	metadata    *ClusterMetadata
 	raftManager *RaftManager
+	broker      BrokerInterface
 }
 
 // NewPartitionAssigner creates a new Multi-Raft partition assigner
@@ -57,7 +66,13 @@ func NewPartitionAssigner(metadata *ClusterMetadata, raftManager *RaftManager) *
 	return &PartitionAssigner{
 		metadata:    metadata,
 		raftManager: raftManager,
+		broker:      nil, //
 	}
+}
+
+// SetBroker sets the broker interface for accessing components
+func (pa *PartitionAssigner) SetBroker(broker BrokerInterface) {
+	pa.broker = broker
 }
 
 // AllocatePartitions allocates partitions as independent Raft groups
@@ -88,12 +103,10 @@ func (pa *PartitionAssigner) AllocatePartitions(
 			assignment.Replicas[j] = broker.ID
 		}
 
-		// Set preferred leader as the least loaded broker (first in sorted list)
 		assignment.PreferredLeader = selectedBrokers[0].ID
 
 		assignments[i] = assignment
 
-		// Update broker loads for next iteration (simulate the load increase)
 		pa.updateBrokerLoadAfterAssignment(selectedBrokers, assignment.PreferredLeader)
 	}
 
@@ -110,16 +123,15 @@ func (pa *PartitionAssigner) RebalancePartitions(
 		return nil, fmt.Errorf("no available brokers for rebalancing")
 	}
 
-	// Calculate current load distribution
 	brokerLoads := pa.calculateBrokerLoads(currentAssignments, availableBrokers)
 	avgLoad := pa.calculateAverageLoad(brokerLoads)
 	threshold := avgLoad * 0.15 // 15% threshold for rebalancing
 
 	var rebalancedAssignments []*PartitionAssignment
 	var leaderTransfers []LeaderTransferPlan
-
+	cnt := 0
 	for _, assignment := range currentAssignments {
-		newAssignment := *assignment // Copy assignment
+		newAssignment := *assignment
 
 		// Get current actual leader from Raft group
 		actualLeader, err := pa.getCurrentRaftLeader(assignment.RaftGroupID)
@@ -131,7 +143,6 @@ func (pa *PartitionAssigner) RebalancePartitions(
 		if newAssignment.Leader != "" {
 			leaderLoad := brokerLoads[newAssignment.Leader]
 			if leaderLoad > avgLoad+threshold {
-				// Find best replica to transfer leadership to
 				bestReplica := pa.findBestLeaderReplica(&newAssignment, brokerLoads, avgLoad-threshold)
 				if bestReplica != "" && bestReplica != newAssignment.Leader {
 					leaderTransfers = append(leaderTransfers, LeaderTransferPlan{
@@ -143,6 +154,11 @@ func (pa *PartitionAssigner) RebalancePartitions(
 					brokerLoads[assignment.Leader] -= 1.0
 					brokerLoads[bestReplica] += 1.0
 				}
+			}
+			cnt++
+			// only do 3 transfer.
+			if cnt == 3 {
+				break
 			}
 		}
 
@@ -169,14 +185,12 @@ func (pa *PartitionAssigner) executeLeaderTransfers(plans []LeaderTransferPlan) 
 	log.Printf("Executing %d leader transfers for load balancing", len(plans))
 
 	for _, plan := range plans {
-		// Convert broker ID to node ID for dragonboat
 		targetNodeID, err := pa.brokerIDToNodeID(plan.ToLeader)
 		if err != nil {
 			log.Printf("Failed to convert broker ID %s to node ID: %v", plan.ToLeader, err)
 			continue
 		}
 
-		// Use dragonboat's native leader transfer
 		err = pa.raftManager.TransferLeadership(plan.RaftGroupID, targetNodeID)
 		if err != nil {
 			log.Printf("Failed to transfer leadership for group %d from %s to %s: %v",
@@ -315,7 +329,19 @@ func (pa *PartitionAssigner) startRaftGroupLocally(
 	join bool,
 ) error {
 	// Create partition state machine
-	stateMachine, err := NewPartitionStateMachine(assignment.TopicName, assignment.PartitionID, pa.raftManager.dataDir)
+	var compressor compression.Compressor
+	var deduplicator *deduplication.Deduplicator
+
+	if pa.broker != nil {
+		compressor = pa.broker.GetCompressor()
+		deduplicator = pa.broker.GetDeduplicator()
+	} else {
+		// Fallback to no compression/deduplication
+		compressor, _ = compression.GetCompressor(compression.None)
+		deduplicator = deduplication.NewDeduplicator(&deduplication.Config{Enabled: false})
+	}
+
+	stateMachine, err := NewPartitionStateMachine(assignment.TopicName, assignment.PartitionID, pa.raftManager.dataDir, compressor, deduplicator)
 	if err != nil {
 		return fmt.Errorf("failed to create partition state machine: %w", err)
 	}
@@ -528,6 +554,16 @@ func (pa *PartitionAssigner) nodeIDToBrokerID(nodeID uint64) (string, error) {
 	return "", fmt.Errorf("no broker found for node ID %d", nodeID)
 }
 
+// NodeIDToBrokerID converts a node ID back to broker ID (public method)
+func (pa *PartitionAssigner) NodeIDToBrokerID(nodeID uint64) (string, error) {
+	return pa.nodeIDToBrokerID(nodeID)
+}
+
+// BrokerIDToNodeID converts broker ID to node ID (public method)
+func (pa *PartitionAssigner) BrokerIDToNodeID(brokerID string) (uint64, error) {
+	return pa.brokerIDToNodeID(brokerID)
+}
+
 // Reuse helper functions from the original assigner
 func (pa *PartitionAssigner) generateRaftGroupID(topicName string, partitionID int32) uint64 {
 	h := fnv.New64a()
@@ -594,16 +630,13 @@ func (pa *PartitionAssigner) selectLeastLoadedBrokers(availableBrokers []*Broker
 		count = len(availableBrokers)
 	}
 
-	// Create a copy of brokers to avoid modifying the original slice
 	brokers := make([]*BrokerInfo, len(availableBrokers))
 	copy(brokers, availableBrokers)
 
-	// Sort brokers by load (ascending - least loaded first)
 	sort.Slice(brokers, func(i, j int) bool {
 		return pa.getBrokerLoad(brokers[i]) < pa.getBrokerLoad(brokers[j])
 	})
 
-	// Return the least loaded brokers
 	return brokers[:count]
 }
 
@@ -613,7 +646,6 @@ func (pa *PartitionAssigner) getBrokerLoad(broker *BrokerInfo) float64 {
 		return 0.0
 	}
 
-	// Weighted load calculation considering multiple factors
 	cpuWeight := 0.3
 	memoryWeight := 0.25
 	partitionWeight := 0.25
@@ -634,15 +666,12 @@ func (pa *PartitionAssigner) updateBrokerLoadAfterAssignment(selectedBrokers []*
 			broker.LoadMetrics = &LoadMetrics{}
 		}
 
-		// Update partition count for all selected brokers
 		broker.LoadMetrics.PartitionCount++
 
-		// Update leader count for the preferred leader
 		if i == 0 && broker.ID == leaderID {
 			broker.LoadMetrics.LeaderCount++
 		}
 
-		// Update last updated time
 		broker.LoadMetrics.LastUpdated = time.Now()
 	}
 }
@@ -652,7 +681,6 @@ func (pa *PartitionAssigner) sendStartPartitionRaftGroupRequest(
 	brokerPort int,
 	request *StartPartitionRaftGroupRequest,
 ) (*StartPartitionRaftGroupResponse, error) {
-	// Connect to the target broker
 	addr := fmt.Sprintf("%s:%d", brokerAddress, brokerPort)
 	conn, err := protocol.ConnectToSpecificBroker(addr, 10*time.Second)
 	if err != nil {
@@ -660,7 +688,6 @@ func (pa *PartitionAssigner) sendStartPartitionRaftGroupRequest(
 	}
 	defer conn.Close()
 
-	// Set timeout
 	conn.SetDeadline(time.Now().Add(10 * time.Second))
 
 	log.Printf("Connected to broker at %s for StartPartitionRaftGroup request", addr)
@@ -685,25 +712,21 @@ func (pa *PartitionAssigner) sendStartPartitionRaftGroupRequest(
 	log.Printf("Sent StartPartitionRaftGroup request: GroupID=%d, Join=%t",
 		request.RaftGroupID, request.Join)
 
-	// Receive response
 	return receiveStartPartitionRaftGroupResponse(conn)
 }
 
 // receiveStartPartitionRaftGroupResponse receives the response from the remote broker
 func receiveStartPartitionRaftGroupResponse(conn net.Conn) (*StartPartitionRaftGroupResponse, error) {
-	// Read response data length
 	var dataLength int32
 	if err := binary.Read(conn, binary.BigEndian, &dataLength); err != nil {
 		return nil, fmt.Errorf("failed to read response length: %w", err)
 	}
 
-	// Read response data
 	responseData := make([]byte, dataLength)
 	if _, err := io.ReadFull(conn, responseData); err != nil {
 		return nil, fmt.Errorf("failed to read response data: %w", err)
 	}
 
-	// Parse response
 	var response StartPartitionRaftGroupResponse
 	if err := json.Unmarshal(responseData, &response); err != nil {
 		return nil, fmt.Errorf("failed to parse response: %w", err)
@@ -757,8 +780,7 @@ func (pa *PartitionAssigner) stopSinglePartitionRaftGroup(assignment *PartitionA
 	for _, brokerID := range assignment.Replicas {
 		err := pa.stopRaftGroupOnBroker(assignment, brokerID)
 		if err != nil {
-			log.Printf("Warning: failed to stop Raft group on broker %s: %v", brokerID, err)
-			// it's okay to
+			return err
 		}
 	}
 
@@ -799,7 +821,6 @@ func (pa *PartitionAssigner) sendStopRaftGroupCommand(assignment *PartitionAssig
 	log.Printf("Sending StopRaftGroup command to broker %s:%d for group %d",
 		broker.Address, broker.Port, assignment.RaftGroupID)
 
-	// Create stop request (we can reuse the start request structure for simplicity)
 	request := &StopPartitionRaftGroupRequest{
 		RaftGroupID: assignment.RaftGroupID,
 		TopicName:   assignment.TopicName,

@@ -2,9 +2,12 @@ package client
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"hash/fnv"
 	"io"
+	"math/big"
 	"time"
 
 	"github.com/issac1998/go-queue/internal/protocol"
@@ -12,20 +15,59 @@ import (
 
 // Producer message producer
 type Producer struct {
-	client *Client
+	client      *Client
+	partitioner Partitioner
 }
 
-// NewProducer creates a new producer
+// Partitioner defines the interface for partition selection strategies
+type Partitioner interface {
+	Partition(message *ProduceMessage, numPartitions int32) (int32, error)
+}
+
+// PartitionStrategy represents different partitioning strategies
+type PartitionStrategy int
+
+const (
+	PartitionStrategyManual PartitionStrategy = iota
+	PartitionStrategyRoundRobin
+	PartitionStrategyRandom
+	PartitionStrategyHash
+)
+
+// NewProducer creates a new producer with default manual partitioning
 func NewProducer(client *Client) *Producer {
 	return &Producer{
-		client: client,
+		client:      client,
+		partitioner: &ManualPartitioner{},
+	}
+}
+
+// NewProducerWithStrategy creates a new producer with specified partitioning strategy
+func NewProducerWithStrategy(client *Client, strategy PartitionStrategy) *Producer {
+	var partitioner Partitioner
+
+	switch strategy {
+	case PartitionStrategyRoundRobin:
+		partitioner = &RoundRobinPartitioner{}
+	case PartitionStrategyRandom:
+		partitioner = &RandomPartitioner{}
+	case PartitionStrategyHash:
+		partitioner = &HashPartitioner{}
+	default:
+		partitioner = &ManualPartitioner{}
+	}
+
+	return &Producer{
+		client:      client,
+		partitioner: partitioner,
 	}
 }
 
 // ProduceMessage single message structure
 type ProduceMessage struct {
 	Topic     string
-	Partition int32
+	Partition int32  
+	Key       []byte 
 	Value     []byte
 }
 
@@ -49,14 +91,106 @@ func (p *Producer) SendBatch(messages []ProduceMessage) (*ProduceResult, error) 
 	}
 
 	topic := messages[0].Topic
-	partition := messages[0].Partition
 	for _, msg := range messages {
-		if msg.Topic != topic || msg.Partition != partition {
-			return nil, fmt.Errorf("batch messages must belong to the same topic and partition")
+		if msg.Topic != topic {
+			return nil, fmt.Errorf("batch messages must belong to the same topic")
 		}
 	}
 
+	partition, err := p.selectPartition(&messages[0])
+	if err != nil {
+		return nil, fmt.Errorf("failed to select partition: %v", err)
+	}
+
+	for i := range messages {
+		messages[i].Partition = partition
+	}
+
 	return p.sendToPartitionLeader(topic, partition, messages)
+}
+
+// selectPartition selects appropriate partition for a message
+func (p *Producer) selectPartition(msg *ProduceMessage) (int32, error) {
+	if msg.Partition >= 0 {
+		return msg.Partition, nil
+	}
+
+	topicMeta, err := p.client.getTopicMetadata(msg.Topic)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get topic metadata: %v", err)
+	}
+
+	numPartitions := int32(len(topicMeta.Partitions))
+	return p.partitioner.Partition(msg, numPartitions)
+}
+
+// ManualPartitioner uses manually specified partitions
+type ManualPartitioner struct{}
+
+func (mp *ManualPartitioner) Partition(message *ProduceMessage, numPartitions int32) (int32, error) {
+	if message.Partition < 0 {
+		return 0, fmt.Errorf("partition must be specified for manual partitioning")
+	}
+	if message.Partition >= numPartitions {
+		return 0, fmt.Errorf("partition %d exceeds available partitions %d", message.Partition, numPartitions)
+	}
+	return message.Partition, nil
+}
+
+// RoundRobinPartitioner distributes messages across partitions in round-robin fashion
+type RoundRobinPartitioner struct {
+	counter int32
+}
+
+func (rrp *RoundRobinPartitioner) Partition(message *ProduceMessage, numPartitions int32) (int32, error) {
+	if numPartitions <= 0 {
+		return 0, fmt.Errorf("invalid number of partitions: %d", numPartitions)
+	}
+
+	partition := rrp.counter % numPartitions
+	rrp.counter++
+	return partition, nil
+}
+
+// RandomPartitioner randomly selects a partition
+type RandomPartitioner struct{}
+
+func (rp *RandomPartitioner) Partition(message *ProduceMessage, numPartitions int32) (int32, error) {
+	if numPartitions <= 0 {
+		return 0, fmt.Errorf("invalid number of partitions: %d", numPartitions)
+	}
+
+	randomNum, err := rand.Int(rand.Reader, big.NewInt(int64(numPartitions)))
+	if err != nil {
+		return 0, fmt.Errorf("failed to generate random number: %v", err)
+	}
+
+	return int32(randomNum.Int64()), nil
+}
+
+// HashPartitioner uses hash of message key to determine partition
+type HashPartitioner struct{}
+
+func (hp *HashPartitioner) Partition(message *ProduceMessage, numPartitions int32) (int32, error) {
+	if numPartitions <= 0 {
+		return 0, fmt.Errorf("invalid number of partitions: %d", numPartitions)
+	}
+
+	// If no key is provided, use random partitioning
+	if len(message.Key) == 0 {
+		randomNum, err := rand.Int(rand.Reader, big.NewInt(int64(numPartitions)))
+		if err != nil {
+			return 0, fmt.Errorf("failed to generate random number: %v", err)
+		}
+		return int32(randomNum.Int64()), nil
+	}
+
+	// Hash the key
+	hasher := fnv.New32a()
+	hasher.Write(message.Key)
+	hash := hasher.Sum32()
+
+	return int32(hash) % numPartitions, nil
 }
 
 // sendToPartitionLeader sends messages directly to the partition leader

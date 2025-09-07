@@ -39,11 +39,12 @@ var metadataRequestTypes = map[int32]bool{
 	protocol.ControllerDiscoverRequestType: true,
 	protocol.ControllerVerifyRequestType:   true,
 	protocol.GetTopicMetadataRequestType:   true,
-	protocol.ProduceRequestType:      false,
-	protocol.FetchRequestType:        false,
-	protocol.HeartbeatRequestType:    false,
-	protocol.CommitOffsetRequestType: false,
-	protocol.FetchOffsetRequestType:  false,
+	protocol.FetchAssignmentRequestType:    false, // Read operation
+	protocol.ProduceRequestType:            false,
+	protocol.FetchRequestType:              false,
+	protocol.HeartbeatRequestType:          false,
+	protocol.CommitOffsetRequestType:       false,
+	protocol.FetchOffsetRequestType:        false,
 }
 
 var writeRequestTypes = map[int32]bool{
@@ -51,8 +52,8 @@ var writeRequestTypes = map[int32]bool{
 	protocol.DeleteTopicRequestType:  true,
 	protocol.JoinGroupRequestType:    true,
 	protocol.LeaveGroupRequestType:   true,
-	protocol.CommitOffsetRequestType: false, 
-	protocol.HeartbeatRequestType:    false, 
+	protocol.CommitOffsetRequestType: false,
+	protocol.HeartbeatRequestType:    false,
 }
 
 // TopicMetadata holds partition-to-broker mapping for a topic
@@ -160,34 +161,19 @@ func (c *Client) setControllerAddr(addr string) {
 	c.controllerAddr = addr
 }
 
-// sendRequest sends request and handles response
-func (c *Client) sendRequest(requestType int32, requestData []byte) ([]byte, error) {
-	return c.sendRequestWithType(requestType, requestData, c.isMetadataRequest(requestType))
-}
-
-// sendRequestWithType sends request with explicit metadata flag
-// TODO :Data Operation,use this method or connectForDataOperation？
-func (c *Client) sendRequestWithType(requestType int32, requestData []byte, isMetadata bool) ([]byte, error) {
+// sendMetaRequest sends request and handles response
+func (c *Client) sendMetaRequest(requestType int32, requestData []byte) ([]byte, error) {
 	var conn net.Conn
 	var err error
 
-	// Get connection without holding the lock to avoid deadlock
-	if isMetadata {
-		// For metadata operations, determine if it's read or write
-		isWrite := c.isMetadataWriteRequest(requestType)
-		conn, err = c.connectForMetadata(isWrite)
-	} else {
-		// data
-
-		return nil, fmt.Errorf("data operations not implemented yet")
-	}
+	isWrite := c.isMetadataWriteRequest(requestType)
+	conn, err = c.connectForMetadata(isWrite)
 
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
 
-	// Now acquire lock for the actual request sending
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -214,11 +200,6 @@ func (c *Client) sendRequestWithType(requestType int32, requestData []byte, isMe
 	}
 
 	return responseData, nil
-}
-
-// isMetadataRequest determines if a request type is a metadata operation
-func (c *Client) isMetadataRequest(requestType int32) bool {
-	return metadataRequestTypes[requestType]
 }
 
 // isMetadataWriteRequest checks if a metadata request type is a write operation

@@ -9,6 +9,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/issac1998/go-queue/internal/compression"
+	"github.com/issac1998/go-queue/internal/deduplication"
 	"github.com/issac1998/go-queue/internal/storage"
 	"github.com/lni/dragonboat/v3/statemachine"
 )
@@ -65,7 +67,6 @@ type PartitionCommand struct {
 // Command types for partition operations
 const (
 	CmdProduceMessage = "produce_message"
-	CmdCommitOffset   = "commit_offset"
 	CmdCleanup        = "cleanup"
 )
 
@@ -79,6 +80,10 @@ type PartitionStateMachine struct {
 	partition *storage.Partition
 	mu        sync.RWMutex
 
+	// Message processing components
+	compressor   compression.Compressor
+	deduplicator *deduplication.Deduplicator
+
 	// Metrics
 	messageCount int64
 	bytesStored  int64
@@ -90,28 +95,30 @@ type PartitionStateMachine struct {
 }
 
 // NewPartitionStateMachine creates a state machine for a partition
-func NewPartitionStateMachine(topicName string, partitionID int32, dataDir string) (*PartitionStateMachine, error) {
+func NewPartitionStateMachine(topicName string, partitionID int32, dataDir string, compressor compression.Compressor, deduplicator *deduplication.Deduplicator) (*PartitionStateMachine, error) {
 	partitionDir := filepath.Join(dataDir, "partitions", fmt.Sprintf("%s-%d", topicName, partitionID))
 
 	// Create storage partition
 	partition, err := storage.NewPartition(partitionDir, &storage.PartitionConfig{
-		MaxSegmentSize: 1024 * 1024 * 1024,      
-		MaxIndexSize:   1024 * 1024 * 10,      
-		RetentionTime:  7 * 24 * time.Hour,      
-		RetentionSize:  10 * 1024 * 1024 * 1024, 
+		MaxSegmentSize: 1024 * 1024 * 1024,
+		MaxIndexSize:   1024 * 1024 * 10,
+		RetentionTime:  7 * 24 * time.Hour,
+		RetentionSize:  10 * 1024 * 1024 * 1024,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create partition storage: %w", err)
 	}
 
 	psm := &PartitionStateMachine{
-		TopicName:   topicName,
-		PartitionID: partitionID,
-		DataDir:     dataDir,
-		partition:   partition,
-		isReady:     true,
-		lastWrite:   time.Now(),
-		lastRead:    time.Now(),
+		TopicName:    topicName,
+		PartitionID:  partitionID,
+		DataDir:      dataDir,
+		partition:    partition,
+		compressor:   compressor,
+		deduplicator: deduplicator,
+		isReady:      true,
+		lastWrite:    time.Now(),
+		lastRead:     time.Now(),
 	}
 
 	log.Printf("Created PartitionStateMachine for %s-%d", topicName, partitionID)
@@ -133,8 +140,6 @@ func (psm *PartitionStateMachine) Update(data []byte) (statemachine.Result, erro
 	switch cmd.Type {
 	case CmdProduceMessage:
 		return psm.handleProduceMessage(cmd.Data)
-	case CmdCommitOffset:
-		return psm.handleCommitOffset(cmd.Data)
 	case CmdCleanup:
 		return psm.handleCleanup(cmd.Data)
 	default:
@@ -171,18 +176,70 @@ func (psm *PartitionStateMachine) handleProduceMessage(data map[string]interface
 		return statemachine.Result{Value: 0}, fmt.Errorf("failed to serialize message: %w", err)
 	}
 
-	// Append to storage
-	offset, err := psm.partition.Append(serializedMsg, msg.Timestamp)
+	if psm.deduplicator != nil && psm.deduplicator.IsEnabled() {
+		isDuplicate, existingOffset, err := psm.deduplicator.IsDuplicate(serializedMsg, -1)
+		if err != nil {
+			log.Printf("Deduplication check failed: %v", err)
+		} else if isDuplicate {
+			log.Printf("Duplicate message detected for %s-%d, returning existing offset %d",
+				psm.TopicName, psm.PartitionID, existingOffset)
+
+			result := WriteResult{
+				Offset:    existingOffset,
+				Timestamp: msg.Timestamp,
+			}
+
+			resultBytes, _ := json.Marshal(result)
+			return statemachine.Result{
+				Value: uint64(existingOffset),
+				Data:  resultBytes,
+			}, nil
+		}
+	}
+
+	var finalMsg []byte
+	if psm.compressor != nil && psm.compressor.Type() != compression.None {
+		if len(serializedMsg) >= 1024 {
+			compressedMsg, err := psm.compressor.Compress(serializedMsg)
+			if err != nil {
+				log.Printf("Compression failed, storing uncompressed: %v", err)
+				finalMsg = serializedMsg
+			} else {
+				finalMsg = make([]byte, 1+len(compressedMsg))
+				finalMsg[0] = byte(psm.compressor.Type())
+				copy(finalMsg[1:], compressedMsg)
+
+				compressionRatio := float64(len(compressedMsg)) / float64(len(serializedMsg))
+				log.Printf("Message compressed: %d -> %d bytes (ratio: %.2f)",
+					len(serializedMsg), len(compressedMsg), compressionRatio)
+			}
+		} else {
+			finalMsg = make([]byte, 1+len(serializedMsg))
+			finalMsg[0] = byte(compression.None)
+			copy(finalMsg[1:], serializedMsg)
+		}
+	} else {
+		finalMsg = make([]byte, 1+len(serializedMsg))
+		finalMsg[0] = byte(compression.None)
+		copy(finalMsg[1:], serializedMsg)
+	}
+
+	offset, err := psm.partition.Append(finalMsg, msg.Timestamp)
 	if err != nil {
 		return statemachine.Result{Value: 0}, fmt.Errorf("failed to append message: %w", err)
 	}
 
-	// Update metrics
+	if psm.deduplicator != nil && psm.deduplicator.IsEnabled() {
+		_, _, err := psm.deduplicator.IsDuplicate(serializedMsg, offset)
+		if err != nil {
+			log.Printf("Failed to update deduplication index: %v", err)
+		}
+	}
+
 	psm.messageCount++
 	psm.bytesStored += int64(len(serializedMsg))
 	psm.lastWrite = time.Now()
 
-	// Prepare result
 	result := WriteResult{
 		Offset:    offset,
 		Timestamp: msg.Timestamp,
@@ -196,29 +253,6 @@ func (psm *PartitionStateMachine) handleProduceMessage(data map[string]interface
 
 	log.Printf("Produced message to %s-%d at offset %d", psm.TopicName, psm.PartitionID, offset)
 
-	return statemachine.Result{
-		Value: uint64(offset),
-		Data:  resultBytes,
-	}, nil
-}
-
-// handleCommitOffset handles offset commits (for consumer groups)
-func (psm *PartitionStateMachine) handleCommitOffset(data map[string]interface{}) (statemachine.Result, error) {
-	// This would handle consumer group offset commits
-	// For now, we'll implement a simple success response
-	groupID := data["group_id"].(string)
-	offset := int64(data["offset"].(float64))
-
-	log.Printf("Committed offset %d for group %s on %s-%d", offset, groupID, psm.TopicName, psm.PartitionID)
-
-	result := map[string]interface{}{
-		"status":    "success",
-		"group_id":  groupID,
-		"offset":    offset,
-		"partition": psm.PartitionID,
-	}
-
-	resultBytes, _ := json.Marshal(result)
 	return statemachine.Result{
 		Value: uint64(offset),
 		Data:  resultBytes,
@@ -319,9 +353,36 @@ func (psm *PartitionStateMachine) readMessagesFromStorage(startOffset int64, max
 			return nil, currentOffset, err
 		}
 
+		var actualMessageData []byte
+		if len(messageData) > 0 {
+			compressionType := compression.CompressionType(messageData[0])
+			if compressionType != compression.None {
+				// Message is compressed, decompress it
+				compressor, err := compression.GetCompressor(compressionType)
+				if err != nil {
+					log.Printf("Failed to get decompressor for type %d at offset %d: %v", compressionType, currentOffset, err)
+					currentOffset++
+					continue
+				}
+
+				decompressedData, err := compressor.Decompress(messageData[1:])
+				if err != nil {
+					log.Printf("Failed to decompress message at offset %d: %v", currentOffset, err)
+					currentOffset++
+					continue
+				}
+				actualMessageData = decompressedData
+			} else {
+				// Message is not compressed, skip the compression marker
+				actualMessageData = messageData[1:]
+			}
+		} else {
+			actualMessageData = messageData
+		}
+
 		// Deserialize message
 		var msg StoredMessage
-		if err := json.Unmarshal(messageData, &msg); err != nil {
+		if err := json.Unmarshal(actualMessageData, &msg); err != nil {
 			log.Printf("Failed to unmarshal stored message at offset %d: %v", currentOffset, err)
 			currentOffset++
 			continue

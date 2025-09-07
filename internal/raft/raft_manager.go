@@ -224,7 +224,8 @@ func (rm *RaftManager) GetLeaderID(groupID uint64) (uint64, bool, error) {
 	}
 
 	return leaderID, valid, nil
-}
+} 
+
 
 // IsLeader checks if the current node is the leader of the specified group
 func (rm *RaftManager) IsLeader(groupID uint64) bool {
@@ -374,4 +375,9 @@ func (rm *RaftManager) EnsureReadIndexConsistency(ctx context.Context, groupID u
 	case <-ctx.Done():
 		return 0, fmt.Errorf("ReadIndex operation timeout for group %d: %v", groupID, ctx.Err())
 	}
+}
+
+// GetGroupCount returns the number of active Raft groups
+func (rm *RaftManager) GetGroupCount() int {
+	return len(rm.groups)
 }
