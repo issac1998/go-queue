@@ -16,7 +16,7 @@ import (
 type Consumer struct {
 	client           *Client
 	subscribedTopics []string
-	topicOffsets     map[string]map[int32]int64 
+	topicOffsets     map[string]map[int32]int64
 	mu               sync.RWMutex
 }
 
@@ -54,6 +54,35 @@ type FetchResult struct {
 	Error      error
 }
 
+// BatchFetchRequest represents a batch fetch request
+type BatchFetchRequest struct {
+	Topic     string
+	Partition int32
+	Ranges    []FetchRange
+}
+
+// FetchRange represents a single range in a batch fetch request
+type FetchRange struct {
+	Offset   int64
+	MaxBytes int32
+	MaxCount int32
+}
+
+// BatchFetchResult represents the result of a batch fetch
+type BatchFetchResult struct {
+	Topic     string
+	Partition int32
+	Results   []FetchRangeResult
+	Error     error
+}
+
+// FetchRangeResult represents the result of a single fetch range
+type FetchRangeResult struct {
+	Messages   []Message
+	NextOffset int64
+	Error      error
+}
+
 // Fetch fetches messages
 func (c *Consumer) Fetch(req FetchRequest) (*FetchResult, error) {
 	if req.MaxBytes <= 0 {
@@ -70,6 +99,59 @@ func (c *Consumer) FetchFrom(topic string, partition int32, offset int64) (*Fetc
 		Partition: partition,
 		Offset:    offset,
 		MaxBytes:  1024 * 1024,
+	})
+}
+
+// BatchFetch fetches multiple message ranges in a single request
+func (c *Consumer) BatchFetch(req BatchFetchRequest) (*BatchFetchResult, error) {
+	if len(req.Ranges) == 0 {
+		return &BatchFetchResult{
+			Topic:     req.Topic,
+			Partition: req.Partition,
+			Results:   []FetchRangeResult{},
+			Error:     fmt.Errorf("empty batch request"),
+		}, nil
+	}
+
+	if len(req.Ranges) == 1 {
+		singleResult, err := c.Fetch(FetchRequest{
+			Topic:     req.Topic,
+			Partition: req.Partition,
+			Offset:    req.Ranges[0].Offset,
+			MaxBytes:  req.Ranges[0].MaxBytes,
+		})
+
+		if err != nil {
+			return &BatchFetchResult{
+				Topic:     req.Topic,
+				Partition: req.Partition,
+				Results:   []FetchRangeResult{},
+				Error:     err,
+			}, nil
+		}
+
+		return &BatchFetchResult{
+			Topic:     req.Topic,
+			Partition: req.Partition,
+			Results: []FetchRangeResult{
+				{
+					Messages:   singleResult.Messages,
+					NextOffset: singleResult.NextOffset,
+					Error:      singleResult.Error,
+				},
+			},
+		}, nil
+	}
+
+	return c.batchFetchFromPartition(req)
+}
+
+// FetchMultipleRanges is a convenience method for fetching multiple ranges
+func (c *Consumer) FetchMultipleRanges(topic string, partition int32, ranges []FetchRange) (*BatchFetchResult, error) {
+	return c.BatchFetch(BatchFetchRequest{
+		Topic:     topic,
+		Partition: partition,
+		Ranges:    ranges,
 	})
 }
 
@@ -220,6 +302,156 @@ func (c *Consumer) fetchFromPartition(req FetchRequest) (*FetchResult, error) {
 	return result, nil
 }
 
+// batchFetchFromPartition fetches messages for multiple ranges from a single partition
+func (c *Consumer) batchFetchFromPartition(req BatchFetchRequest) (*BatchFetchResult, error) {
+	conn, err := c.client.connectForDataOperation(req.Topic, req.Partition, false)
+	if err != nil {
+		c.client.refreshTopicMetadata(req.Topic)
+		return nil, fmt.Errorf("failed to connect to partition leader or follower: %v", err)
+	}
+	defer conn.Close()
+
+	conn.SetDeadline(time.Now().Add(c.client.timeout))
+
+	requestData, err := c.buildBatchFetchRequest(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build batch request: %v", err)
+	}
+
+	requestType := protocol.BatchFetchRequestType
+	if err := binary.Write(conn, binary.BigEndian, requestType); err != nil {
+		return nil, fmt.Errorf("failed to send request type: %v", err)
+	}
+
+	if _, err := conn.Write(requestData); err != nil {
+		return nil, fmt.Errorf("failed to send request data: %v", err)
+	}
+
+	var responseLen int32
+	if err := binary.Read(conn, binary.BigEndian, &responseLen); err != nil {
+		return nil, fmt.Errorf("failed to read response length: %v", err)
+	}
+
+	responseData := make([]byte, responseLen)
+	if _, err := io.ReadFull(conn, responseData); err != nil {
+		return nil, fmt.Errorf("failed to read response data: %v", err)
+	}
+
+	result, err := c.parseBatchFetchResponse(req.Topic, req.Partition, responseData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse batch response: %v", err)
+	}
+
+	return result, nil
+}
+
+// buildBatchFetchRequest builds a batch fetch request
+func (c *Consumer) buildBatchFetchRequest(req BatchFetchRequest) ([]byte, error) {
+	buf := new(bytes.Buffer)
+
+	if err := binary.Write(buf, binary.BigEndian, int16(protocol.ProtocolVersion)); err != nil {
+		return nil, err
+	}
+
+	if err := binary.Write(buf, binary.BigEndian, int16(len(req.Topic))); err != nil {
+		return nil, err
+	}
+	if _, err := buf.WriteString(req.Topic); err != nil {
+		return nil, err
+	}
+
+	if err := binary.Write(buf, binary.BigEndian, req.Partition); err != nil {
+		return nil, err
+	}
+
+	if err := binary.Write(buf, binary.BigEndian, int32(len(req.Ranges))); err != nil {
+		return nil, err
+	}
+
+	for _, r := range req.Ranges {
+		if err := binary.Write(buf, binary.BigEndian, r.Offset); err != nil {
+			return nil, err
+		}
+		if err := binary.Write(buf, binary.BigEndian, r.MaxBytes); err != nil {
+			return nil, err
+		}
+		if err := binary.Write(buf, binary.BigEndian, r.MaxCount); err != nil {
+			return nil, err
+		}
+	}
+
+	return buf.Bytes(), nil
+}
+
+// parseBatchFetchResponse parses a batch fetch response
+func (c *Consumer) parseBatchFetchResponse(topic string, partition int32, data []byte) (*BatchFetchResult, error) {
+	buf := bytes.NewReader(data)
+
+	result := &BatchFetchResult{
+		Topic:     topic,
+		Partition: partition,
+		Results:   make([]FetchRangeResult, 0),
+	}
+
+	var topicLen int16
+	if err := binary.Read(buf, binary.BigEndian, &topicLen); err != nil {
+		return nil, fmt.Errorf("failed to read topic length: %v", err)
+	}
+	topicBytes := make([]byte, topicLen)
+	if _, err := io.ReadFull(buf, topicBytes); err != nil {
+		return nil, fmt.Errorf("failed to read topic: %v", err)
+	}
+
+	var responsePartition int32
+	if err := binary.Read(buf, binary.BigEndian, &responsePartition); err != nil {
+		return nil, fmt.Errorf("failed to read partition: %v", err)
+	}
+
+	var errorCode int16
+	if err := binary.Read(buf, binary.BigEndian, &errorCode); err != nil {
+		return nil, fmt.Errorf("failed to read error code: %v", err)
+	}
+
+	if errorCode != 0 {
+		result.Error = fmt.Errorf("server error, error code: %d", errorCode)
+		return result, nil
+	}
+
+	var rangeCount int32
+	if err := binary.Read(buf, binary.BigEndian, &rangeCount); err != nil {
+		return nil, fmt.Errorf("failed to read range count: %v", err)
+	}
+
+	for i := int32(0); i < rangeCount; i++ {
+		var rangeResult FetchRangeResult
+		var rangeOffset int64
+		if err := binary.Read(buf, binary.BigEndian, &rangeOffset); err != nil {
+			return nil, fmt.Errorf("failed to read range %d offset: %v", i, err)
+		}
+
+		var rangeNextOffset int64
+		if err := binary.Read(buf, binary.BigEndian, &rangeNextOffset); err != nil {
+			return nil, fmt.Errorf("failed to read range %d next offset: %v", i, err)
+		}
+
+		var rangeErrorCode int16
+		if err := binary.Read(buf, binary.BigEndian, &rangeErrorCode); err != nil {
+			return nil, fmt.Errorf("failed to read range %d error code: %v", i, err)
+		}
+
+		if rangeErrorCode != 0 {
+			rangeResult.Error = fmt.Errorf("server error in range %d, error code: %d", i, rangeErrorCode)
+		} else {
+			// For simplicity, set next offset directly (can be improved to parse messages)
+			rangeResult.NextOffset = rangeNextOffset
+			rangeResult.Messages = []Message{} // TODO: Implement proper message parsing for batch ranges
+		}
+		result.Results = append(result.Results, rangeResult)
+	}
+
+	return result, nil
+}
+
 // SubscribePartition simple consumer subscription for a single partition (starting from latest position)
 func (c *Consumer) SubscribePartition(ctx context.Context, topic string, partition int32, handler func(Message) error) error {
 	offset := int64(0)
@@ -341,14 +573,14 @@ func (c *Consumer) pollTopic(topic string, timeout time.Duration) ([]*Message, e
 		if c.topicOffsets[topic] == nil {
 			c.topicOffsets[topic] = make(map[int32]int64)
 		}
-		offset := c.topicOffsets[topic][partitionID] 
+		offset := c.topicOffsets[topic][partitionID]
 		c.mu.Unlock()
 
 		fetchResult, err := c.Fetch(FetchRequest{
 			Topic:     topic,
 			Partition: partitionID,
 			Offset:    offset,
-			MaxBytes:  1024 * 1024, 
+			MaxBytes:  1024 * 1024,
 		})
 		if err != nil {
 			continue
@@ -386,4 +618,3 @@ func (c *Consumer) Seek(topic string, partition int32, offset int64) error {
 
 	return nil
 }
-

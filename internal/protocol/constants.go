@@ -28,6 +28,7 @@ const (
 	DiscoverControllerRequestType int32 = 11
 	GetTopicInfoRequestType       int32 = 12
 	FetchAssignmentRequestType    int32 = 13
+	BatchFetchRequestType         int32 = 14
 
 	// Group management request types
 	ListGroupsRequestType    int32 = 20
@@ -91,6 +92,7 @@ var RequestTypeNames = map[int32]string{
 	DeleteTopicRequestType:     "DELETE_TOPIC",
 	GetTopicInfoRequestType:    "GET_TOPIC_INFO",
 	FetchAssignmentRequestType: "FETCH_ASSIGNMENT",
+	BatchFetchRequestType:      "BATCH_FETCH",
 }
 
 // GetRequestTypeName returns the human-readable name for a request type
