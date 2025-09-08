@@ -66,8 +66,8 @@ func NewProducerWithStrategy(client *Client, strategy PartitionStrategy) *Produc
 // ProduceMessage single message structure
 type ProduceMessage struct {
 	Topic     string
-	Partition int32  
-	Key       []byte 
+	Partition int32
+	Key       []byte
 	Value     []byte
 }
 

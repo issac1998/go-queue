@@ -11,6 +11,7 @@ import (
 
 	"github.com/issac1998/go-queue/internal/compression"
 	"github.com/issac1998/go-queue/internal/deduplication"
+	"github.com/issac1998/go-queue/internal/protocol"
 	"github.com/issac1998/go-queue/internal/storage"
 	"github.com/lni/dragonboat/v3/statemachine"
 )
@@ -40,6 +41,20 @@ type FetchRequest struct {
 	MaxBytes  int32  `json:"max_bytes"`
 }
 
+// BatchFetchRequest represents a batch request to read multiple ranges of messages
+type BatchFetchRequest struct {
+	Topic     string              `json:"topic"`
+	Partition int32               `json:"partition"`
+	Requests  []FetchRangeRequest `json:"requests"`
+}
+
+// FetchRangeRequest represents a single range request within a batch
+type FetchRangeRequest struct {
+	Offset   int64 `json:"offset"`
+	MaxBytes int32 `json:"max_bytes"`
+	MaxCount int32 `json:"max_count,omitempty"`
+}
+
 // FetchResponse represents the response to a fetch request
 type FetchResponse struct {
 	Topic      string          `json:"topic"`
@@ -47,6 +62,22 @@ type FetchResponse struct {
 	Messages   []StoredMessage `json:"messages"`
 	NextOffset int64           `json:"next_offset"`
 	ErrorCode  int16           `json:"error_code"`
+}
+
+// BatchFetchResponse represents the response to a batch fetch request
+type BatchFetchResponse struct {
+	Topic     string        `json:"topic"`
+	Partition int32         `json:"partition"`
+	Results   []FetchResult `json:"results"`
+	ErrorCode int16         `json:"error_code"`
+	Error     string        `json:"error,omitempty"`
+}
+
+// FetchResult represents the result of a single fetch range
+type FetchResult struct {
+	Messages   []StoredMessage `json:"messages"`
+	NextOffset int64           `json:"next_offset"`
+	Error      string          `json:"error,omitempty"`
 }
 
 // StoredMessage represents a message stored in the partition
@@ -67,8 +98,20 @@ type PartitionCommand struct {
 // Command types for partition operations
 const (
 	CmdProduceMessage = "produce_message"
+	CmdProduceBatch   = "produce_batch" // 新增批量写入命令
 	CmdCleanup        = "cleanup"
 )
+
+// ProduceBatchCommand represents a batch of messages to be produced
+type ProduceBatchCommand struct {
+	Messages []ProduceMessage `json:"messages"`
+}
+
+// BatchWriteResult represents the result of a batch write operation
+type BatchWriteResult struct {
+	Results []WriteResult `json:"results"`
+	Error   string        `json:"error,omitempty"`
+}
 
 // PartitionStateMachine implements statemachine.IStateMachine for partition data
 type PartitionStateMachine struct {
@@ -140,6 +183,8 @@ func (psm *PartitionStateMachine) Update(data []byte) (statemachine.Result, erro
 	switch cmd.Type {
 	case CmdProduceMessage:
 		return psm.handleProduceMessage(cmd.Data)
+	case CmdProduceBatch:
+		return psm.handleProduceBatch(cmd.Data)
 	case CmdCleanup:
 		return psm.handleCleanup(cmd.Data)
 	default:
@@ -259,6 +304,116 @@ func (psm *PartitionStateMachine) handleProduceMessage(data map[string]interface
 	}, nil
 }
 
+// handleProduceBatch handles batch message production
+func (psm *PartitionStateMachine) handleProduceBatch(data map[string]interface{}) (statemachine.Result, error) {
+	var batchCmd ProduceBatchCommand
+	batchCmdBytes, err := json.Marshal(data["batch"])
+	if err != nil {
+		return statemachine.Result{Value: protocol.ErrorInvalidRequest}, fmt.Errorf("failed to marshal batch command: %w", err)
+	}
+
+	if err := json.Unmarshal(batchCmdBytes, &batchCmd); err != nil {
+		return statemachine.Result{Value: protocol.ErrorInvalidRequest}, fmt.Errorf("failed to unmarshal batch command: %w", err)
+	}
+
+	results := make([]WriteResult, len(batchCmd.Messages))
+	for i, msg := range batchCmd.Messages {
+		messageData := StoredMessage{
+			Key:       msg.Key,
+			Value:     msg.Value,
+			Headers:   msg.Headers,
+			Timestamp: msg.Timestamp,
+		}
+
+		serializedMsg, err := json.Marshal(messageData)
+		if err != nil {
+			results[i] = WriteResult{Error: fmt.Sprintf("failed to serialize message %d: %v", i, err)}
+			continue
+		}
+
+		if psm.deduplicator != nil && psm.deduplicator.IsEnabled() {
+			isDuplicate, existingOffset, err := psm.deduplicator.IsDuplicate(serializedMsg, -1)
+			if err != nil {
+				results[i] = WriteResult{Error: fmt.Sprintf("deduplication check failed for message %d: %v", i, err)}
+			} else if isDuplicate {
+				results[i] = WriteResult{
+					Offset:    existingOffset,
+					Timestamp: msg.Timestamp,
+				}
+				log.Printf("Duplicate message detected for %s-%d, returning existing offset %d for message %d",
+					psm.TopicName, psm.PartitionID, existingOffset, i)
+				continue
+			}
+		}
+
+		var finalMsg []byte
+		if psm.compressor != nil && psm.compressor.Type() != compression.None {
+			if len(serializedMsg) >= 1024 {
+				compressedMsg, err := psm.compressor.Compress(serializedMsg)
+				if err != nil {
+					results[i] = WriteResult{Error: fmt.Sprintf("compression failed for message %d: %v", i, err)}
+					log.Printf("Compression failed for message %d, storing uncompressed: %v", i, err)
+					finalMsg = serializedMsg
+				} else {
+					finalMsg = make([]byte, 1+len(compressedMsg))
+					finalMsg[0] = byte(psm.compressor.Type())
+					copy(finalMsg[1:], compressedMsg)
+
+					compressionRatio := float64(len(compressedMsg)) / float64(len(serializedMsg))
+					log.Printf("Message %d compressed: %d -> %d bytes (ratio: %.2f)",
+						i, len(serializedMsg), len(compressedMsg), compressionRatio)
+				}
+			} else {
+				finalMsg = make([]byte, 1+len(serializedMsg))
+				finalMsg[0] = byte(compression.None)
+				copy(finalMsg[1:], serializedMsg)
+			}
+		} else {
+			finalMsg = make([]byte, 1+len(serializedMsg))
+			finalMsg[0] = byte(compression.None)
+			copy(finalMsg[1:], serializedMsg)
+		}
+
+		offset, err := psm.partition.Append(finalMsg, msg.Timestamp)
+		if err != nil {
+			results[i] = WriteResult{Error: fmt.Sprintf("failed to append message %d: %v", i, err)}
+			log.Printf("Failed to append message %d: %v", i, err)
+			continue
+		}
+
+		if psm.deduplicator != nil && psm.deduplicator.IsEnabled() {
+			_, _, err := psm.deduplicator.IsDuplicate(serializedMsg, offset)
+			if err != nil {
+				log.Printf("Failed to update deduplication index for message %d: %v", i, err)
+			}
+		}
+
+		psm.messageCount++
+		psm.bytesStored += int64(len(serializedMsg))
+		psm.lastWrite = time.Now()
+
+		results[i] = WriteResult{
+			Offset:    offset,
+			Timestamp: msg.Timestamp,
+		}
+		log.Printf("Produced message %d to %s-%d at offset %d", i, psm.TopicName, psm.PartitionID, offset)
+	}
+
+	batchResult := BatchWriteResult{Results: results}
+	batchResultBytes, err := json.Marshal(batchResult)
+	if err != nil {
+		log.Printf("Failed to marshal batch write result: %v", err)
+		batchResultBytes = []byte(`{"results":[],"error":"failed to marshal results"}`)
+	}
+
+	log.Printf("Produced batch of %d messages to %s-%d", len(batchCmd.Messages), psm.TopicName, psm.PartitionID)
+
+	return statemachine.Result{
+		Value: 0,
+		Data:  batchResultBytes,
+	}, nil
+}
+
 // handleCleanup handles partition cleanup operations
 func (psm *PartitionStateMachine) handleCleanup(data map[string]interface{}) (statemachine.Result, error) {
 	// This would handle cleanup operations like log compaction
@@ -293,12 +448,76 @@ func (psm *PartitionStateMachine) Lookup(query interface{}) (interface{}, error)
 		return nil, fmt.Errorf("invalid query type: %T", query)
 	}
 
+	// Try to parse as BatchFetchRequest first
+	var batchReq BatchFetchRequest
+	if err := json.Unmarshal(queryBytes, &batchReq); err == nil && len(batchReq.Requests) > 0 {
+		return psm.handleBatchFetchMessages(&batchReq)
+	}
+
 	var req FetchRequest
 	if err := json.Unmarshal(queryBytes, &req); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal fetch request: %w", err)
 	}
 
 	return psm.handleFetchMessages(&req)
+}
+
+// handleBatchFetchMessages handles batch message fetching
+func (psm *PartitionStateMachine) handleBatchFetchMessages(req *BatchFetchRequest) (*BatchFetchResponse, error) {
+	if req.Topic != psm.TopicName || req.Partition != psm.PartitionID {
+		return &BatchFetchResponse{
+			Topic:     req.Topic,
+			Partition: req.Partition,
+			Results:   []FetchResult{},
+			ErrorCode: protocol.ErrorInvalidTopic,
+			Error:     "topic or partition mismatch",
+		}, nil
+	}
+
+	if len(req.Requests) == 0 {
+		return &BatchFetchResponse{
+			Topic:     req.Topic,
+			Partition: req.Partition,
+			Results:   []FetchResult{},
+			ErrorCode: 2, // Invalid request
+			Error:     "empty batch request",
+		}, nil
+	}
+
+	results := make([]FetchResult, len(req.Requests))
+	for i, fetchRange := range req.Requests {
+		messages, nextOffset, err := psm.readMessagesFromStorageWithCount(
+			fetchRange.Offset,
+			fetchRange.MaxBytes,
+			fetchRange.MaxCount,
+		)
+
+		if err != nil {
+			results[i] = FetchResult{
+				Messages:   []StoredMessage{},
+				NextOffset: fetchRange.Offset,
+				Error:      fmt.Sprintf("failed to read range %d: %v", i, err),
+			}
+			log.Printf("Failed to read messages for range %d: %v", i, err)
+		} else {
+			results[i] = FetchResult{
+				Messages:   messages,
+				NextOffset: nextOffset,
+			}
+		}
+	}
+
+	psm.lastRead = time.Now()
+
+	log.Printf("✅ Batch fetched %d ranges from %s-%d",
+		len(req.Requests), psm.TopicName, psm.PartitionID)
+
+	return &BatchFetchResponse{
+		Topic:     req.Topic,
+		Partition: req.Partition,
+		Results:   results,
+		ErrorCode: protocol.ErrorNone,
+	}, nil
 }
 
 // handleFetchMessages handles message fetching
@@ -308,7 +527,7 @@ func (psm *PartitionStateMachine) handleFetchMessages(req *FetchRequest) (*Fetch
 			Topic:     req.Topic,
 			Partition: req.Partition,
 			Messages:  []StoredMessage{},
-			ErrorCode: 1, // Invalid topic/partition
+			ErrorCode: protocol.ErrorInvalidTopic,
 		}, nil
 	}
 
@@ -319,7 +538,7 @@ func (psm *PartitionStateMachine) handleFetchMessages(req *FetchRequest) (*Fetch
 			Topic:     req.Topic,
 			Partition: req.Partition,
 			Messages:  []StoredMessage{},
-			ErrorCode: 2, // Read error
+			ErrorCode: protocol.ErrorFetchFailed,
 		}, nil
 	}
 
@@ -333,7 +552,7 @@ func (psm *PartitionStateMachine) handleFetchMessages(req *FetchRequest) (*Fetch
 		Partition:  req.Partition,
 		Messages:   messages,
 		NextOffset: nextOffset,
-		ErrorCode:  0, // Success
+		ErrorCode:  protocol.ErrorNone,
 	}, nil
 }
 
@@ -389,6 +608,67 @@ func (psm *PartitionStateMachine) readMessagesFromStorage(startOffset int64, max
 		}
 
 		// Set the offset
+		msg.Offset = currentOffset
+
+		messages = append(messages, msg)
+		totalBytes += int32(len(messageData))
+		currentOffset++
+	}
+
+	return messages, currentOffset, nil
+}
+
+// readMessagesFromStorageWithCount reads messages from the storage layer with both bytes and count limits
+func (psm *PartitionStateMachine) readMessagesFromStorageWithCount(startOffset int64, maxBytes int32, maxCount int32) ([]StoredMessage, int64, error) {
+	messages := []StoredMessage{}
+	currentOffset := startOffset
+	totalBytes := int32(0)
+
+	if maxCount <= 0 {
+		maxCount = 1000
+	}
+
+	for totalBytes < maxBytes && int32(len(messages)) < maxCount {
+		messageData, err := psm.partition.ReadAt(currentOffset)
+		if err != nil {
+			if err == storage.ErrOffsetOutOfRange {
+				break
+			}
+			return nil, currentOffset, err
+		}
+
+		var actualMessageData []byte
+		if len(messageData) > 0 {
+			compressionType := compression.CompressionType(messageData[0])
+			if compressionType != compression.None {
+				compressor, err := compression.GetCompressor(compressionType)
+				if err != nil {
+					log.Printf("Failed to get decompressor for type %d at offset %d: %v", compressionType, currentOffset, err)
+					currentOffset++
+					continue
+				}
+
+				decompressedData, err := compressor.Decompress(messageData[1:])
+				if err != nil {
+					log.Printf("Failed to decompress message at offset %d: %v", currentOffset, err)
+					currentOffset++
+					continue
+				}
+				actualMessageData = decompressedData
+			} else {
+				actualMessageData = messageData[1:]
+			}
+		} else {
+			actualMessageData = messageData
+		}
+
+		var msg StoredMessage
+		if err := json.Unmarshal(actualMessageData, &msg); err != nil {
+			log.Printf("Failed to unmarshal stored message at offset %d: %v", currentOffset, err)
+			currentOffset++
+			continue
+		}
+
 		msg.Offset = currentOffset
 
 		messages = append(messages, msg)
