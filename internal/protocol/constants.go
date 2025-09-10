@@ -11,28 +11,30 @@ const (
 	ProtocolVersion = 1
 )
 
-// Request type constants define different types of requests that can be made to the queue system
+// Request type constants define different types of operations in the system
 const (
-	// Client request types
-	ProduceRequestType            int32 = 0
-	FetchRequestType              int32 = 1
-	CreateTopicRequestType        int32 = 2
-	ListTopicsRequestType         int32 = 3
-	DeleteTopicRequestType        int32 = 4
-	JoinGroupRequestType          int32 = 5
-	LeaveGroupRequestType         int32 = 6
-	HeartbeatRequestType          int32 = 7
-	CommitOffsetRequestType       int32 = 8
-	FetchOffsetRequestType        int32 = 9
-	DescribeTopicRequestType      int32 = 10
-	DiscoverControllerRequestType int32 = 11
-	GetTopicInfoRequestType       int32 = 12
-	FetchAssignmentRequestType    int32 = 13
-	BatchFetchRequestType         int32 = 14
+	ProduceRequestType     int32 = 1
+	FetchRequestType       int32 = 2
+	ListTopicsRequestType  int32 = 3
+	CreateTopicRequestType int32 = 4
+	DeleteTopicRequestType int32 = 5
+
+	JoinGroupRequestType           int32 = 10
+	LeaveGroupRequestType          int32 = 11
+	HeartbeatRequestType           int32 = 12
+	CommitOffsetRequestType        int32 = 13
+	FetchOffsetRequestType         int32 = 14
+	GetTopicInfoRequestType        int32 = 15
+	FetchAssignmentRequestType     int32 = 16
+	BatchFetchRequestType          int32 = 17
+	TransactionPrepareRequestType  int32 = 18
+	TransactionCommitRequestType   int32 = 19
+	TransactionRollbackRequestType int32 = 20
+	TransactionCheckRequestType    int32 = 21
 
 	// Group management request types
-	ListGroupsRequestType    int32 = 20
-	DescribeGroupRequestType int32 = 21
+	ListGroupsRequestType    int32 = 30
+	DescribeGroupRequestType int32 = 31
 
 	ControllerDiscoverRequestType = 1000
 	ControllerVerifyRequestType   = 1001
@@ -57,6 +59,8 @@ const (
 	ErrorBrokerNotAvailable = 10
 	ErrorFetchFailed        = 11
 	ErrorProduceFailed      = 12
+	ErrorNotLeader          = 13
+	ErrorInternalError      = 14
 
 	// Authentication and authorization
 	ErrorUnauthorized  = 20
@@ -67,6 +71,13 @@ const (
 	ErrorUnknownMember       = 31
 	ErrorRebalanceInProgress = 32
 	ErrorGenerationMismatch  = 33
+
+	// Transaction states
+	TransactionStateUnknown  int16 = 0
+	TransactionStateCommit   int16 = 1
+	TransactionStateRollback int16 = 2
+	TransactionStatePrepared int16 = 3
+	TransactionStateChecking int16 = 4
 )
 
 const (
@@ -76,23 +87,25 @@ const (
 	CompressionNone      = 0x00
 )
 
-// RequestTypeNames maps request type constants to human-readable names
+// RequestTypeNames maps request types to human-readable names
 var RequestTypeNames = map[int32]string{
-	ProduceRequestType:         "PRODUCE",
-	FetchRequestType:           "FETCH",
-	CreateTopicRequestType:     "CREATE_TOPIC",
-	JoinGroupRequestType:       "JOIN_GROUP",
-	LeaveGroupRequestType:      "LEAVE_GROUP",
-	HeartbeatRequestType:       "HEARTBEAT",
-	CommitOffsetRequestType:    "COMMIT_OFFSET",
-	FetchOffsetRequestType:     "FETCH_OFFSET",
-	ListGroupsRequestType:      "LIST_GROUPS",
-	DescribeGroupRequestType:   "DESCRIBE_GROUP",
-	ListTopicsRequestType:      "LIST_TOPICS",
-	DeleteTopicRequestType:     "DELETE_TOPIC",
-	GetTopicInfoRequestType:    "GET_TOPIC_INFO",
-	FetchAssignmentRequestType: "FETCH_ASSIGNMENT",
-	BatchFetchRequestType:      "BATCH_FETCH",
+	ProduceRequestType:             "PRODUCE",
+	FetchRequestType:               "FETCH",
+	ListTopicsRequestType:          "LIST_TOPICS",
+	CreateTopicRequestType:         "CREATE_TOPIC",
+	DeleteTopicRequestType:         "DELETE_TOPIC",
+	JoinGroupRequestType:           "JOIN_GROUP",
+	LeaveGroupRequestType:          "LEAVE_GROUP",
+	HeartbeatRequestType:           "HEARTBEAT",
+	CommitOffsetRequestType:        "COMMIT_OFFSET",
+	FetchOffsetRequestType:         "FETCH_OFFSET",
+	GetTopicInfoRequestType:        "GET_TOPIC_INFO",
+	FetchAssignmentRequestType:     "FETCH_ASSIGNMENT",
+	BatchFetchRequestType:          "BATCH_FETCH",
+	TransactionPrepareRequestType:  "TRANSACTION_PREPARE",
+	TransactionCommitRequestType:   "TRANSACTION_COMMIT",
+	TransactionRollbackRequestType: "TRANSACTION_ROLLBACK",
+	TransactionCheckRequestType:    "TRANSACTION_CHECK",
 }
 
 // GetRequestTypeName returns the human-readable name for a request type
@@ -146,6 +159,11 @@ const (
 	RaftCmdCommitOffset               = "commit_offset"
 	RaftCmdUpdateSubscription         = "update_subscription"
 	RaftCmdUpdateTopicAssignment      = "update_topic_assignment"
+	RaftCmdStoreHalfMessage        = "store_half_message"
+	RaftCmdUpdateTransactionState  = "update_transaction_state"
+	RaftCmdDeleteHalfMessage       = "delete_half_message"
+	RaftCmdRegisterProducerGroup   = "register_producer_group"
+	RaftCmdUnregisterProducerGroup = "unregister_producer_group"
 )
 
 const (

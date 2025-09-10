@@ -23,7 +23,6 @@ type RaftConfig struct {
 	CompactionOverhead uint64 `yaml:"compaction_overhead"`
 	MaxInMemLogSize    uint64 `yaml:"max_in_mem_log_size"`
 
-	ControllerGroupID      uint64 `yaml:"controller_group_id"`
 	ControllerSnapshotFreq uint64 `yaml:"controller_snapshot_freq"`
 
 	NodeID    uint64 `yaml:"node_id"`
@@ -67,7 +66,6 @@ func NewRaftManager(raftConfig *RaftConfig, dataDir string) (*RaftManager, error
 			SnapshotEntries:        10000,
 			CompactionOverhead:     5000,
 			MaxInMemLogSize:        67108864,
-			ControllerGroupID:      1,
 			ControllerSnapshotFreq: 1000,
 			NodeID:                 1,
 			RaftAddr:               "localhost:63001",
@@ -148,7 +146,7 @@ func (rm *RaftManager) StartRaftGroup(groupID uint64, members map[uint64]string,
 		GroupID:      groupID,
 		Members:      members,
 		StateMachine: sm,
-		IsController: groupID == rm.config.ControllerGroupID,
+		IsController: groupID == 1,
 	}
 
 	log.Printf("Raft group %d started successfully", groupID)
@@ -224,8 +222,7 @@ func (rm *RaftManager) GetLeaderID(groupID uint64) (uint64, bool, error) {
 	}
 
 	return leaderID, valid, nil
-} 
-
+}
 
 // IsLeader checks if the current node is the leader of the specified group
 func (rm *RaftManager) IsLeader(groupID uint64) bool {

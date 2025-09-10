@@ -37,9 +37,8 @@ func main() {
 		RaftConfig: &raft.RaftConfig{
 			NodeID:             hashedNodeID,
 			RaftAddr:           *raftAddr,
-			ControllerGroupID:  1, // Fixed controller group ID
 			HeartbeatRTT:       5,
-			ElectionRTT:        50, // Must be >= 10 * HeartbeatRTT
+			ElectionRTT:        50, 
 			CheckQuorum:        true,
 			SnapshotEntries:    10000,
 			CompactionOverhead: 5000,

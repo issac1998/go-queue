@@ -22,7 +22,6 @@ func TestNewBroker(t *testing.T) {
 			SnapshotEntries:    10000,
 			CompactionOverhead: 5000,
 			MaxInMemLogSize:    67108864,
-			ControllerGroupID:  1,
 		},
 		Discovery: &discovery.DiscoveryConfig{
 			Type:    "memory",
@@ -62,7 +61,6 @@ func TestBrokerStartStop(t *testing.T) {
 			SnapshotEntries:    10000,
 			CompactionOverhead: 5000,
 			MaxInMemLogSize:    67108864,
-			ControllerGroupID:  1,
 		},
 		Discovery: &discovery.DiscoveryConfig{
 			Type:    "memory",

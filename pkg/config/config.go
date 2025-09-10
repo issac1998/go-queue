@@ -97,7 +97,6 @@ func setDefaults(config *broker.BrokerConfig) {
 			SnapshotEntries:        10000,
 			CompactionOverhead:     5000,
 			MaxInMemLogSize:        67108864, // 64MB
-			ControllerGroupID:      1,
 			ControllerSnapshotFreq: 1000,
 		}
 	}

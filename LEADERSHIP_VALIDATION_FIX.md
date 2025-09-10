@@ -12,7 +12,7 @@ func (cm *ControllerManager) IsLeaderWithValidation() bool {
     }
 
     // Double-check with Raft system to avoid stale leadership state
-    return cm.broker.raftManager.IsLeader(cm.broker.Config.RaftConfig.ControllerGroupID)
+    return cm.broker.raftManager.IsLeader(raft.ControllerGroupID )
 }
 ```
 
