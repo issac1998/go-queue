@@ -101,6 +101,7 @@ func TestBuildProduceRequest(t *testing.T) {
 	}
 }
 
+
 func TestParseProduceResponse(t *testing.T) {
 	client := NewClient(ClientConfig{})
 	producer := NewProducer(client)

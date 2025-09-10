@@ -11,6 +11,7 @@ import (
 	"github.com/issac1998/go-queue/internal/deduplication"
 	"github.com/issac1998/go-queue/internal/discovery"
 	"github.com/issac1998/go-queue/internal/raft"
+	"github.com/issac1998/go-queue/internal/transaction"
 	"github.com/lni/dragonboat/v3"
 )
 
@@ -29,6 +30,10 @@ type Broker struct {
 
 	// Consumer Group management
 	ConsumerGroupManager *ConsumerGroupManager
+
+	// Transaction management
+	TransactionManager *transaction.TransactionManager
+	TransactionChecker *TransactionChecker
 
 	// Client service
 	ClientServer *ClientServer
@@ -166,7 +171,12 @@ func (b *Broker) Start() error {
 		return fmt.Errorf("consumer group manager init failed: %v", err)
 	}
 
-	// 8. Start client server
+	// 8. Initialize Transaction Manager
+	if err := b.initTransactionManager(); err != nil {
+		return fmt.Errorf("transaction manager init failed: %v", err)
+	}
+
+	// 9. Start client server
 	if err := b.startClientServer(); err != nil {
 		return fmt.Errorf("client server start failed: %v", err)
 	}
@@ -321,13 +331,31 @@ func (b *Broker) initController() error {
 	return nil
 }
 
-// initConsumerGroupManager initializes the ConsumerGroupManager
+// initConsumerGroupManager initializes the consumer group manager
 func (b *Broker) initConsumerGroupManager() error {
-	log.Printf("Initializing Consumer Group Manager...")
-
 	b.ConsumerGroupManager = NewConsumerGroupManager(b)
+	log.Printf("Consumer Group Manager initialized")
+	return nil
+}
 
-	log.Printf("Consumer Group Manager initialized successfully")
+// initTransactionManager initializes the transaction manager
+func (b *Broker) initTransactionManager() error {
+	b.TransactionChecker = NewTransactionChecker(b)
+	b.TransactionManager = transaction.NewTransactionManager()
+
+	if b.raftManager != nil {
+		groupID := raft.TransactionManagerGroupID
+
+		raftProposer := NewBrokerRaftProposer(b.raftManager)
+
+		b.TransactionManager.EnableRaft(raftProposer, groupID)
+
+		if err := b.startTransactionRaftGroup(groupID); err != nil {
+			log.Printf("Warning: Failed to start transaction Raft group: %v", err)
+		}
+	}
+
+	log.Printf("Transaction Manager and Checker initialized")
 	return nil
 }
 

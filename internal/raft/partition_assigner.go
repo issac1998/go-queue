@@ -577,7 +577,6 @@ func (pa *PartitionAssigner) calculateBrokerLoads(
 ) map[string]float64 {
 	loads := make(map[string]float64)
 
-	// Initialize with base load from metrics
 	for _, broker := range brokers {
 		if broker.LoadMetrics != nil {
 			cpuWeight := 0.3

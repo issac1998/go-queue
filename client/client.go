@@ -27,15 +27,15 @@ type Client struct {
 }
 
 var metadataRequestTypes = map[int32]bool{
-	protocol.CreateTopicRequestType:        true,
-	protocol.ListTopicsRequestType:         true,
-	protocol.DeleteTopicRequestType:        true,
-	protocol.GetTopicInfoRequestType:       true,
-	protocol.JoinGroupRequestType:          true,
-	protocol.LeaveGroupRequestType:         true,
-	protocol.ListGroupsRequestType:         true,
-	protocol.DescribeGroupRequestType:      true,
-	protocol.DescribeTopicRequestType:      true,
+	protocol.CreateTopicRequestType:   true,
+	protocol.ListTopicsRequestType:    true,
+	protocol.DeleteTopicRequestType:   true,
+	protocol.GetTopicInfoRequestType:  true,
+	protocol.JoinGroupRequestType:     true,
+	protocol.LeaveGroupRequestType:    true,
+	protocol.ListGroupsRequestType:    true,
+	protocol.DescribeGroupRequestType: true,
+
 	protocol.ControllerDiscoverRequestType: true,
 	protocol.ControllerVerifyRequestType:   true,
 	protocol.GetTopicMetadataRequestType:   true,

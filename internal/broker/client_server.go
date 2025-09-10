@@ -62,6 +62,9 @@ var requestConfigs = map[int32]RequestConfig{
 	protocol.CommitOffsetRequestType:            {Type: MetadataWriteRequest, Handler: &CommitOffsetHandler{}},
 	protocol.FetchOffsetRequestType:             {Type: MetadataReadRequest, Handler: &FetchOffsetHandler{}},
 	protocol.FetchAssignmentRequestType:         {Type: MetadataReadRequest, Handler: &FetchAssignmentHandler{}},
+	protocol.TransactionPrepareRequestType:      {Type: DataRequest, Handler: &TransactionPrepareHandler{}},
+	protocol.TransactionCommitRequestType:       {Type: DataRequest, Handler: &TransactionCommitHandler{}},
+	protocol.TransactionRollbackRequestType:     {Type: DataRequest, Handler: &TransactionRollbackHandler{}},
 }
 
 // NewClientServer creates a new ClientServer
@@ -162,7 +165,7 @@ func (cs *ClientServer) handleRequestByType(conn net.Conn, requestType int32, co
 }
 
 func (cs *ClientServer) isLeader() bool {
-	leaderID, exists, _ := cs.broker.raftManager.GetLeaderID(cs.broker.Config.RaftConfig.ControllerGroupID)
+	leaderID, exists, _ := cs.broker.raftManager.GetLeaderID(raft.ControllerGroupID)
 	if exists && leaderID == cs.broker.Controller.brokerIDToNodeID(cs.broker.ID) {
 		return true
 	}
@@ -214,9 +217,7 @@ func (cs *ClientServer) ensureReadIndexConsistency() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	groupID := cs.broker.Config.RaftConfig.ControllerGroupID
-
-	_, err := cs.broker.raftManager.EnsureReadIndexConsistency(ctx, groupID)
+	_, err := cs.broker.raftManager.EnsureReadIndexConsistency(ctx, raft.ControllerGroupID)
 	if err != nil {
 		return fmt.Errorf("failed to ensure read index consistency: %v", err)
 	}

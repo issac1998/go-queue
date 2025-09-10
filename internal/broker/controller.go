@@ -130,7 +130,7 @@ func (cm *ControllerManager) Stop() error {
 	cm.wg.Wait()
 
 	if cm.broker.raftManager != nil {
-		if err := cm.broker.raftManager.StopRaftGroup(cm.broker.Config.RaftConfig.ControllerGroupID); err != nil {
+		if err := cm.broker.raftManager.StopRaftGroup(raft.ControllerGroupID); err != nil {
 			log.Printf("Error stopping controller raft group: %v", err)
 		}
 	}
@@ -162,7 +162,7 @@ func (cm *ControllerManager) initControllerRaftGroup() error {
 	isFirstNode := len(brokers) <= 1
 
 	err = cm.broker.raftManager.StartRaftGroup(
-		cm.broker.Config.RaftConfig.ControllerGroupID,
+		raft.ControllerGroupID,
 		members,
 		cm.stateMachine,
 		!isFirstNode,
@@ -175,7 +175,7 @@ func (cm *ControllerManager) initControllerRaftGroup() error {
 		return fmt.Errorf("controller raft group not ready: %v", err)
 	}
 
-	if cm.broker.raftManager.IsLeader(cm.broker.Config.RaftConfig.ControllerGroupID) {
+	if cm.broker.raftManager.IsLeader(raft.ControllerGroupID) {
 		go cm.StartLeaderTasks()
 	}
 
@@ -187,7 +187,7 @@ func (cm *ControllerManager) initControllerRaftGroup() error {
 // waitForControllerReady waits for the controller to be ready
 func (cm *ControllerManager) waitForControllerReady(timeout time.Duration) error {
 	return cm.broker.raftManager.WaitForLeadershipReady(
-		cm.broker.Config.RaftConfig.ControllerGroupID,
+		raft.ControllerGroupID,
 		timeout,
 	)
 }
@@ -212,7 +212,7 @@ func (cm *ControllerManager) monitorLeadership() {
 		case <-cm.ctx.Done():
 			return
 		case <-ticker.C:
-			isLeader := cm.broker.raftManager.IsLeader(cm.broker.Config.RaftConfig.ControllerGroupID)
+			isLeader := cm.broker.raftManager.IsLeader(raft.ControllerGroupID)
 			if isLeader != wasLeader {
 				if isLeader {
 					go cm.StartLeaderTasks()
@@ -254,7 +254,7 @@ func (cm *ControllerManager) StopLeaderTasks() {
 
 // IsLeader returns whether this broker is the Controller leader
 func (cm *ControllerManager) isLeader() bool {
-	leaderID, exists, _ := cm.broker.raftManager.GetLeaderID(cm.broker.Config.RaftConfig.ControllerGroupID)
+	leaderID, exists, _ := cm.broker.raftManager.GetLeaderID(raft.ControllerGroupID)
 	nodeID := cm.brokerIDToNodeID(cm.broker.ID)
 	if exists && leaderID == nodeID {
 		return true
@@ -289,7 +289,7 @@ func (cm *ControllerManager) executeRaftCommand(cmd *raft.ControllerCommand) err
 
 	_, err = cm.broker.raftManager.SyncPropose(
 		ctx,
-		cm.broker.Config.RaftConfig.ControllerGroupID,
+		raft.ControllerGroupID,
 		data,
 	)
 
@@ -303,7 +303,7 @@ func (cm *ControllerManager) ExecuteCommand(cmd *raft.ControllerCommand) error {
 
 // GetControlledLeaderID returns the current Controller leader NodeID and whether it exists
 func (cm *ControllerManager) GetControlledLeaderID() (uint64, bool) {
-	leaderNodeID, valid, _ := cm.broker.raftManager.GetLeaderID(cm.broker.Config.RaftConfig.ControllerGroupID)
+	leaderNodeID, valid, _ := cm.broker.raftManager.GetLeaderID(raft.ControllerGroupID)
 	if !valid {
 		return 0, false
 	}
@@ -330,7 +330,7 @@ func (cm *ControllerManager) QueryMetadata(queryType string, params map[string]i
 	//TODO: Should We use sync Read, or just read it from stateMachine?
 	result, err := cm.broker.raftManager.SyncRead(
 		ctx,
-		cm.broker.Config.RaftConfig.ControllerGroupID,
+		raft.ControllerGroupID,
 		queryData,
 	)
 	if err != nil {

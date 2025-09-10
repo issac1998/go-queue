@@ -14,7 +14,6 @@ go.work.sum
 /build/
 /dist/
 broker
-client
 go-queue
 quick_start_create_topic
 simple_test
@@ -39,7 +38,6 @@ log.*
 .idea/
 *.swp
 *.swo
-*~
 .DS_Store
 Thumbs.db
 
