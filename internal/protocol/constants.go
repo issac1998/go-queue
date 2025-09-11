@@ -31,6 +31,7 @@ const (
 	TransactionCommitRequestType   int32 = 19
 	TransactionRollbackRequestType int32 = 20
 	TransactionCheckRequestType    int32 = 21
+	OrderedProduceRequestType      int32 = 22
 
 	// Group management request types
 	ListGroupsRequestType    int32 = 30
@@ -106,6 +107,7 @@ var RequestTypeNames = map[int32]string{
 	TransactionCommitRequestType:   "TRANSACTION_COMMIT",
 	TransactionRollbackRequestType: "TRANSACTION_ROLLBACK",
 	TransactionCheckRequestType:    "TRANSACTION_CHECK",
+	OrderedProduceRequestType:      "ORDERED_PRODUCE",
 }
 
 // GetRequestTypeName returns the human-readable name for a request type
@@ -159,11 +161,11 @@ const (
 	RaftCmdCommitOffset               = "commit_offset"
 	RaftCmdUpdateSubscription         = "update_subscription"
 	RaftCmdUpdateTopicAssignment      = "update_topic_assignment"
-	RaftCmdStoreHalfMessage        = "store_half_message"
-	RaftCmdUpdateTransactionState  = "update_transaction_state"
-	RaftCmdDeleteHalfMessage       = "delete_half_message"
-	RaftCmdRegisterProducerGroup   = "register_producer_group"
-	RaftCmdUnregisterProducerGroup = "unregister_producer_group"
+	RaftCmdStoreHalfMessage           = "store_half_message"
+	RaftCmdUpdateTransactionState     = "update_transaction_state"
+	RaftCmdDeleteHalfMessage          = "delete_half_message"
+	RaftCmdRegisterProducerGroup      = "register_producer_group"
+	RaftCmdUnregisterProducerGroup    = "unregister_producer_group"
 )
 
 const (
