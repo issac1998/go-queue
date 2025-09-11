@@ -101,7 +101,6 @@ func TestBuildProduceRequest(t *testing.T) {
 	}
 }
 
-
 func TestParseProduceResponse(t *testing.T) {
 	client := NewClient(ClientConfig{})
 	producer := NewProducer(client)
@@ -139,7 +138,6 @@ func TestParseProduceResponse(t *testing.T) {
 		t.Errorf("expected no error, got %v", result.Error)
 	}
 }
-
 
 func TestProducerBatchValidation(t *testing.T) {
 	config := ClientConfig{

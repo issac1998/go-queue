@@ -57,7 +57,11 @@ type Broker struct {
 
 	compressor   compression.Compressor
 	deduplicator *deduplication.Deduplicator
-	mu           sync.RWMutex
+
+	// Ordered message routing
+	orderedRouter *OrderedMessageRouter
+
+	mu sync.RWMutex
 }
 
 // BrokerConfig contains all broker configuration
@@ -465,6 +469,10 @@ func (b *Broker) initMessageProcessing() error {
 		b.deduplicator = deduplication.NewDeduplicator(dedupConfig)
 		log.Printf("Deduplication disabled")
 	}
+
+	// Initialize ordered message router
+	b.orderedRouter = NewOrderedMessageRouter()
+	log.Printf("Ordered message router initialized")
 
 	return nil
 }

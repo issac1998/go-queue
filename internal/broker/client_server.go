@@ -65,6 +65,7 @@ var requestConfigs = map[int32]RequestConfig{
 	protocol.TransactionPrepareRequestType:      {Type: DataRequest, Handler: &TransactionPrepareHandler{}},
 	protocol.TransactionCommitRequestType:       {Type: DataRequest, Handler: &TransactionCommitHandler{}},
 	protocol.TransactionRollbackRequestType:     {Type: DataRequest, Handler: &TransactionRollbackHandler{}},
+	protocol.OrderedProduceRequestType:          {Type: DataRequest, Handler: &OrderedProduceHandler{}},
 }
 
 // NewClientServer creates a new ClientServer
