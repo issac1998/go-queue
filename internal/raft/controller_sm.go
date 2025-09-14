@@ -3,6 +3,7 @@ package raft
 import (
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"sync"
@@ -178,7 +179,8 @@ func (csm *ControllerStateMachine) executeCommand(cmd *ControllerCommand) (inter
 		return csm.joinGroup(cmd.Data)
 	case protocol.RaftCmdLeaveGroup:
 		return csm.leaveGroup(cmd.Data)
-
+	case protocol.RaftCmdUpdateBrokerLoad:
+		return csm.updateBrokerLoad(cmd.Data)
 	case protocol.RaftCmdMarkBrokerFailed:
 		return csm.markBrokerFailed(cmd.Data)
 	case protocol.RaftCmdRebalancePartitions:
@@ -188,17 +190,31 @@ func (csm *ControllerStateMachine) executeCommand(cmd *ControllerCommand) (inter
 	}
 }
 
-// registerBroker registers a new broker in the cluster
+// registerBroker registers a new broker in the cluster or updates existing one
 func (csm *ControllerStateMachine) registerBroker(data map[string]interface{}) (interface{}, error) {
 	brokerID := data["broker_id"].(string)
 	address := data["address"].(string)
 	port := int(data["port"].(float64))
 	raftAddress := data["raft_address"].(string)
 
-	if _, exists := csm.metadata.Brokers[brokerID]; exists {
-		return nil, fmt.Errorf("broker %s already exists", brokerID)
+	// Check if broker already exists
+	if existingBroker, exists := csm.metadata.Brokers[brokerID]; exists {
+		// Update existing broker information
+		existingBroker.Address = address
+		existingBroker.Port = port
+		existingBroker.RaftAddress = raftAddress
+		existingBroker.Status = "active"
+		existingBroker.LastSeen = time.Now()
+		if existingBroker.LoadMetrics == nil {
+			existingBroker.LoadMetrics = &LoadMetrics{
+				LastUpdated: time.Now(),
+			}
+		}
+		log.Printf("Updated existing broker %s at %s:%d", brokerID, address, port)
+		return existingBroker, nil
 	}
 
+	// Create new broker
 	broker := &BrokerInfo{
 		ID:          brokerID,
 		Address:     address,
@@ -213,7 +229,7 @@ func (csm *ControllerStateMachine) registerBroker(data map[string]interface{}) (
 
 	csm.metadata.Brokers[brokerID] = broker
 
-	log.Printf("Registered broker %s at %s:%d", brokerID, address, port)
+	log.Printf("Registered new broker %s at %s:%d", brokerID, address, port)
 	return broker, nil
 }
 
@@ -533,13 +549,11 @@ func (csm *ControllerStateMachine) executeRaftLeaderTransfer(assignment *Partiti
 	}, nil
 }
 
-// brokerIDToNodeID converts broker ID to node ID using the same logic as PartitionAssigner
+// brokerIDToNodeID converts broker ID to node ID using consistent conversion
 func (csm *ControllerStateMachine) brokerIDToNodeID(brokerID string) uint64 {
-	hash := uint64(0)
-	for _, b := range []byte(brokerID) {
-		hash = hash*31 + uint64(b)
-	}
-	return hash
+	h := fnv.New64a()
+	h.Write([]byte(brokerID))
+	return h.Sum64()
 }
 
 func (csm *ControllerStateMachine) updatePartitionAssignment(data map[string]interface{}) (interface{}, error) {

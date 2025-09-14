@@ -68,20 +68,19 @@ func TestConstants(t *testing.T) {
 	}
 
 	expectedRequestTypes := map[string]int32{
-		"PRODUCE":        0,
-		"FETCH":          1,
-		"CREATE_TOPIC":   2,
+		"PRODUCE":        1,
+		"FETCH":          2,
 		"LIST_TOPICS":    3,
-		"DELETE_TOPIC":   4,
-		"JOIN_GROUP":     5,
-		"LEAVE_GROUP":    6,
-		"HEARTBEAT":      7,
-		"COMMIT_OFFSET":  8,
-		"FETCH_OFFSET":   9,
-		"DESCRIBE_TOPIC": 10,
-		"GET_TOPIC_INFO": 12,
-		"LIST_GROUPS":    20,
-		"DESCRIBE_GROUP": 21,
+		"CREATE_TOPIC":   4,
+		"DELETE_TOPIC":   5,
+		"JOIN_GROUP":     10,
+		"LEAVE_GROUP":    11,
+		"HEARTBEAT":      12,
+		"COMMIT_OFFSET":  13,
+		"FETCH_OFFSET":   14,
+		"GET_TOPIC_INFO": 15,
+		"LIST_GROUPS":    30,
+		"DESCRIBE_GROUP": 31,
 	}
 
 	for name, expectedValue := range expectedRequestTypes {
@@ -98,13 +97,16 @@ func TestConstants(t *testing.T) {
 		"INVALID_TOPIC":        2,
 		"UNKNOWN_PARTITION":    3,
 		"INVALID_MESSAGE":      4,
-		"MESSAGE_TOO_LARGE":    5,
-		"OFFSET_OUT_OF_RANGE":  6,
-		"BROKER_NOT_AVAILABLE": 100,
-		"FETCH_FAILED":         101,
-		"PRODUCE_FAILED":       102,
-		"UNAUTHORIZED":         200,
-		"QUOTA_EXCEEDED":       201,
+		"TOPIC_ALREADY_EXISTS": 5,
+		"TOPIC_NOT_FOUND":      6,
+		"PARTITION_NOT_FOUND":  7,
+		"INVALID_OFFSET":       8,
+		"GROUP_NOT_FOUND":      9,
+		"BROKER_NOT_AVAILABLE": 10,
+		"FETCH_FAILED":         11,
+		"PRODUCE_FAILED":       12,
+		"UNAUTHORIZED":         20,
+		"QUOTA_EXCEEDED":       21,
 	}
 
 	for name, expectedValue := range expectedErrorCodes {

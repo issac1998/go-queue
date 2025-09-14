@@ -1,10 +1,13 @@
 package main
 
 import (
+	"context"
 	"flag"
+	"hash/fnv"
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/issac1998/go-queue/internal/broker"
@@ -18,6 +21,8 @@ func main() {
 	bindPort := flag.Int("bind-port", 9092, "Bind port")
 	dataDir := flag.String("data-dir", "./data", "Data directory")
 	raftAddr := flag.String("raft-addr", "", "Raft communication address")
+	discoveryType := flag.String("discovery-type", "memory", "Discovery type (etcd, memory)")
+	discoveryEndpoints := flag.String("discovery-endpoints", "", "Discovery endpoints (comma-separated)")
 	enableFollowerRead := flag.Bool("enable-follower-read", false, "Enable follower read on this broker")
 	flag.Parse()
 
@@ -37,13 +42,17 @@ func main() {
 		RaftConfig: &raft.RaftConfig{
 			NodeID:             hashedNodeID,
 			RaftAddr:           *raftAddr,
+			RTTMillisecond:     200,
 			HeartbeatRTT:       5,
-			ElectionRTT:        50, 
+			ElectionRTT:        15,
 			CheckQuorum:        true,
 			SnapshotEntries:    10000,
 			CompactionOverhead: 5000,
 		},
-		Discovery: &discovery.DiscoveryConfig{},
+		Discovery: &discovery.DiscoveryConfig{
+			Type:      *discoveryType,
+			Endpoints: parseEndpoints(*discoveryEndpoints),
+		},
 		Performance: &broker.PerformanceConfig{
 			MaxBatchSize:       1000,
 			MaxBatchBytes:      1024 * 1024, // 1MB
@@ -51,13 +60,15 @@ func main() {
 		},
 		EnableFollowerRead: *enableFollowerRead, // Set follower read configuration
 	}
-
+	ctx, cancel := context.WithCancel(context.Background())
 	// Create and start broker
 	b := &broker.Broker{
 		ID:      config.NodeID,
 		Address: config.BindAddr,
 		Port:    config.BindPort,
 		Config:  config,
+		Ctx:     ctx,
+		Cancel:  cancel,
 	}
 
 	log.Printf("Starting Multi-Raft Message Queue Broker %s...", b.ID)
@@ -81,11 +92,17 @@ func main() {
 	log.Printf("Broker %s shutdown complete", b.ID)
 }
 
+// parseEndpoints parses comma-separated endpoints string
+func parseEndpoints(endpoints string) []string {
+	if endpoints == "" {
+		return nil
+	}
+	return strings.Split(endpoints, ",")
+}
+
 // hashBrokerID converts a broker ID string to a uint64 node ID
 func hashBrokerID(brokerID string) uint64 {
-	hash := uint64(0)
-	for _, b := range []byte(brokerID) {
-		hash = hash*31 + uint64(b)
-	}
-	return hash
+	h := fnv.New64a()
+	h.Write([]byte(brokerID))
+	return h.Sum64()
 }

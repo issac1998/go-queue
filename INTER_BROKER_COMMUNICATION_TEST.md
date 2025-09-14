@@ -221,7 +221,7 @@ func (h *StartPartitionRaftGroupHandler) Handle(conn net.Conn, cs *ClientServer)
 ### 2. 安全性增强
 ```go
 func (cs *ClientServer) handleInterBrokerRequest(conn net.Conn, config RequestConfig) error {
-    // TODO: 添加 Broker 身份验证
+    // TODO: Add Broker authentication
     // 1. 检查 IP 白名单
     // 2. 验证 TLS 证书
     // 3. 检查 Broker ID 匹配
@@ -272,4 +272,4 @@ Inter-Broker 通信的处理在 `client_server.go` 中已经**完整实现**了�
 4. **请求处理** → `StartPartitionRaftGroupHandler` 或 `StopPartitionRaftGroupHandler` 处理具体逻辑
 5. **响应返回** → Handler 发送响应给调用方
 
-整个架构设计得很清晰，通过 Handler 模式实现了良好的解耦和扩展性。🎉 
+整个架构设计得很清晰，通过 Handler 模式实现了良好的解耦和扩展性。🎉

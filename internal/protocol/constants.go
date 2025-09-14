@@ -37,12 +37,12 @@ const (
 	ListGroupsRequestType    int32 = 30
 	DescribeGroupRequestType int32 = 31
 
-	ControllerDiscoverRequestType = 1000
-	ControllerVerifyRequestType   = 1001
+	ControllerDiscoverRequestType int32 = 1000
+	ControllerVerifyRequestType   int32 = 1001
 
-	GetTopicMetadataRequestType        = 1002
-	StartPartitionRaftGroupRequestType = 1003
-	StopPartitionRaftGroupRequestType  = 1004
+	GetTopicMetadataRequestType        int32 = 1002
+	StartPartitionRaftGroupRequestType int32 = 1003
+	StopPartitionRaftGroupRequestType  int32 = 1004
 )
 
 // Error code constants define different types of errors that can occur
@@ -108,6 +108,8 @@ var RequestTypeNames = map[int32]string{
 	TransactionRollbackRequestType: "TRANSACTION_ROLLBACK",
 	TransactionCheckRequestType:    "TRANSACTION_CHECK",
 	OrderedProduceRequestType:      "ORDERED_PRODUCE",
+	ListGroupsRequestType:          "LIST_GROUPS",
+	DescribeGroupRequestType:       "DESCRIBE_GROUP",
 }
 
 // GetRequestTypeName returns the human-readable name for a request type
@@ -161,6 +163,7 @@ const (
 	RaftCmdCommitOffset               = "commit_offset"
 	RaftCmdUpdateSubscription         = "update_subscription"
 	RaftCmdUpdateTopicAssignment      = "update_topic_assignment"
+	RaftCmdUpdateBrokerLoad           = "update_broker_load"
 	RaftCmdStoreHalfMessage           = "store_half_message"
 	RaftCmdUpdateTransactionState     = "update_transaction_state"
 	RaftCmdDeleteHalfMessage          = "delete_half_message"

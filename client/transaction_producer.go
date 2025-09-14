@@ -35,6 +35,8 @@ type Transaction struct {
 	producer      *TransactionProducer
 	producerGroup string
 	prepared      bool
+	topic         string
+	partition     int32
 }
 
 // TransactionResult txn result
@@ -114,6 +116,8 @@ func (t *Transaction) SendHalfMessageAndDoLocal(msg *TransactionMessage) (*Trans
 	}
 
 	t.prepared = true
+	t.topic = msg.Topic
+	t.partition = msg.Partition
 
 	halfMessage := transaction.HalfMessage{
 		TransactionID: t.ID,
@@ -174,16 +178,45 @@ func (t *Transaction) Commit() (*TransactionResult, error) {
 		TransactionID: t.ID,
 	}
 
-	// 这里简化处理，实际应该连接到原来的分区 Leader
-	// TODO: 改进连接逻辑
 	requestData, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal commit request: %w", err)
 	}
 
-	responseData, err := t.producer.client.sendMetaRequest(protocol.TransactionCommitRequestType, requestData)
+	// Connect to partition leader for data operation
+	conn, err := t.producer.client.connectForDataOperation(t.topic, t.partition, true)
 	if err != nil {
-		return nil, fmt.Errorf("failed to send commit request: %w", err)
+		return nil, fmt.Errorf("failed to connect for transaction commit: %w", err)
+	}
+	defer conn.Close()
+
+	conn.SetDeadline(time.Now().Add(t.producer.client.timeout))
+
+	// Send request type
+	if err := binary.Write(conn, binary.BigEndian, protocol.TransactionCommitRequestType); err != nil {
+		return nil, fmt.Errorf("failed to write request type: %w", err)
+	}
+
+	// Send request length
+	if err := binary.Write(conn, binary.BigEndian, int32(len(requestData))); err != nil {
+		return nil, fmt.Errorf("failed to write request length: %w", err)
+	}
+
+	// Send request data
+	if _, err := conn.Write(requestData); err != nil {
+		return nil, fmt.Errorf("failed to write request data: %w", err)
+	}
+
+	// Read response length
+	var responseLen int32
+	if err := binary.Read(conn, binary.BigEndian, &responseLen); err != nil {
+		return nil, fmt.Errorf("failed to read response length: %w", err)
+	}
+
+	// Read response data
+	responseData := make([]byte, responseLen)
+	if _, err := io.ReadFull(conn, responseData); err != nil {
+		return nil, fmt.Errorf("failed to read response data: %w", err)
 	}
 
 	var response transaction.TransactionCommitResponse
@@ -196,13 +229,13 @@ func (t *Transaction) Commit() (*TransactionResult, error) {
 	}
 
 	return &TransactionResult{
-		TransactionID: t.ID,
+		TransactionID: response.TransactionID,
 		Offset:        response.Offset,
 		Timestamp:     response.Timestamp,
 	}, nil
 }
 
-// Rollback 回滚事务
+// Rollback rollback transaction
 func (t *Transaction) Rollback() error {
 	if !t.prepared {
 		return fmt.Errorf("transaction not prepared")
@@ -217,9 +250,40 @@ func (t *Transaction) Rollback() error {
 		return fmt.Errorf("failed to marshal rollback request: %w", err)
 	}
 
-	responseData, err := t.producer.client.sendMetaRequest(protocol.TransactionRollbackRequestType, requestData)
+	// Connect to partition leader for data operation
+	conn, err := t.producer.client.connectForDataOperation(t.topic, t.partition, true)
 	if err != nil {
-		return fmt.Errorf("failed to send rollback request: %w", err)
+		return fmt.Errorf("failed to connect for transaction rollback: %w", err)
+	}
+	defer conn.Close()
+
+	conn.SetDeadline(time.Now().Add(t.producer.client.timeout))
+
+	// Send request type
+	if err := binary.Write(conn, binary.BigEndian, protocol.TransactionRollbackRequestType); err != nil {
+		return fmt.Errorf("failed to write request type: %w", err)
+	}
+
+	// Send request length
+	if err := binary.Write(conn, binary.BigEndian, int32(len(requestData))); err != nil {
+		return fmt.Errorf("failed to write request length: %w", err)
+	}
+
+	// Send request data
+	if _, err := conn.Write(requestData); err != nil {
+		return fmt.Errorf("failed to write request data: %w", err)
+	}
+
+	// Read response length
+	var responseLen int32
+	if err := binary.Read(conn, binary.BigEndian, &responseLen); err != nil {
+		return fmt.Errorf("failed to read response length: %w", err)
+	}
+
+	// Read response data
+	responseData := make([]byte, responseLen)
+	if _, err := io.ReadFull(conn, responseData); err != nil {
+		return fmt.Errorf("failed to read response data: %w", err)
 	}
 
 	var response transaction.TransactionRollbackResponse
@@ -237,7 +301,7 @@ func (t *Transaction) Rollback() error {
 func (tp *TransactionProducer) generateTransactionID() transaction.TransactionID {
 	timestamp := time.Now().UnixNano()
 	randomBytes := make([]byte, 8)
-	// TODO: how to generate a unique id？
+	// TODO: How to generate a unique ID?
 	rand.Read(randomBytes)
 
 	id := fmt.Sprintf("txn_%d_%s", timestamp, hex.EncodeToString(randomBytes))

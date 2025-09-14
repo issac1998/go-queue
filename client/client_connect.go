@@ -48,14 +48,22 @@ func (c *Client) connectToController() (net.Conn, error) {
 // TODO:DO we have a better way to verify controller leader?like just send a request to the broker,
 // proxy to controller leader and then return an error to indicate local cache is stale?
 func (c *Client) connectAndVerifyController(brokerAddr string) (net.Conn, error) {
+	// First verify with a separate connection
+	verifyConn, err := net.DialTimeout("tcp", brokerAddr, c.timeout)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to %s for verification: %v", brokerAddr, err)
+	}
+
+	if err := c.verifyControllerLeader(verifyConn); err != nil {
+		verifyConn.Close()
+		return nil, fmt.Errorf("broker %s is not controller leader: %v", brokerAddr, err)
+	}
+	verifyConn.Close()
+
+	// Now create a fresh connection for actual requests
 	conn, err := net.DialTimeout("tcp", brokerAddr, c.timeout)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to %s: %v", brokerAddr, err)
-	}
-
-	if err := c.verifyControllerLeader(conn); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("broker %s is not controller leader: %v", brokerAddr, err)
 	}
 
 	return conn, nil
@@ -68,6 +76,12 @@ func (c *Client) verifyControllerLeader(conn net.Conn) error {
 	requestType := protocol.ControllerVerifyRequestType
 	if err := binary.Write(conn, binary.BigEndian, requestType); err != nil {
 		return fmt.Errorf("failed to send verification request: %v", err)
+	}
+
+	// Send empty data length for protocol consistency
+	dataLength := int32(0)
+	if err := binary.Write(conn, binary.BigEndian, dataLength); err != nil {
+		return fmt.Errorf("failed to send data length: %v", err)
 	}
 
 	var responseLen int32

@@ -221,7 +221,7 @@ func (p *Partition) ReadRange(startOffset int64, maxBytes int32) ([][]byte, int6
 		messageData, err := p.ReadAt(currentOffset)
 		if err != nil {
 			if err == ErrOffsetOutOfRange {
-				break 
+				break
 			}
 			return messages, currentOffset, err
 		}

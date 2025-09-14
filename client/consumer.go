@@ -18,14 +18,16 @@ type Consumer struct {
 	subscribedTopics []string
 	topicOffsets     map[string]map[int32]int64
 	mu               sync.RWMutex
+	asyncEnabled     bool
 }
 
-// NewConsumer creates a new consumer
+// NewConsumer creates a new consumer instance
 func NewConsumer(client *Client) *Consumer {
 	return &Consumer{
 		client:           client,
 		subscribedTopics: make([]string, 0),
 		topicOffsets:     make(map[string]map[int32]int64),
+		asyncEnabled:     client.config.EnableAsyncIO,
 	}
 }
 
@@ -259,6 +261,7 @@ func (c *Consumer) parseFetchResponse(topic string, partition int32, requestOffs
 
 // fetchFromPartition fetches messages directly from the partition leader or follower
 func (c *Consumer) fetchFromPartition(req FetchRequest) (*FetchResult, error) {
+	// Always use synchronous mode
 	conn, err := c.client.connectForDataOperation(req.Topic, req.Partition, false)
 	if err != nil {
 		// TODO: only do refresh if it's a follower error
@@ -277,6 +280,10 @@ func (c *Consumer) fetchFromPartition(req FetchRequest) (*FetchResult, error) {
 	requestType := protocol.FetchRequestType
 	if err := binary.Write(conn, binary.BigEndian, requestType); err != nil {
 		return nil, fmt.Errorf("failed to send request type: %v", err)
+	}
+
+	if err := binary.Write(conn, binary.BigEndian, int32(len(requestData))); err != nil {
+		return nil, fmt.Errorf("failed to send data length: %v", err)
 	}
 
 	if _, err := conn.Write(requestData); err != nil {
@@ -321,6 +328,11 @@ func (c *Consumer) batchFetchFromPartition(req BatchFetchRequest) (*BatchFetchRe
 	requestType := protocol.BatchFetchRequestType
 	if err := binary.Write(conn, binary.BigEndian, requestType); err != nil {
 		return nil, fmt.Errorf("failed to send request type: %v", err)
+	}
+
+	// Send data length first, then the actual data
+	if err := binary.Write(conn, binary.BigEndian, int32(len(requestData))); err != nil {
+		return nil, fmt.Errorf("failed to send data length: %v", err)
 	}
 
 	if _, err := conn.Write(requestData); err != nil {
@@ -615,6 +627,5 @@ func (c *Consumer) Seek(topic string, partition int32, offset int64) error {
 		c.topicOffsets[topic] = make(map[int32]int64)
 	}
 	c.topicOffsets[topic][partition] = offset
-
 	return nil
 }

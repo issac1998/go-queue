@@ -1,5 +1,5 @@
 {
-  "broker_addrs": ["localhost:9092"],
+  "broker_addrs": ["localhost:9092", "localhost:9093"],
   "timeout": "10s",
   "log_file": "logs/client.log",
   "command": {
@@ -10,4 +10,4 @@
     "offset": 0,
     "count": 1
   }
-} 
+}

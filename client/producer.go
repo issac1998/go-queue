@@ -8,6 +8,7 @@ import (
 	"hash/fnv"
 	"io"
 	"math/big"
+	"net"
 	"time"
 
 	"github.com/issac1998/go-queue/internal/protocol"
@@ -91,19 +92,27 @@ func (p *Producer) SendBatch(messages []ProduceMessage) (*ProduceResult, error) 
 	}
 
 	topic := messages[0].Topic
+	partition := messages[0].Partition
+
 	for _, msg := range messages {
 		if msg.Topic != topic {
 			return nil, fmt.Errorf("batch messages must belong to the same topic")
 		}
+		if msg.Partition != partition {
+			return nil, fmt.Errorf("batch messages must belong to the same topic and partition")
+		}
 	}
 
-	partition, err := p.selectPartition(&messages[0])
-	if err != nil {
-		return nil, fmt.Errorf("failed to select partition: %v", err)
-	}
+	if partition <= 0 {
+		var err error
+		partition, err = p.selectPartition(&messages[0])
+		if err != nil {
+			return nil, fmt.Errorf("failed to select partition: %v", err)
+		}
 
-	for i := range messages {
-		messages[i].Partition = partition
+		for i := range messages {
+			messages[i].Partition = partition
+		}
 	}
 
 	return p.sendToPartitionLeader(topic, partition, messages)
@@ -195,23 +204,107 @@ func (hp *HashPartitioner) Partition(message *ProduceMessage, numPartitions int3
 
 // sendToPartitionLeader sends messages directly to the partition leader
 func (p *Producer) sendToPartitionLeader(topic string, partition int32, messages []ProduceMessage) (*ProduceResult, error) {
-	conn, err := p.client.connectForDataOperation(topic, partition, true)
+	metadata, err := p.client.getTopicMetadata(topic)
 	if err != nil {
-		p.client.refreshTopicMetadata(topic)
-		return nil, fmt.Errorf("failed to connect to partition leader: %v", err)
+		return nil, fmt.Errorf("failed to get topic metadata: %v", err)
 	}
-	defer conn.Close()
 
-	conn.SetDeadline(time.Now().Add(p.client.timeout))
+	partitionMeta, exists := metadata.Partitions[partition]
+	if !exists {
+		return nil, fmt.Errorf("partition %d not found for topic %s", partition, topic)
+	}
 
 	requestData, err := p.buildProduceRequest(topic, partition, messages)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build request: %v", err)
 	}
 
+	var result *ProduceResult
+	if p.client.config.EnableConnectionPool && p.client.connectionPool != nil {
+		result, err = p.sendWithConnectionPool(partitionMeta.Leader, requestData)
+	} else {
+		result, err = p.sendWithDirectConnection(partitionMeta.Leader, requestData)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	result.Topic = topic
+	result.Partition = partition
+	return result, nil
+}
+
+func (p *Producer) sendWithConnectionPool(brokerAddr string, requestData []byte) (*ProduceResult, error) {
+	if p.client.config.EnableAsyncIO && p.client.asyncIO != nil {
+		return p.sendWithAsyncConnection(brokerAddr, requestData)
+	}
+
+	conn, err := p.client.connectionPool.GetConnection(brokerAddr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get connection from pool: %v", err)
+	}
+	defer conn.Return()
+
+	return p.sendSynchronously(conn, requestData)
+}
+
+func (p *Producer) sendWithAsyncConnection(brokerAddr string, requestData []byte) (*ProduceResult, error) {
+	// Use the generic async request function
+	handler := func(responseData []byte) (interface{}, error) {
+		return p.parseProduceResponse(responseData)
+	}
+
+	callback := func(result interface{}, err error) {
+		if err != nil {
+			// TODO:保存错误信息，类似死信队列
+			// 需要记录requestData,topic,partition
+			return
+		}
+	}
+
+	err := p.client.AsyncRequestWithCallback(brokerAddr, protocol.ProduceRequestType, requestData, handler, callback)
+	if err != nil {
+		return p.sendWithConnectionPoolFallback(brokerAddr, requestData)
+	}
+	// 返回空值
+	return &ProduceResult{}, nil
+}
+
+func (p *Producer) sendWithConnectionPoolFallback(brokerAddr string, requestData []byte) (*ProduceResult, error) {
+	if p.client.connectionPool == nil {
+		return nil, fmt.Errorf("no connection pool available for fallback")
+	}
+
+	conn, err := p.client.connectionPool.GetConnection(brokerAddr)
+	if err != nil {
+		return nil, fmt.Errorf("fallback connection pool failed: %v", err)
+	}
+	defer conn.Return()
+
+	return p.sendSynchronously(conn, requestData)
+}
+
+func (p *Producer) sendWithDirectConnection(brokerAddr string, requestData []byte) (*ProduceResult, error) {
+	conn, err := protocol.ConnectToSpecificBroker(brokerAddr, p.client.timeout)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to broker: %v", err)
+	}
+	defer conn.Close()
+
+	return p.sendSynchronously(conn, requestData)
+}
+
+func (p *Producer) sendSynchronously(conn net.Conn, requestData []byte) (*ProduceResult, error) {
+	conn.SetDeadline(time.Now().Add(p.client.timeout))
+
 	requestType := protocol.ProduceRequestType
 	if err := binary.Write(conn, binary.BigEndian, requestType); err != nil {
 		return nil, fmt.Errorf("failed to send request type: %v", err)
+	}
+
+	// Send data length first, then the actual data
+	if err := binary.Write(conn, binary.BigEndian, int32(len(requestData))); err != nil {
+		return nil, fmt.Errorf("failed to send data length: %v", err)
 	}
 
 	if _, err := conn.Write(requestData); err != nil {
@@ -228,14 +321,72 @@ func (p *Producer) sendToPartitionLeader(topic string, partition int32, messages
 		return nil, fmt.Errorf("failed to read response data: %v", err)
 	}
 
-	// TODO: refreshMetadata if it's a follower error
+	return p.parseProduceResponse(responseData)
+}
 
-	result, err := p.parseProduceResponse(topic, partition, responseData)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse response: %v", err)
+// sendWithAsyncIO 使用异步IO发送数据
+func (p *Producer) sendWithAsyncIO(conn net.Conn, requestData []byte) (*ProduceResult, error) {
+	// 设置超时
+	conn.SetDeadline(time.Now().Add(p.client.timeout))
+
+	// 准备完整请求数据: requestType + dataLength + requestData
+	requestType := protocol.ProduceRequestType
+	fullRequest := make([]byte, 4+4+len(requestData))
+	binary.BigEndian.PutUint32(fullRequest[:4], uint32(requestType))
+	binary.BigEndian.PutUint32(fullRequest[4:8], uint32(len(requestData)))
+	copy(fullRequest[8:], requestData)
+
+	// 创建结果通道
+	resultChan := make(chan *ProduceResult, 1)
+	errorChan := make(chan error, 1)
+
+	// 异步发送请求
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				errorChan <- fmt.Errorf("panic in async send: %v", r)
+			}
+		}()
+
+		// 发送请求
+		if _, writeErr := conn.Write(fullRequest); writeErr != nil {
+			errorChan <- fmt.Errorf("failed to send async request: %v", writeErr)
+			return
+		}
+
+		// 读取响应长度
+		var responseLen int32
+		if readErr := binary.Read(conn, binary.BigEndian, &responseLen); readErr != nil {
+			errorChan <- fmt.Errorf("failed to read response length: %v", readErr)
+			return
+		}
+
+		// 读取响应数据
+		responseData := make([]byte, responseLen)
+		if _, readErr := io.ReadFull(conn, responseData); readErr != nil {
+			errorChan <- fmt.Errorf("failed to read response data: %v", readErr)
+			return
+		}
+
+		// 解析响应
+		result, parseErr := p.parseProduceResponse(responseData)
+		if parseErr != nil {
+			errorChan <- fmt.Errorf("failed to parse response: %v", parseErr)
+			return
+		}
+
+		resultChan <- result
+	}()
+
+	// 等待结果
+	select {
+	case result := <-resultChan:
+		return result, nil
+	case err := <-errorChan:
+		return nil, err
+	case <-time.After(p.client.timeout):
+		return nil, fmt.Errorf("async send timeout")
 	}
-
-	return result, nil
 }
 
 // buildProduceRequest builds produce request
@@ -283,7 +434,7 @@ func (p *Producer) buildProduceRequest(topic string, partition int32, messages [
 }
 
 // parseProduceResponse parses produce response
-func (p *Producer) parseProduceResponse(topic string, partition int32, data []byte) (*ProduceResult, error) {
+func (p *Producer) parseProduceResponse(data []byte) (*ProduceResult, error) {
 	buf := bytes.NewReader(data)
 
 	var baseOffset int64
@@ -297,9 +448,7 @@ func (p *Producer) parseProduceResponse(topic string, partition int32, data []by
 	}
 
 	result := &ProduceResult{
-		Topic:     topic,
-		Partition: partition,
-		Offset:    baseOffset,
+		Offset: baseOffset,
 	}
 
 	if errorCode != 0 {

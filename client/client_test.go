@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/issac1998/go-queue/internal/protocol"
 )
 
 func TestNewClient(t *testing.T) {
@@ -79,8 +81,8 @@ func TestControllerDiscovery(t *testing.T) {
 func TestLoadBalancing(t *testing.T) {
 	// Create client with multiple broker addresses
 	config := ClientConfig{
-		BrokerAddrs: []string{"localhost:9092", "localhost:9093", "localhost:9094"},
-		Timeout:     50, // milliseconds
+		BrokerAddrs: []string{"localhost:19992", "localhost:19993", "localhost:19994"}, // Use unlikely ports
+		Timeout:     50 * time.Millisecond,
 	}
 	client := NewClient(config)
 
@@ -258,21 +260,17 @@ func TestParseTopicMetadataResponse(t *testing.T) {
 }
 
 func TestMetadataReadWriteClassification(t *testing.T) {
-	config := ClientConfig{
-		BrokerAddrs: []string{"localhost:9092"},
-		Timeout:     50,
-	}
-	client := NewClient(config)
+	client := NewClient(ClientConfig{})
 
-	// Test write operations (must go to Controller Leader)
+	// Test write operations (must use leader)
 	writeOperations := []struct {
 		requestType int32
 		description string
 	}{
-		{2, "CREATE_TOPIC"},
-		{4, "DELETE_TOPIC"},
-		{5, "JOIN_GROUP"},
-		{6, "LEAVE_GROUP"},
+		{protocol.CreateTopicRequestType, "CREATE_TOPIC"},
+		{protocol.DeleteTopicRequestType, "DELETE_TOPIC"},
+		{protocol.JoinGroupRequestType, "JOIN_GROUP"},
+		{protocol.LeaveGroupRequestType, "LEAVE_GROUP"},
 	}
 
 	for _, op := range writeOperations {
@@ -287,14 +285,13 @@ func TestMetadataReadWriteClassification(t *testing.T) {
 		requestType int32
 		description string
 	}{
-		{3, "LIST_TOPICS"},
-		{10, "DESCRIBE_TOPIC"},
-		{12, "GET_TOPIC_INFO"},
-		{20, "LIST_GROUPS"},
-		{21, "DESCRIBE_GROUP"},
-		{1002, "GET_TOPIC_METADATA"},
-		{1000, "CONTROLLER_DISCOVERY"},
-		{1001, "CONTROLLER_VERIFY"},
+		{protocol.ListTopicsRequestType, "LIST_TOPICS"},
+		{protocol.GetTopicInfoRequestType, "GET_TOPIC_INFO"},
+		{protocol.ListGroupsRequestType, "LIST_GROUPS"},
+		{protocol.DescribeGroupRequestType, "DESCRIBE_GROUP"},
+		{protocol.GetTopicMetadataRequestType, "GET_TOPIC_METADATA"},
+		{protocol.ControllerDiscoverRequestType, "CONTROLLER_DISCOVERY"},
+		{protocol.ControllerVerifyRequestType, "CONTROLLER_VERIFY"},
 	}
 
 	for _, op := range readOperations {
@@ -307,26 +304,37 @@ func TestMetadataReadWriteClassification(t *testing.T) {
 
 func TestConnectForMetadata(t *testing.T) {
 	config := ClientConfig{
-		BrokerAddrs: []string{"localhost:9092", "localhost:9093"},
+		BrokerAddrs: []string{"localhost:19999", "localhost:19998"}, // Use unlikely ports
 		Timeout:     50 * time.Millisecond,
 	}
 	client := NewClient(config)
 
 	// Test metadata write operation (should try controller)
-	_, err := client.connectForMetadata(true)
-	if err == nil {
+	conn1, err1 := client.connectForMetadata(true)
+	if conn1 != nil {
+		conn1.Close()
+	}
+	if err1 == nil {
 		t.Error("Expected error when no controller is available, got nil")
+	} else {
+		t.Logf("Write operation error (expected): %v", err1)
 	}
 
 	// Test metadata read operation (should try any broker)
-	_, err = client.connectForMetadata(false)
-	if err == nil {
+	conn2, err2 := client.connectForMetadata(false)
+	if conn2 != nil {
+		conn2.Close()
+		t.Logf("Unexpectedly got a connection: %v", conn2.RemoteAddr())
+	}
+	if err2 == nil {
 		t.Error("Expected error when no broker is available, got nil")
+	} else {
+		t.Logf("Read operation error (expected): %v", err2)
 	}
 
 	// The errors should be connection-related since no brokers are running
-	if !strings.Contains(err.Error(), "failed to") {
-		t.Errorf("Expected connection error, got: %v", err)
+	if err2 != nil && !strings.Contains(err2.Error(), "failed to") {
+		t.Errorf("Expected connection error, got: %v", err2)
 	}
 }
 

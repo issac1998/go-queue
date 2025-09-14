@@ -145,29 +145,27 @@ func TestParseCreateTopicResponse(t *testing.T) {
 	}
 }
 
-func TestUnimplementedMethods(t *testing.T) {
+func TestAdminMethodsWithUnavailableBroker(t *testing.T) {
 	client := NewClient(ClientConfig{
-		BrokerAddrs: []string{"localhost:9092"},
+		BrokerAddrs: []string{"localhost:19999"},
 		Timeout:     50 * time.Millisecond, // Very short timeout for tests
 	})
 	admin := NewAdmin(client)
 
-	// Test ListTopics
+	// Test ListTopics - should fail due to unavailable broker
 	_, err := admin.ListTopics()
 	if err == nil {
-		t.Error("expected error for unimplemented ListTopics")
+		t.Error("expected error when broker is unavailable for ListTopics")
 	}
-
-	// Test DeleteTopic
 	err = admin.DeleteTopic("test-topic")
 	if err == nil {
-		t.Error("expected error for unimplemented DeleteTopic")
+		t.Error("expected error when broker is unavailable for DeleteTopic")
 	}
 
-	// Test GetTopicInfo
+	// Test GetTopicInfo - should fail due to unavailable broker
 	_, err = admin.GetTopicInfo("test-topic")
 	if err == nil {
-		t.Error("expected error for unimplemented GetTopicInfo")
+		t.Error("expected error when broker is unavailable for GetTopicInfo")
 	}
 }
 
@@ -195,7 +193,6 @@ func TestCreateTopic(t *testing.T) {
 		t.Errorf("Expected connection error, got: %v", err)
 	}
 }
-
 
 func TestClientFollowerReadClassification(t *testing.T) {
 	config := ClientConfig{

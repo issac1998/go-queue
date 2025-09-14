@@ -29,7 +29,6 @@ func TestOrderedPartitionerDifferentGroups(t *testing.T) {
 	partitioner := NewOrderedPartitioner()
 	numPartitions := int32(4)
 
-	
 	groups := []string{"user-1", "user-2", "user-3", "user-4", "user-5"}
 	partitions := make([]int32, len(groups))
 

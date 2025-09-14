@@ -116,7 +116,8 @@ func (cs *ClientServer) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
 	log.Printf("New client connection from %s", conn.RemoteAddr())
-	conn.SetDeadline(time.Now().Add(30 * time.Second))
+	// Set read timeout for reading request type
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 
 	// Read request type
 	var requestType int32
@@ -145,11 +146,8 @@ func (cs *ClientServer) handleConnection(conn net.Conn) {
 // handleRequestByType handles requests based on their type and configuration
 func (cs *ClientServer) handleRequestByType(conn net.Conn, requestType int32, config RequestConfig) error {
 	switch config.Type {
-	// MetaRead check raft role first, as it known which raft group it is.
-	// for featuch and request ,group ID is in request data.
-	// We can only known it after
 	case ControllerRequest:
-		fallthrough
+		return config.Handler.Handle(conn, cs)
 	case MetadataWriteRequest:
 		return cs.handleMetadataWriteRequest(conn, config)
 	case MetadataReadRequest:
@@ -166,8 +164,22 @@ func (cs *ClientServer) handleRequestByType(conn net.Conn, requestType int32, co
 }
 
 func (cs *ClientServer) isLeader() bool {
-	leaderID, exists, _ := cs.broker.raftManager.GetLeaderID(raft.ControllerGroupID)
-	if exists && leaderID == cs.broker.Controller.brokerIDToNodeID(cs.broker.ID) {
+	// Check if raftManager is properly initialized
+	if cs.broker.raftManager == nil {
+		return false
+	}
+
+	leaderID, exists, err := cs.broker.raftManager.GetLeaderID(raft.ControllerGroupID)
+	if err != nil || !exists {
+		return false
+	}
+
+	// Check if Controller is properly initialized
+	if cs.broker.Controller == nil {
+		return false
+	}
+
+	if leaderID == cs.broker.Controller.brokerIDToNodeID(cs.broker.ID) {
 		return true
 	}
 	return false
@@ -252,35 +264,52 @@ func (cs *ClientServer) getControllerLeaderAddr() string {
 }
 
 func (cs *ClientServer) sendErrorResponse(conn net.Conn, err error) {
-	errorResponse := fmt.Sprintf("ERROR: %v", err)
-	responseData := []byte(errorResponse)
+	// Set write timeout for sending response
+	conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+
+	var buf bytes.Buffer
+	errorCode := int16(protocol.ErrorInvalidRequest)
+	binary.Write(&buf, binary.BigEndian, errorCode)
+
+	responseData := buf.Bytes()
 	responseLen := int32(len(responseData))
 
 	binary.Write(conn, binary.BigEndian, responseLen)
 	conn.Write(responseData)
+	log.Printf("Sent error response with error code: %d", errorCode)
 }
 
 func (cs *ClientServer) sendSuccessResponse(conn net.Conn, data []byte) {
+	// Set write timeout for sending response
+	conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+
 	responseLen := int32(len(data))
 	binary.Write(conn, binary.BigEndian, responseLen)
 	conn.Write(data)
 }
 
 // readRequestData reads variable-length request data from the connection
-// This uses io.ReadAll with size limits to handle data of any size safely
+// Client sends: RequestType + DataLength + RequestData
+// handleConnection already read RequestType, so we read DataLength + RequestData
+// Uses the connection timeout set by handleConnection (30 seconds)
 func (cs *ClientServer) readRequestData(conn net.Conn) ([]byte, error) {
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	// Set read timeout for this operation to avoid i/o timeout issues
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 
-	const maxRequestSize = 10 * 1024 * 1024
-	limitedReader := io.LimitReader(conn, maxRequestSize)
-
-	requestData, err := io.ReadAll(limitedReader)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read request data: %v", err)
+	var dataLength int32
+	if err := binary.Read(conn, binary.BigEndian, &dataLength); err != nil {
+		return nil, fmt.Errorf("failed to read data length: %v", err)
 	}
 
-	if len(requestData) == maxRequestSize {
-		return nil, fmt.Errorf("request data too large (exceeded %d bytes)", maxRequestSize)
+	const maxRequestSize = 10 * 1024 * 1024
+	if dataLength < 0 || dataLength > maxRequestSize {
+		return nil, fmt.Errorf("invalid data length: %d (max: %d)", dataLength, maxRequestSize)
+	}
+
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	requestData := make([]byte, dataLength)
+	if _, err := io.ReadFull(conn, requestData); err != nil {
+		return nil, fmt.Errorf("failed to read request data: %v", err)
 	}
 
 	return requestData, nil
@@ -290,9 +319,15 @@ func (cs *ClientServer) readRequestData(conn net.Conn) ([]byte, error) {
 type ControllerDiscoveryHandler struct{}
 
 func (h *ControllerDiscoveryHandler) Handle(conn net.Conn, cs *ClientServer) error {
+	// Read request data to maintain protocol consistency
+	_, err := cs.readRequestData(conn)
+	if err != nil {
+		return fmt.Errorf("failed to read request data: %v", err)
+	}
+
 	var controllerAddr string
 
-	if cs.broker.Controller != nil && cs.broker.Controller.isLeader() {
+	if cs.isLeader() {
 		controllerAddr = fmt.Sprintf("%s:%d", cs.broker.Address, cs.broker.Port)
 	} else {
 		controllerAddr = cs.getControllerLeaderAddr()
@@ -317,13 +352,19 @@ func (h *ControllerDiscoveryHandler) Handle(conn net.Conn, cs *ClientServer) err
 type ControllerVerifyHandler struct{}
 
 func (h *ControllerVerifyHandler) Handle(conn net.Conn, cs *ClientServer) error {
-	isLeader := cs.broker.Controller != nil
+	// Read request data to maintain protocol consistency
+	_, err := cs.readRequestData(conn)
+	if err != nil {
+		return fmt.Errorf("failed to read request data: %v", err)
+	}
+
+	isLeader := cs.broker.Controller != nil && cs.broker.Controller.isLeader()
 
 	var response []byte
 	if isLeader {
-		response = []byte("LEADER")
+		response = []byte("true")
 	} else {
-		response = []byte("FOLLOWER")
+		response = []byte("false")
 	}
 
 	responseLen := int32(len(response))
@@ -348,7 +389,7 @@ func (h *CreateTopicHandler) Handle(conn net.Conn, cs *ClientServer) error {
 		return fmt.Errorf("failed to read request data: %v", err)
 	}
 
-	topicName, partitions, replicationFactor, err := h.parseCreateTopicRequest(requestData)
+	topicName, partitions, replicas, err := h.parseCreateTopicRequest(requestData)
 	if err != nil {
 		return fmt.Errorf("failed to parse request: %v", err)
 	}
@@ -359,17 +400,26 @@ func (h *CreateTopicHandler) Handle(conn net.Conn, cs *ClientServer) error {
 	if partitions <= 0 {
 		return fmt.Errorf("partitions must be greater than 0")
 	}
-	if replicationFactor <= 0 {
-		return fmt.Errorf("replication factor must be greater than 0")
+	if replicas <= 0 {
+		cs.sendErrorResponse(conn, fmt.Errorf("replicas must be greater than 0"))
+		return nil
 	}
 
-	err = cs.broker.Controller.CreateTopic(topicName, partitions, replicationFactor)
+	err = cs.broker.Controller.CreateTopic(topicName, partitions, replicas)
+	fmt.Println("CreateTopic result:", err)
 	if err != nil {
-		return fmt.Errorf("failed to create topic: %v", err)
+		buf := new(bytes.Buffer)
+		if writeErr := binary.Write(buf, binary.BigEndian, int16(protocol.ErrorInternalError)); writeErr != nil {
+			log.Printf("Failed to write error response: %v", writeErr)
+			return nil
+		}
+		cs.sendSuccessResponse(conn, buf.Bytes())
+		log.Printf("Failed to create topic '%s': %v", topicName, err)
+		return nil
 	}
 
 	buf := new(bytes.Buffer)
-	if err := binary.Write(buf, binary.BigEndian, int16(0)); err != nil {
+	if err := binary.Write(buf, binary.BigEndian, int16(protocol.ErrorNone)); err != nil {
 		return fmt.Errorf("failed to write success response: %v", err)
 	}
 
@@ -410,15 +460,22 @@ func (h *CreateTopicHandler) parseCreateTopicRequest(data []byte) (string, int32
 type ListTopicsHandler struct{}
 
 func (h *ListTopicsHandler) Handle(conn net.Conn, cs *ClientServer) error {
-	var version int16
-	if err := binary.Read(conn, binary.BigEndian, &version); err != nil {
-		return fmt.Errorf("failed to read version: %v", err)
+	requestData, err := cs.readRequestData(conn)
+	if err != nil {
+		return fmt.Errorf("failed to read request data: %v", err)
+	}
+
+	// Validate request data length
+	if len(requestData) < 2 {
+		return fmt.Errorf("invalid request data length")
 	}
 
 	result, err := cs.broker.Controller.QueryMetadata(protocol.RaftQueryGetTopics, nil)
 	if err != nil {
 		return fmt.Errorf("failed to get topics: %v", err)
 	}
+
+	log.Printf("QueryMetadata returned data length: %d, content: %s", len(result), string(result))
 
 	responseData, err := h.buildListTopicsResponse(result)
 	if err != nil {
@@ -480,6 +537,36 @@ func (h *ListTopicsHandler) buildListTopicsResponse(topicsData []byte) ([]byte, 
 	}
 
 	return buf.Bytes(), nil
+}
+
+// sendOrderedProduceErrorResponse sends JSON error response for ordered produce requests
+func (cs *ClientServer) sendOrderedProduceErrorResponse(conn net.Conn, errorMsg string) error {
+	// Send complete PartitionProduceResponse structure that client expects
+	errorResponse := struct {
+		Partition int32                 `json:"partition"`
+		Results   []interface{}         `json:"results"`
+		ErrorCode int16                 `json:"error_code"`
+		Error     string                `json:"error,omitempty"`
+	}{
+		Partition: -1,      // -1 indicates error at request level
+		Results:   []interface{}{}, // empty results array
+		ErrorCode: -1,
+		Error:     errorMsg,
+	}
+
+	responseData, err := json.Marshal(errorResponse)
+	if err != nil {
+		log.Printf("Failed to marshal error response: %v", err)
+		return err
+	}
+
+	conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+	responseLen := int32(len(responseData))
+	if err := binary.Write(conn, binary.BigEndian, responseLen); err != nil {
+		return err
+	}
+	_, err = conn.Write(responseData)
+	return err
 }
 
 // DeleteTopicHandler handles delete topic requests
@@ -895,12 +982,7 @@ func (h *GetTopicMetadataHandler) Handle(conn net.Conn, cs *ClientServer) error 
 func (h *GetTopicMetadataHandler) parseGetTopicMetadataRequest(data []byte) (string, error) {
 	buf := bytes.NewReader(data)
 
-	var version int16
-	if err := binary.Read(buf, binary.BigEndian, &version); err != nil {
-		return "", err
-	}
-
-	var nameLen int16
+	var nameLen int32
 	if err := binary.Read(buf, binary.BigEndian, &nameLen); err != nil {
 		return "", err
 	}
@@ -915,20 +997,48 @@ func (h *GetTopicMetadataHandler) parseGetTopicMetadataRequest(data []byte) (str
 func (h *GetTopicMetadataHandler) buildGetTopicMetadataResponse(topicMetadata *raft.TopicMetadata) ([]byte, error) {
 	buf := new(bytes.Buffer)
 
-	if err := binary.Write(buf, binary.BigEndian, int16(0)); err != nil {
+	// Write error code (int32, 0 for success)
+	if err := binary.Write(buf, binary.BigEndian, int32(0)); err != nil {
 		return nil, err
 	}
 
-	metadataJSON, err := json.Marshal(topicMetadata)
-	if err != nil {
+	// Write partition count
+	partitionCount := topicMetadata.Partitions
+	if err := binary.Write(buf, binary.BigEndian, partitionCount); err != nil {
 		return nil, err
 	}
 
-	if err := binary.Write(buf, binary.BigEndian, int32(len(metadataJSON))); err != nil {
-		return nil, err
-	}
-	if _, err := buf.Write(metadataJSON); err != nil {
-		return nil, err
+	// Write each partition's metadata
+	for i := int32(0); i < partitionCount; i++ {
+		// Write partition ID
+		if err := binary.Write(buf, binary.BigEndian, i); err != nil {
+			return nil, err
+		}
+
+		// For now, use a placeholder leader address
+		// In a real implementation, this should come from PartitionAssignments
+		leaderAddr := "127.0.0.1:9092"
+		if err := binary.Write(buf, binary.BigEndian, int32(len(leaderAddr))); err != nil {
+			return nil, err
+		}
+		if _, err := buf.Write([]byte(leaderAddr)); err != nil {
+			return nil, err
+		}
+
+		// Write replica count (1 for single broker setup)
+		replicaCount := int32(1)
+		if err := binary.Write(buf, binary.BigEndian, replicaCount); err != nil {
+			return nil, err
+		}
+
+		// Write replica address
+		replicaAddr := "127.0.0.1:9092"
+		if err := binary.Write(buf, binary.BigEndian, int32(len(replicaAddr))); err != nil {
+			return nil, err
+		}
+		if _, err := buf.Write([]byte(replicaAddr)); err != nil {
+			return nil, err
+		}
 	}
 
 	return buf.Bytes(), nil
@@ -936,6 +1046,84 @@ func (h *GetTopicMetadataHandler) buildGetTopicMetadataResponse(topicMetadata *r
 
 // ProduceHandler handles produce requests
 type ProduceHandler struct{}
+
+// parseProduceRequest parses binary produce request from client
+func (h *ProduceHandler) parseProduceRequest(data []byte) (*ProduceRequest, error) {
+	if len(data) < 8 {
+		return nil, fmt.Errorf("request too short")
+	}
+
+	offset := 0
+
+	// Read topic length (4 bytes)
+	topicLen := binary.BigEndian.Uint32(data[offset:])
+	offset += 4
+
+	if len(data) < offset+int(topicLen)+4 {
+		return nil, fmt.Errorf("invalid topic length")
+	}
+
+	// Read topic
+	topic := string(data[offset : offset+int(topicLen)])
+	offset += int(topicLen)
+
+	// Read partition (4 bytes)
+	partition := binary.BigEndian.Uint32(data[offset:])
+	offset += 4
+
+	// Read message count (4 bytes)
+	if len(data) < offset+4 {
+		return nil, fmt.Errorf("invalid message count")
+	}
+	messageCount := binary.BigEndian.Uint32(data[offset:])
+	offset += 4
+
+	messages := make([]ProduceMessage, messageCount)
+	for i := uint32(0); i < messageCount; i++ {
+		if len(data) < offset+8 {
+			return nil, fmt.Errorf("invalid message %d", i)
+		}
+
+		// Read key length (4 bytes)
+		keyLen := binary.BigEndian.Uint32(data[offset:])
+		offset += 4
+
+		var key []byte
+		if keyLen > 0 {
+			if len(data) < offset+int(keyLen) {
+				return nil, fmt.Errorf("invalid key length for message %d", i)
+			}
+			key = data[offset : offset+int(keyLen)]
+			offset += int(keyLen)
+		}
+
+		// Read value length (4 bytes)
+		if len(data) < offset+4 {
+			return nil, fmt.Errorf("invalid value length for message %d", i)
+		}
+		valueLen := binary.BigEndian.Uint32(data[offset:])
+		offset += 4
+
+		if len(data) < offset+int(valueLen) {
+			return nil, fmt.Errorf("invalid value length for message %d", i)
+		}
+
+		// Read value
+		value := data[offset : offset+int(valueLen)]
+		offset += int(valueLen)
+
+		messages[i] = ProduceMessage{
+			Key:   key,
+			Value: value,
+		}
+	}
+
+	return &ProduceRequest{
+		Topic:     topic,
+		Partition: int32(partition),
+		Messages:  messages,
+	}, nil
+}
 
 func (h *ProduceHandler) Handle(conn net.Conn, cs *ClientServer) error {
 	requestData, err := cs.readRequestData(conn)
@@ -945,9 +1133,10 @@ func (h *ProduceHandler) Handle(conn net.Conn, cs *ClientServer) error {
 		return err
 	}
 
-	var produceReq ProduceRequest
-	if err := json.Unmarshal(requestData, &produceReq); err != nil {
-		log.Printf("Failed to unmarshal produce request: %v", err)
+	// Parse binary produce request from client
+	produceReq, err := h.parseProduceRequest(requestData)
+	if err != nil {
+		log.Printf("Failed to parse produce request: %v", err)
 		cs.sendErrorResponse(conn, fmt.Errorf("Invalid request format: %v", err))
 		return err
 	}
@@ -968,7 +1157,7 @@ func (h *ProduceHandler) Handle(conn net.Conn, cs *ClientServer) error {
 		return fmt.Errorf("not the leader")
 	}
 
-	response, err := cs.handleProduceToRaft(&produceReq)
+	response, err := cs.handleProduceToRaft(produceReq)
 	if err != nil {
 		log.Printf("Failed to produce to Raft: %v", err)
 		cs.sendErrorResponse(conn, fmt.Errorf("Failed to produce: %v", err))

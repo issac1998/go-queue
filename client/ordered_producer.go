@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"net"
 	"time"
 
 	"github.com/issac1998/go-queue/internal/protocol"
@@ -18,7 +17,7 @@ type OrderedProducer struct {
 
 // OrderedPartitioner pratitioner
 type OrderedPartitioner struct {
-	messageGroupPartitions map[string]int32 
+	messageGroupPartitions map[string]int32
 }
 
 // NewOrderedPartitioner create new ordered partitioner
@@ -138,7 +137,6 @@ func (op *OrderedProducer) SendMessageGroupBatch(topic string, messageGroup stri
 
 	return op.SendOrderedMessages(topic, messages)
 }
-
 
 // sendOrderedProduceRequest
 func (op *OrderedProducer) sendOrderedProduceRequest(request OrderedProduceRequest) (*OrderedProduceResult, error) {

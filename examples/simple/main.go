@@ -3,193 +3,208 @@ package main
 import (
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
+	"sync/atomic"
+
 	"github.com/issac1998/go-queue/client"
+	"github.com/issac1998/go-queue/internal/async"
+	"github.com/issac1998/go-queue/internal/pool"
 )
 
 func main() {
-	// Create a client
-	c := client.NewClient(client.ClientConfig{
+	fmt.Println("=== Go Queue 简单客户端演示 ===")
+
+	// Create client config (connection pool and async IO enabled by default)
+	config := client.ClientConfig{
 		BrokerAddrs: []string{"localhost:9092"},
 		Timeout:     5 * time.Second,
-	})
 
-	fmt.Println("=== Go Queue Consumer Protocol Fix Test ===")
+		// Performance optimization config (optional)
+		EnableConnectionPool: true,
+		EnableAsyncIO:        true, // Enable async IO persistent connections
+		ConnectionPool: pool.ConnectionPoolConfig{
+			MaxConnections:    10,
+			MinConnections:    2,
+			ConnectionTimeout: 3 * time.Second,
+			IdleTimeout:       5 * time.Minute,
+			MaxLifetime:       15 * time.Minute,
+		},
+		AsyncIO: async.AsyncIOConfig{
+			WorkerCount:    4,
+			SQSize:         512,
+			CQSize:         512,
+			BatchSize:      100,
+			PollTimeout:    10 * time.Millisecond,
+			ReadTimeout:    10 * time.Second,
+			WriteTimeout:   10 * time.Second,
+			MaxConnections: 100,
+		},
+		BatchSize:       50,
+		BatchTimeout:    5 * time.Millisecond,
+		MaxPendingBatch: 500,
+	}
 
-	// 1. Create topic for testing
-	fmt.Println("\n1. Creating test topic...")
+	// Create client
+	c := client.NewClient(config)
+	defer c.Close()
+
+	// Create admin client
 	admin := client.NewAdmin(c)
-	createResult, err := admin.CreateTopic(client.CreateTopicRequest{
-		Name:       "consume-test-topic",
-		Partitions: 1,
+
+	// Create topic
+	fmt.Println("\n1. 创建Topic...")
+	createReq := client.CreateTopicRequest{
+		Name:       "async-demo",
+		Partitions: 3,
 		Replicas:   1,
-	})
+	}
+
+	createResult, err := admin.CreateTopic(createReq)
 	if err != nil {
-		log.Printf("Failed to create topic: %v", err)
+		log.Printf("Failed to create topic (might already exist): %v", err)
 	} else if createResult.Error != nil {
 		log.Printf("Failed to create topic: %v", createResult.Error)
 	} else {
-		fmt.Printf("✓ Topic '%s' created successfully!\n", createResult.Name)
+		fmt.Printf("✅ Topic创建成功: %s\n", createResult.Name)
 	}
 
+	// Create Producer
+	fmt.Println("\n2. 异步IO长连接演示...")
 	producer := client.NewProducer(c)
+
+	// High concurrency send test - demonstrate async IO persistent connection advantages
+	fmt.Println("  发送100条消息测试异步IO性能...")
+
+	start := time.Now()
+	var wg sync.WaitGroup
+	successCount := int64(0)
+	errorCount := int64(0)
+
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func(msgId int) {
+			defer wg.Done()
+
+			msg := client.ProduceMessage{
+				Topic:     "async-demo",
+				Partition: int32(msgId % 3), // Distribute to 3 partitions
+				Value:     []byte(fmt.Sprintf("Async message %d - %s", msgId, time.Now().Format("15:04:05.000"))),
+			}
+
+			result, err := producer.Send(msg)
+			if err != nil {
+				atomic.AddInt64(&errorCount, 1)
+				log.Printf("Message %d failed: %v", msgId, err)
+			} else {
+				atomic.AddInt64(&successCount, 1)
+				if msgId%20 == 0 { // Print every 20 messages
+					fmt.Printf("  ✅ 消息 %d: Partition=%d, Offset=%d\n", msgId, result.Partition, result.Offset)
+				}
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	duration := time.Since(start)
+
+	fmt.Printf("\n📊 异步IO性能测试结果:\n")
+	fmt.Printf("  - 总消息数: 100\n")
+	fmt.Printf("  - 成功数: %d\n", successCount)
+	fmt.Printf("  - 失败数: %d\n", errorCount)
+	fmt.Printf("  - 总用时: %v\n", duration)
+	fmt.Printf("  - 平均延迟: %v/msg\n", duration/100)
+	fmt.Printf("  - 吞吐量: %.2f msg/s\n", float64(successCount)/duration.Seconds())
+
+	// Batch send demonstration
+	fmt.Println("\n3. 批量发送演示...")
+	messages := make([]client.ProduceMessage, 10)
+	for i := range messages {
+		messages[i] = client.ProduceMessage{
+			Topic:     "async-demo",
+			Partition: 1,
+			Value:     []byte(fmt.Sprintf("Batch message %d", i)),
+		}
+	}
+
+	batchStart := time.Now()
+	batchResult, err := producer.SendBatch(messages)
+	batchDuration := time.Since(batchStart)
+
+	if err != nil {
+		log.Printf("Failed to send batch: %v", err)
+	} else {
+		fmt.Printf("✅ 批量发送成功: 10条消息，用时 %v, 起始Offset=%d\n",
+			batchDuration, batchResult.Offset)
+	}
+
+	// Create Consumer
+	fmt.Println("\n4. 消费消息...")
 	consumer := client.NewConsumer(c)
 
-	// 2. Test Single Message Production and Consumption
-	fmt.Println("\n2. Testing SINGLE message consumption...")
-
-	singleMessages := []string{
-		"Single message test 1",
-		"Single message test 2",
-		"Single message test 3",
-	}
-
-	var singleOffsets []int64
-
-	// Send single messages one by one
-	for i, msgText := range singleMessages {
-		msg := client.ProduceMessage{
-			Topic:     "consume-test-topic",
-			Partition: 0,
-			Value:     []byte(msgText),
+	// Consume messages from different partitions
+	for partition := int32(0); partition < 3; partition++ {
+		fetchReq := client.FetchRequest{
+			Topic:     "async-demo",
+			Partition: partition,
+			Offset:    0,
+			MaxBytes:  4096,
 		}
 
-		fmt.Printf("  Sending: %s\n", msgText)
-		result, err := producer.Send(msg)
+		fetchResult, err := consumer.Fetch(fetchReq)
 		if err != nil {
-			log.Printf("Failed to send single message %d: %v", i+1, err)
-			return
-		} else if result.Error != nil {
-			log.Printf("Failed to send single message %d: %v", i+1, result.Error)
-			return
-		}
-
-		singleOffsets = append(singleOffsets, result.Offset)
-		fmt.Printf("  ✓ Sent at offset: %d\n", result.Offset)
-
-		// Small delay to ensure ordering
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	// Test consuming each single message
-	fmt.Println("\n  Testing consumption of single messages:")
-	for i, offset := range singleOffsets {
-		fetchResult, err := consumer.FetchFrom("consume-test-topic", 0, offset)
-		if err != nil {
-			log.Printf("Failed to fetch single message at offset %d: %v", offset, err)
-			continue
-		} else if fetchResult.Error != nil {
-			log.Printf("Failed to fetch single message at offset %d: %v", offset, fetchResult.Error)
+			log.Printf("Failed to fetch from partition %d: %v", partition, err)
 			continue
 		}
 
+		fmt.Printf("✅ 分区 %d: 消费到 %d 条消息\n", partition, len(fetchResult.Messages))
 		if len(fetchResult.Messages) > 0 {
-			msg := fetchResult.Messages[0]
-			fmt.Printf("  ✓ Consumed message %d: %s (Offset: %d)\n", i+1, string(msg.Value), msg.Offset)
-		} else {
-			fmt.Printf("  ✗ No message found at offset %d\n", offset)
-		}
-	}
-
-	// 3. Test Batch Message Production and Consumption
-	fmt.Println("\n3. Testing BATCH message consumption...")
-
-	batchMessages := []client.ProduceMessage{
-		{Topic: "consume-test-topic", Partition: 0, Value: []byte("Batch message 1")},
-		{Topic: "consume-test-topic", Partition: 0, Value: []byte("Batch message 2")},
-		{Topic: "consume-test-topic", Partition: 0, Value: []byte("Batch message 3")},
-		{Topic: "consume-test-topic", Partition: 0, Value: []byte("Batch message 4")},
-		{Topic: "consume-test-topic", Partition: 0, Value: []byte("Batch message 5")},
-		{Topic: "consume-test-topic", Partition: 0, Value: []byte("Batch message 6")},
-		{Topic: "consume-test-topic", Partition: 0, Value: []byte("Batch message 7")},
-	}
-
-	fmt.Printf("  Sending batch of %d messages...\n", len(batchMessages))
-	for i, msg := range batchMessages {
-		fmt.Printf("    [%d]: %s\n", i+1, string(msg.Value))
-	}
-
-	batchResult, err := producer.SendBatch(batchMessages)
-	if err != nil {
-		log.Printf("Failed to send batch messages: %v", err)
-		return
-	} else if batchResult.Error != nil {
-		log.Printf("Failed to send batch messages: %v", batchResult.Error)
-		return
-	}
-
-	fmt.Printf("  ✓ Batch sent successfully! Start offset: %d\n", batchResult.Offset)
-
-	// Wait for persistence
-	time.Sleep(50 * time.Millisecond)
-
-	// Test consuming the entire batch
-	fmt.Println("\n  Testing consumption of batch messages:")
-	batchFetchResult, err := consumer.FetchFrom("consume-test-topic", 0, batchResult.Offset)
-	if err != nil {
-		log.Printf("Failed to fetch batch messages: %v", err)
-	} else if batchFetchResult.Error != nil {
-		log.Printf("Failed to fetch batch messages: %v", batchFetchResult.Error)
-	} else {
-		fmt.Printf("  ✓ Successfully fetched %d messages from batch:\n", len(batchFetchResult.Messages))
-		for i, msg := range batchFetchResult.Messages {
-			fmt.Printf("    [%d]: %s (Offset: %d)\n", i+1, string(msg.Value), msg.Offset)
-		}
-		fmt.Printf("  Next Offset: %d\n", batchFetchResult.NextOffset)
-	}
-
-	// 4. Test consuming all messages from beginning
-	fmt.Println("\n4. Testing consumption from beginning (ALL messages)...")
-	allFetchResult, err := consumer.FetchFrom("consume-test-topic", 0, 0)
-	if err != nil {
-		log.Printf("Failed to fetch all messages: %v", err)
-	} else if allFetchResult.Error != nil {
-		log.Printf("Failed to fetch all messages: %v", allFetchResult.Error)
-	} else {
-		fmt.Printf("✓ Successfully fetched %d total messages:\n", len(allFetchResult.Messages))
-		singleCount := 0
-		batchCount := 0
-
-		for i, msg := range allFetchResult.Messages {
-			msgStr := string(msg.Value)
-			if len(msgStr) > 0 && msgStr[0:6] == "Single" {
-				singleCount++
-				fmt.Printf("  [%d] SINGLE: %s (Offset: %d)\n", i+1, msgStr, msg.Offset)
-			} else if len(msgStr) > 0 && msgStr[0:5] == "Batch" {
-				batchCount++
-				fmt.Printf("  [%d] BATCH:  %s (Offset: %d)\n", i+1, msgStr, msg.Offset)
-			} else {
-				fmt.Printf("  [%d] OTHER:  %s (Offset: %d)\n", i+1, msgStr, msg.Offset)
+			// Show first 3 messages
+			for i, message := range fetchResult.Messages[:min(3, len(fetchResult.Messages))] {
+				fmt.Printf("   消息 %d: Offset=%d, Value=%s\n", i, message.Offset, string(message.Value))
 			}
-		}
-
-		fmt.Printf("Summary: %d single messages, %d batch messages, %d total\n",
-			singleCount, batchCount, len(allFetchResult.Messages))
-		fmt.Printf("Next Offset: %d\n", allFetchResult.NextOffset)
-	}
-
-	// 5. Test partial batch consumption
-	fmt.Println("\n5. Testing partial batch consumption...")
-	if batchResult.Offset >= 0 && len(batchMessages) >= 3 {
-		// Consume only first 3 messages from the batch
-		partialOffset := batchResult.Offset + 2 // Start from 3rd message in batch
-		partialResult, err := consumer.FetchFrom("consume-test-topic", 0, partialOffset)
-		if err != nil {
-			log.Printf("Failed to fetch partial batch: %v", err)
-		} else if partialResult.Error != nil {
-			log.Printf("Failed to fetch partial batch: %v", partialResult.Error)
-		} else {
-			fmt.Printf("✓ Partial consumption starting from offset %d:\n", partialOffset)
-			for i, msg := range partialResult.Messages {
-				fmt.Printf("  [%d]: %s (Offset: %d)\n", i+1, string(msg.Value), msg.Offset)
+			if len(fetchResult.Messages) > 3 {
+				fmt.Printf("   ... 还有 %d 条消息\n", len(fetchResult.Messages)-3)
 			}
 		}
 	}
 
-	fmt.Println("\n=== Consumer Protocol Fix Test COMPLETED SUCCESSFULLY! ===")
-	fmt.Println("✓ Single message consumption: WORKING")
-	fmt.Println("✓ Batch message consumption: WORKING")
-	fmt.Println("✓ Protocol parsing errors: FIXED")
-	fmt.Println("✓ Request type constants: ALIGNED")
+	// Show client statistics
+	fmt.Println("\n5. 性能统计...")
+	stats := c.GetStats()
+	fmt.Printf("📊 客户端统计:\n")
+	fmt.Printf("  - Topic缓存数: %d\n", stats.TopicCount)
+	fmt.Printf("  - 元数据TTL: %v\n", stats.MetadataTTL)
+
+	if stats.ConnectionPool.TotalConnections > 0 {
+		fmt.Printf("\n🔗 连接池统计:\n")
+		fmt.Printf("  - 总连接数: %d\n", stats.ConnectionPool.TotalConnections)
+		fmt.Printf("  - 活跃连接数: %d\n", stats.ConnectionPool.ActiveConnections)
+		fmt.Printf("  - Broker连接池数: %d\n", len(stats.ConnectionPool.BrokerStats))
+	}
+
+	if stats.AsyncIO.WorkerCount > 0 {
+		fmt.Printf("\n⚡ 异步IO统计:\n")
+		fmt.Printf("  - Worker数量: %d\n", stats.AsyncIO.WorkerCount)
+		fmt.Printf("  - 异步连接总数: %d\n", stats.AsyncIO.TotalConnections)
+		fmt.Printf("  - 异步连接活跃数: %d\n", stats.AsyncIO.ActiveConnections)
+		fmt.Printf("  - 提交队列大小: %d\n", stats.AsyncIO.SQSize)
+		fmt.Printf("  - 完成队列大小: %d\n", stats.AsyncIO.CQSize)
+	}
+
+	fmt.Println("\n✅ 演示完成！")
+	fmt.Println("\n🚀 新异步IO架构特性:")
+	fmt.Println("  ✅ 长连接复用: 每个broker维护一个长连接，避免频繁建立/关闭")
+	fmt.Println("  ✅ 事件驱动: 基于事件循环的异步处理，高并发性能")
+	fmt.Println("  ✅ 智能降级: 异步连接失败时自动降级到连接池")
+	fmt.Println("  ✅ 资源管理: 连接生命周期管理，优雅关闭")
+	fmt.Println("  ✅ 双重保障: 异步IO + 连接池，确保高可用性")
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

@@ -48,6 +48,7 @@ type DiscoveryConfig struct {
 	Username  string   `yaml:"username"`
 	Password  string   `yaml:"password"`
 	Timeout   string   `yaml:"timeout"`
+	Peers     []string `yaml:"peers"` 
 }
 
 // NewDiscovery creates a new Discovery instance based on configuration
@@ -59,8 +60,6 @@ func NewDiscovery(config *DiscoveryConfig) (Discovery, error) {
 	switch config.Type {
 	case "etcd":
 		return NewEtcdDiscovery(config)
-	case "consul":
-		return NewConsulDiscovery(config)
 	case "memory", "":
 		return NewMemoryDiscovery(), nil
 	default:

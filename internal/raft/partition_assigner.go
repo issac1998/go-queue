@@ -185,7 +185,7 @@ func (pa *PartitionAssigner) executeLeaderTransfers(plans []LeaderTransferPlan) 
 	log.Printf("Executing %d leader transfers for load balancing", len(plans))
 
 	for _, plan := range plans {
-		targetNodeID, err := pa.brokerIDToNodeID(plan.ToLeader)
+		targetNodeID, err := pa.BrokerIDToNodeID(plan.ToLeader)
 		if err != nil {
 			log.Printf("Failed to convert broker ID %s to node ID: %v", plan.ToLeader, err)
 			continue
@@ -278,7 +278,7 @@ func (pa *PartitionAssigner) startSinglePartitionRaftGroup(assignment *Partition
 	// Convert broker IDs to node IDs and addresses
 	nodeMembers := make(map[uint64]string)
 	for _, brokerID := range assignment.Replicas {
-		nodeID, err := pa.brokerIDToNodeID(brokerID)
+		nodeID, err := pa.BrokerIDToNodeID(brokerID)
 		if err != nil {
 			return fmt.Errorf("failed to convert broker ID %s to node ID: %w", brokerID, err)
 		}
@@ -505,7 +505,7 @@ func (pa *PartitionAssigner) waitForLeadershipEstablishment(assignments []*Parti
 			log.Printf("Transferring leadership for partition %s from %s to preferred leader %s",
 				partitionKey, actualLeader, assignment.PreferredLeader)
 
-			preferredNodeID, err := pa.brokerIDToNodeID(assignment.PreferredLeader)
+			preferredNodeID, err := pa.BrokerIDToNodeID(assignment.PreferredLeader)
 			if err != nil {
 				log.Printf("Warning: failed to convert preferred leader %s to node ID: %v",
 					assignment.PreferredLeader, err)
@@ -536,18 +536,10 @@ func (pa *PartitionAssigner) waitForLeadershipEstablishment(assignments []*Parti
 	return nil
 }
 
-// Helper functions for broker ID <-> node ID conversion
-func (pa *PartitionAssigner) brokerIDToNodeID(brokerID string) (uint64, error) {
-	// Simple hash-based conversion - in production, you might want a more sophisticated mapping
-	h := fnv.New64a()
-	h.Write([]byte(brokerID))
-	return h.Sum64(), nil
-}
-
 func (pa *PartitionAssigner) nodeIDToBrokerID(nodeID uint64) (string, error) {
 	// Reverse lookup in broker metadata
 	for brokerID := range pa.metadata.Brokers {
-		if expectedNodeID, err := pa.brokerIDToNodeID(brokerID); err == nil && expectedNodeID == nodeID {
+		if expectedNodeID, err := pa.BrokerIDToNodeID(brokerID); err == nil && expectedNodeID == nodeID {
 			return brokerID, nil
 		}
 	}
@@ -561,7 +553,9 @@ func (pa *PartitionAssigner) NodeIDToBrokerID(nodeID uint64) (string, error) {
 
 // BrokerIDToNodeID converts broker ID to node ID (public method)
 func (pa *PartitionAssigner) BrokerIDToNodeID(brokerID string) (uint64, error) {
-	return pa.brokerIDToNodeID(brokerID)
+	h := fnv.New64a()
+	h.Write([]byte(brokerID))
+	return h.Sum64(), nil
 }
 
 // Reuse helper functions from the original assigner

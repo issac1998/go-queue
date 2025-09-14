@@ -10,6 +10,7 @@ import (
 	"github.com/issac1998/go-queue/internal/compression"
 	"github.com/issac1998/go-queue/internal/deduplication"
 	"github.com/issac1998/go-queue/internal/discovery"
+	"github.com/issac1998/go-queue/internal/protocol"
 	"github.com/issac1998/go-queue/internal/raft"
 	"github.com/issac1998/go-queue/internal/transaction"
 	"github.com/lni/dragonboat/v3"
@@ -42,8 +43,8 @@ type Broker struct {
 	Config *BrokerConfig
 
 	// Lifecycle management
-	ctx    context.Context
-	cancel context.CancelFunc
+	Ctx    context.Context
+	Cancel context.CancelFunc
 	wg     sync.WaitGroup
 
 	// Raft manager
@@ -129,8 +130,8 @@ func NewBroker(config *BrokerConfig) (*Broker, error) {
 		Address: config.BindAddr,
 		Port:    config.BindPort,
 		Config:  config,
-		ctx:     ctx,
-		cancel:  cancel,
+		Ctx:    ctx,
+		Cancel: cancel,
 	}
 
 	return broker, nil
@@ -190,6 +191,19 @@ func (b *Broker) Start() error {
 		return fmt.Errorf("system metrics start failed: %v", err)
 	}
 
+	// 10. Register broker to controller Raft state machine
+	if err := b.Controller.RegisterBroker(); err != nil {
+		log.Printf("Warning: Failed to register broker to controller: %v", err)
+	}
+
+	// 11. Update broker status to active after successful startup
+	if err := b.discovery.UpdateBrokerStatus(b.ID, "active"); err != nil {
+		log.Printf("Warning: Failed to update broker status to active: %v", err)
+	}
+
+	// 12. Start heartbeat to controller
+	b.startHeartbeat()
+
 	log.Printf("Broker %s started successfully", b.ID)
 	return nil
 }
@@ -208,7 +222,14 @@ func (b *Broker) GetDeduplicator() *deduplication.Deduplicator {
 func (b *Broker) Stop() error {
 	log.Printf("Stopping Broker %s...", b.ID)
 
-	b.cancel()
+	// Unregister broker from controller before shutdown
+	if b.Controller != nil {
+		if err := b.unregisterBroker(); err != nil {
+			log.Printf("Warning: Failed to unregister broker: %v", err)
+		}
+	}
+
+	b.Cancel()
 
 	if b.ClientServer != nil {
 		b.ClientServer.Stop()
@@ -405,6 +426,81 @@ func validateConfig(config *BrokerConfig) error {
 	}
 
 	return nil
+}
+
+// startHeartbeat starts periodic heartbeat to controller to update LastSeen time
+func (b *Broker) startHeartbeat() {
+	b.wg.Add(1)
+	go func() {
+		defer b.wg.Done()
+
+		// Wait for controller to be ready before starting heartbeat
+		for i := 0; i < 10; i++ {
+			time.Sleep(1 * time.Second)
+			if b.Controller != nil {
+				break
+			}
+		}
+
+		if b.Controller == nil {
+			log.Printf("Controller not initialized after 10 seconds, heartbeat disabled")
+			return
+		}
+
+		ticker := time.NewTicker(30 * time.Second) // Send heartbeat every 30 seconds
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				if err := b.sendHeartbeat(); err != nil {
+					log.Printf("Failed to send heartbeat: %v", err)
+				}
+			case <-b.Ctx.Done():
+				return
+			}
+		}
+	}()
+}
+
+// sendHeartbeat sends heartbeat to controller to update LastSeen time
+func (b *Broker) sendHeartbeat() error {
+	if b.Controller == nil {
+		return fmt.Errorf("controller not initialized")
+	}
+
+	if b.raftManager == nil {
+		return fmt.Errorf("raft manager not initialized")
+	}
+
+	cmd := &raft.ControllerCommand{
+		Type:      protocol.RaftCmdUpdateBrokerLoad,
+		ID:        fmt.Sprintf("heartbeat-%s-%d", b.ID, time.Now().UnixNano()),
+		Timestamp: time.Now(),
+		Data: map[string]interface{}{
+			"broker_id": b.ID,
+		},
+	}
+
+	return b.Controller.ExecuteCommand(cmd)
+}
+
+// unregisterBroker unregisters this broker from controller
+func (b *Broker) unregisterBroker() error {
+	if b.Controller == nil {
+		return fmt.Errorf("controller not initialized")
+	}
+
+	cmd := &raft.ControllerCommand{
+		Type:      protocol.RaftCmdUnregisterBroker,
+		ID:        fmt.Sprintf("unregister-%s-%d", b.ID, time.Now().UnixNano()),
+		Timestamp: time.Now(),
+		Data: map[string]interface{}{
+			"broker_id": b.ID,
+		},
+	}
+
+	return b.Controller.ExecuteCommand(cmd)
 }
 
 func (b *Broker) startSystemMetrics() error {
