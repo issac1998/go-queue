@@ -232,7 +232,6 @@ func (s *Segment) FindPosition(offset int64) (int64, error) {
 	var nearestEntry IndexEntry
 	var startPos int64
 
-	
 	if len(s.IndexEntries) == 0 {
 		startPos = 0
 	} else {
@@ -255,7 +254,6 @@ func (s *Segment) FindPosition(offset int64) (int64, error) {
 		}
 	}
 
-	
 	currentPos := startPos
 	currentOffset := s.BaseOffset
 	if nearestEntry.Offset != 0 {

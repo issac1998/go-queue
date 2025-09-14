@@ -69,6 +69,7 @@ func main() {
 	}
 
 	result1, err := orderedProducer.SendOrderedMessages(topicName, user123Events)
+	fmt.Println(result1)
 	if err != nil {
 		log.Fatalf("❌ 发送用户123事件失败: %v", err)
 	}

@@ -57,6 +57,7 @@ type CommandConfig struct {
 	Type      string `json:"type"`
 	Topic     string `json:"topic"`
 	Partition int    `json:"partition"`
+	Replicas  int    `json:"replicas"`
 	Message   string `json:"message"`
 	Offset    int64  `json:"offset"`
 	Count     int    `json:"count"`

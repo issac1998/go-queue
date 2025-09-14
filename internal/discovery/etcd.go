@@ -29,7 +29,6 @@ func NewEtcdDiscovery(config *DiscoveryConfig) (*EtcdDiscovery, error) {
 		config.Endpoints = []string{"localhost:2379"}
 	}
 
-	// Parse timeout
 	timeout := 5 * time.Second
 	if config.Timeout != "" {
 		if t, err := time.ParseDuration(config.Timeout); err == nil {
@@ -37,13 +36,11 @@ func NewEtcdDiscovery(config *DiscoveryConfig) (*EtcdDiscovery, error) {
 		}
 	}
 
-	// Create etcd client configuration
 	clientConfig := clientv3.Config{
 		Endpoints:   config.Endpoints,
 		DialTimeout: timeout,
 	}
 
-	// Add authentication if provided
 	if config.Username != "" && config.Password != "" {
 		clientConfig.Username = config.Username
 		clientConfig.Password = config.Password
@@ -152,11 +149,8 @@ func (ed *EtcdDiscovery) DiscoverBrokers() ([]*BrokerInfo, error) {
 			continue
 		}
 
-		// Check if broker is still alive (within last 60 seconds)
-		if time.Since(broker.LastSeen) > 60*time.Second {
-			// Broker is considered dead, skip it
-			continue
-		}
+		// Note: We rely on etcd lease mechanism for broker liveness,
+		// so we don't need to check LastSeen time here
 
 		brokers = append(brokers, &broker)
 	}
@@ -251,11 +245,4 @@ func (ed *EtcdDiscovery) WatchBrokers(callback func(*BrokerInfo, string)) error 
 	}()
 
 	return nil
-}
-
-// NewConsulDiscovery creates a placeholder consul discovery (not implemented yet)
-func NewConsulDiscovery(config *DiscoveryConfig) (Discovery, error) {
-	// TODO: Implement Consul discovery
-	fmt.Println("ConsulDiscovery: not implemented, falling back to memory")
-	return NewMemoryDiscovery(), nil
 }

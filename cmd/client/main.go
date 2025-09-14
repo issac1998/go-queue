@@ -23,6 +23,8 @@ func main() {
 		count      = flag.Int("count", -1, "Message count (overrides config)")
 		broker     = flag.String("broker", "", "Broker address (overrides config)")
 		logFile    = flag.String("log", "", "Log file path (overrides config)")
+		partitions = flag.Int("partitions", 1, "Number of partitions for topic creation")
+		replicas   = flag.Int("replicas", 1, "Number of replicas for topic creation")
 	)
 	flag.Parse()
 
@@ -55,6 +57,8 @@ func main() {
 	if *count >= 0 {
 		clientConfig.Command.Count = *count
 	}
+	// Note: partitions and replicas are only used for topic creation
+	// Don't override the partition setting here
 
 	if clientConfig.LogFile != "" {
 		file, err := os.OpenFile(clientConfig.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
@@ -87,7 +91,15 @@ func main() {
 
 	switch clientConfig.Command.Type {
 	case "create-topic":
-		createTopic(c, clientConfig.Command.Topic)
+		partitionCount := int32(1)
+		replicaCount := int32(1)
+		if *partitions > 0 {
+			partitionCount = int32(*partitions)
+		}
+		if *replicas > 0 {
+			replicaCount = int32(*replicas)
+		}
+		createTopic(c, clientConfig.Command.Topic, partitionCount, replicaCount)
 	case "list-topics":
 		listTopics(c)
 	case "describe-topic":
@@ -132,17 +144,25 @@ func printUsage() {
 	flag.PrintDefaults()
 }
 
-func createTopic(c *client.Client, topicName string) {
+func createTopic(c *client.Client, topicName string, partitions int32, replicas int32) {
 	if topicName == "" {
 		log.Fatal("Please specify topic name")
 	}
 
-	log.Printf("Starting to create topic: %s", topicName)
+	// Set defaults if not specified
+	if partitions <= 0 {
+		partitions = 1
+	}
+	if replicas <= 0 {
+		replicas = 1
+	}
+
+	log.Printf("Starting to create topic: %s with %d partitions and %d replicas", topicName, partitions, replicas)
 	admin := client.NewAdmin(c)
 	result, err := admin.CreateTopic(client.CreateTopicRequest{
 		Name:       topicName,
-		Partitions: 1,
-		Replicas:   1,
+		Partitions: partitions,
+		Replicas:   replicas,
 	})
 
 	if err != nil {
@@ -153,8 +173,8 @@ func createTopic(c *client.Client, topicName string) {
 		log.Fatalf("Failed to create topic: %v", result.Error)
 	}
 
-	log.Printf("Topic '%s' created successfully", result.Name)
-	fmt.Printf("Topic '%s' created successfully!\n", result.Name)
+	log.Printf("Topic '%s' created successfully with %d partitions and %d replicas", result.Name, partitions, replicas)
+	fmt.Printf("Topic '%s' created successfully with %d partitions and %d replicas!\n", result.Name, partitions, replicas)
 }
 
 func produce(c *client.Client, topicName string, partition int32, message string, count int) {

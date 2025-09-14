@@ -7,7 +7,7 @@ import (
 	"github.com/issac1998/go-queue/internal/protocol"
 )
 
-// ExampleUsage 展示如何使用事务管理器
+// ExampleUsage demonstrates how to use transaction manager
 func ExampleUsage() {
 	tm := NewTransactionManager()
 	defer tm.Stop()
@@ -31,7 +31,7 @@ func ExampleUsage() {
 		Key:           []byte("test-key"),
 		Value:         []byte("test-value"),
 		Headers:       map[string]string{"source": "test"},
-		Timeout:       30000, // 30秒
+		Timeout:       30000, // 30 seconds
 		ProducerGroup: "producer-group-1",
 	}
 
@@ -86,7 +86,6 @@ func ExampleRollback() {
 		log.Printf("Prepare transaction failed: %s", resp.Error)
 		return
 	}
-
 
 	rollbackResp, err := tm.RollbackTransaction("txn-002")
 	if err != nil {

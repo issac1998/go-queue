@@ -26,7 +26,7 @@ func NewAdmin(client *Client) *Admin {
 type CreateTopicRequest struct {
 	Name       string
 	Partitions int32
-	Replicas   int32 // Not supported yet, set to 1
+	Replicas   int32 
 }
 
 // CreateTopicResult create topic result

@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/issac1998/go-queue/internal/discovery"
 	"github.com/issac1998/go-queue/internal/protocol"
 	"github.com/issac1998/go-queue/internal/raft"
 )
@@ -141,31 +143,68 @@ func (cm *ControllerManager) Stop() error {
 
 // initControllerRaftGroup initializes the Controller Raft Group
 func (cm *ControllerManager) initControllerRaftGroup() error {
-	brokers, err := cm.broker.discovery.DiscoverBrokers()
-	if err != nil {
-		return fmt.Errorf("broker discovery failed: %v", err)
+	// Retry broker discovery to handle timing issues
+	var brokers []*discovery.BrokerInfo
+	var err error
+
+	// Try multiple times to discover brokers, with increasing delays
+	for attempt := 0; attempt < 10; attempt++ {
+		brokers, err = cm.broker.discovery.DiscoverBrokers()
+		if err != nil {
+			return fmt.Errorf("broker discovery failed: %v", err)
+		}
+
+		// If we found more than just ourselves, proceed
+		if len(brokers) > 1 {
+			break
+		}
+
+		// Only proceed with single broker if we've waited long enough
+		// This ensures we don't miss other brokers due to timing issues
+		if attempt >= 7 && len(brokers) == 1 {
+			log.Printf("Proceeding with single broker after %d attempts", attempt+1)
+			break
+		}
+
+		// Wait before retrying, with exponential backoff
+		waitTime := time.Duration(attempt+1) * 1000 * time.Millisecond
+		log.Printf("Only found %d broker(s), retrying discovery in %v (attempt %d/10)", len(brokers), waitTime, attempt+1)
+		time.Sleep(waitTime)
 	}
+
+	log.Printf("Discovered %d broker(s) for controller initialization", len(brokers))
 
 	members := make(map[uint64]string)
-	for _, broker := range brokers {
-		nodeID := cm.brokerIDToNodeID(broker.ID)
-		members[nodeID] = broker.RaftAddress
-	}
-
-	currentNodeID := cm.broker.Config.RaftConfig.NodeID
-	if _, exists := members[currentNodeID]; !exists {
-		members[currentNodeID] = cm.broker.Config.RaftConfig.RaftAddr
-	}
 
 	log.Printf("Initializing Controller Raft Group with members: %v", members)
 
-	isFirstNode := len(brokers) <= 1
+	// Determine if this broker should create or join the cluster
+	var shouldJoin bool
+	if len(brokers) > 1 {
+		shouldJoin = true
+		members = make(map[uint64]string)
 
+		log.Printf("Multiple brokers discovered, joining existing cluster")
+	} else {
+		for _, broker := range brokers {
+			nodeID := cm.brokerIDToNodeID(broker.ID)
+			members[nodeID] = broker.RaftAddress
+		}
+
+		// Use broker ID to generate consistent node ID
+		currentNodeID := cm.brokerIDToNodeID(cm.broker.ID)
+		if _, exists := members[currentNodeID]; !exists {
+			members[currentNodeID] = cm.broker.Config.RaftConfig.RaftAddr
+		}
+		log.Printf("Single broker discovered, creating new cluster")
+	}
+
+	log.Printf("Starting Controller Raft Group (join=%t)", shouldJoin)
 	err = cm.broker.raftManager.StartRaftGroup(
 		raft.ControllerGroupID,
 		members,
 		cm.stateMachine,
-		!isFirstNode,
+		shouldJoin,
 	)
 	if err != nil {
 		return fmt.Errorf("controller raft group start failed: %v", err)
@@ -284,7 +323,8 @@ func (cm *ControllerManager) executeRaftCommand(cmd *raft.ControllerCommand) err
 		return fmt.Errorf("failed to marshal command: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Use longer timeout for Raft operations to avoid premature timeouts
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	_, err = cm.broker.raftManager.SyncPropose(
@@ -325,7 +365,8 @@ func (cm *ControllerManager) QueryMetadata(queryType string, params map[string]i
 		return nil, fmt.Errorf("failed to marshal query: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Use longer timeout for SyncRead operations to avoid premature timeouts
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	//TODO: Should We use sync Read, or just read it from stateMachine?
 	result, err := cm.broker.raftManager.SyncRead(
@@ -636,11 +677,9 @@ func (cm *ControllerManager) isValidReplica(assignment *raft.PartitionAssignment
 }
 
 func (cm *ControllerManager) brokerIDToNodeID(brokerID string) uint64 {
-	hash := uint64(0)
-	for _, b := range []byte(brokerID) {
-		hash = hash*31 + uint64(b)
-	}
-	return hash
+	h := fnv.New64a()
+	h.Write([]byte(brokerID))
+	return h.Sum64()
 }
 
 // Health checker implementation
@@ -715,14 +754,34 @@ func (cm *ControllerManager) getAvailableBrokers() ([]*raft.BrokerInfo, error) {
 		return nil, fmt.Errorf("failed to marshal query: %w", err)
 	}
 
-	result, err := cm.broker.raftManager.SyncRead(context.Background(), uint64(1), queryBytes)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := cm.broker.raftManager.SyncRead(ctx, uint64(1), queryBytes)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query brokers: %w", err)
 	}
 
+	if result == nil {
+		return nil, fmt.Errorf("received nil result from raft query")
+	}
+
 	var brokersMap map[string]*raft.BrokerInfo
-	if err := json.Unmarshal(result.([]byte), &brokersMap); err != nil {
-		return nil, fmt.Errorf("failed to parse brokers: %w", err)
+
+	// Try to cast directly to the expected type first
+	if directMap, ok := result.(map[string]*raft.BrokerInfo); ok {
+		brokersMap = directMap
+	} else if resultBytes, ok := result.([]byte); ok {
+		// Fallback to JSON unmarshaling
+		if err := json.Unmarshal(resultBytes, &brokersMap); err != nil {
+			return nil, fmt.Errorf("failed to parse brokers: %w", err)
+		}
+	} else {
+		return nil, fmt.Errorf("unexpected result type: %T", result)
+	}
+
+	fmt.Printf("DEBUG: brokersMap contains %d brokers\n", len(brokersMap))
+	for id, broker := range brokersMap {
+		fmt.Printf("DEBUG: Broker %s - Status: %s, Address: %s\n", id, broker.Status, broker.Address)
 	}
 
 	var available []*raft.BrokerInfo
@@ -732,6 +791,7 @@ func (cm *ControllerManager) getAvailableBrokers() ([]*raft.BrokerInfo, error) {
 		}
 	}
 
+	fmt.Printf("DEBUG: Found %d active brokers\n", len(available))
 	return available, nil
 }
 

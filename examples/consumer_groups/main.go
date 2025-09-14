@@ -37,7 +37,7 @@ func main() {
 	producer := client.NewProducer(c)
 
 	for i := 0; i < 20; i++ {
-		partition := int32(i % 4) // 轮询分配到4个分区
+		partition := int32(i % 4) // Round-robin assignment to 4 partitions
 		message := fmt.Sprintf("Message %d for consumer groups", i+1)
 
 		result, err := producer.Send(client.ProduceMessage{
@@ -116,7 +116,7 @@ func main() {
 
 			done := make(chan struct{})
 			go func() {
-				time.Sleep(10 * time.Second) // 消费10秒
+				time.Sleep(10 * time.Second) // Consume for 10 seconds
 				close(done)
 			}()
 
@@ -129,7 +129,7 @@ func main() {
 
 						startOffset, err := gc.FetchCommittedOffset(t, p)
 						if err != nil {
-							startOffset = 0 // 如果没有提交的offset，从头开始
+							startOffset = 0 // Start from beginning if no committed offset
 						}
 
 						offset := startOffset
