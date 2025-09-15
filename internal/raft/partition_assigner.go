@@ -325,7 +325,6 @@ func (pa *PartitionAssigner) startRaftGroupOnBroker(
 		assignment.RaftGroupID, brokerID, join)
 
 	if brokerID == pa.getCurrentBrokerID() {
-		// This is the current broker - start directly
 		return pa.startRaftGroupLocally(assignment, nodeMembers, join)
 	}
 	return pa.sendStartRaftGroupCommand(assignment, nodeMembers, brokerID, join)

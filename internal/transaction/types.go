@@ -102,5 +102,4 @@ type TransactionListener interface {
 
 type RaftProposer interface {
 	ProposeCommand(groupID uint64, data []byte) error
-	SyncRead(groupID uint64, query []byte) (interface{}, error)
 }
