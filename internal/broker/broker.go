@@ -340,12 +340,10 @@ func (b *Broker) initController() error {
 
 	b.Controller = controller
 
-	// Start Controller Raft Group
 	if err := b.Controller.Start(); err != nil {
 		return fmt.Errorf("failed to start controller: %v", err)
 	}
 
-	// Set broker reference in PartitionAssigner for accessing compression/deduplication components
 	if b.Controller.stateMachine != nil {
 		if partitionAssigner := b.Controller.stateMachine.GetPartitionAssigner(); partitionAssigner != nil {
 			partitionAssigner.SetBroker(b)

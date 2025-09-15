@@ -134,7 +134,15 @@ func (rm *RaftManager) StartRaftGroup(groupID uint64, members map[uint64]string,
 		CompactionOverhead: rm.config.CompactionOverhead,
 	}
 
-	err := rm.nodeHost.StartCluster(members, join, func(uint64, uint64) statemachine.IStateMachine {
+	
+	var initialMembers map[uint64]string
+	if join {
+		initialMembers = make(map[uint64]string)
+	} else {
+		initialMembers = members
+	}
+
+	err := rm.nodeHost.StartCluster(initialMembers, join, func(uint64, uint64) statemachine.IStateMachine {
 		return sm
 	}, raftConfig)
 
@@ -205,6 +213,16 @@ func (rm *RaftManager) SyncRead(ctx context.Context, groupID uint64, query []byt
 // TransferLeadership transfers leadership of the specified group to target node
 func (rm *RaftManager) TransferLeadership(groupID uint64, targetNodeID uint64) error {
 	return rm.nodeHost.RequestLeaderTransfer(groupID, targetNodeID)
+}
+
+// RequestAddNode adds a new node to an existing Raft cluster
+func (rm *RaftManager) RequestAddNode(groupID uint64, nodeID uint64, address string, configChangeID uint64, timeout time.Duration) (*dragonboat.RequestState, error) {
+	return rm.nodeHost.RequestAddNode(groupID, nodeID, address, configChangeID, timeout)
+}
+
+// RequestDeleteNode removes a node from an existing Raft cluster
+func (rm *RaftManager) RequestDeleteNode(groupID uint64, nodeID uint64, configChangeID uint64, timeout time.Duration) (*dragonboat.RequestState, error) {
+	return rm.nodeHost.RequestDeleteNode(groupID, nodeID, configChangeID, timeout)
 }
 
 // GetLeaderID returns the current leader node ID for the specified group
