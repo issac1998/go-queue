@@ -408,12 +408,7 @@ func (h *CreateTopicHandler) Handle(conn net.Conn, cs *ClientServer) error {
 	err = cs.broker.Controller.CreateTopic(topicName, partitions, replicas)
 	fmt.Println("CreateTopic result:", err)
 	if err != nil {
-		buf := new(bytes.Buffer)
-		if writeErr := binary.Write(buf, binary.BigEndian, int16(protocol.ErrorInternalError)); writeErr != nil {
-			log.Printf("Failed to write error response: %v", writeErr)
-			return nil
-		}
-		cs.sendSuccessResponse(conn, buf.Bytes())
+		cs.sendErrorResponse(conn, fmt.Errorf("failed to create topic: %v", err))
 		log.Printf("Failed to create topic '%s': %v", topicName, err)
 		return nil
 	}
@@ -543,12 +538,12 @@ func (h *ListTopicsHandler) buildListTopicsResponse(topicsData []byte) ([]byte, 
 func (cs *ClientServer) sendOrderedProduceErrorResponse(conn net.Conn, errorMsg string) error {
 	// Send complete PartitionProduceResponse structure that client expects
 	errorResponse := struct {
-		Partition int32                 `json:"partition"`
-		Results   []interface{}         `json:"results"`
-		ErrorCode int16                 `json:"error_code"`
-		Error     string                `json:"error,omitempty"`
+		Partition int32         `json:"partition"`
+		Results   []interface{} `json:"results"`
+		ErrorCode int16         `json:"error_code"`
+		Error     string        `json:"error,omitempty"`
 	}{
-		Partition: -1,      // -1 indicates error at request level
+		Partition: -1,              // -1 indicates error at request level
 		Results:   []interface{}{}, // empty results array
 		ErrorCode: -1,
 		Error:     errorMsg,

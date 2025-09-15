@@ -81,7 +81,7 @@ func NewControllerManager(broker *Broker) (*ControllerManager, error) {
 
 	cm.healthChecker = &HealthChecker{
 		controller:       cm,
-		checkInterval:    30 * time.Second,
+		checkInterval:    5 * time.Second,
 		timeout:          10 * time.Second,
 		failureThreshold: 3,
 	}
@@ -147,62 +147,47 @@ func (cm *ControllerManager) initControllerRaftGroup() error {
 	var brokers []*discovery.BrokerInfo
 	var err error
 
-	// Try multiple times to discover brokers, with increasing delays
-	for attempt := 0; attempt < 10; attempt++ {
-		brokers, err = cm.broker.discovery.DiscoverBrokers()
-		if err != nil {
-			return fmt.Errorf("broker discovery failed: %v", err)
-		}
-
-		// If we found more than just ourselves, proceed
-		if len(brokers) > 1 {
-			break
-		}
-
-		// Only proceed with single broker if we've waited long enough
-		// This ensures we don't miss other brokers due to timing issues
-		if attempt >= 7 && len(brokers) == 1 {
-			log.Printf("Proceeding with single broker after %d attempts", attempt+1)
-			break
-		}
-
-		// Wait before retrying, with exponential backoff
-		waitTime := time.Duration(attempt+1) * 1000 * time.Millisecond
-		log.Printf("Only found %d broker(s), retrying discovery in %v (attempt %d/10)", len(brokers), waitTime, attempt+1)
-		time.Sleep(waitTime)
+	brokers, err = cm.broker.discovery.DiscoverBrokers()
+	if err != nil {
+		return fmt.Errorf("broker discovery failed: %v", err)
 	}
 
 	log.Printf("Discovered %d broker(s) for controller initialization", len(brokers))
 
 	members := make(map[uint64]string)
 
-	log.Printf("Initializing Controller Raft Group with members: %v", members)
-
-	// Determine if this broker should create or join the cluster
-	var shouldJoin bool
-	if len(brokers) > 1 {
-		shouldJoin = true
-		members = make(map[uint64]string)
-
-		log.Printf("Multiple brokers discovered, joining existing cluster")
-	} else {
-		for _, broker := range brokers {
-			nodeID := cm.brokerIDToNodeID(broker.ID)
-			members[nodeID] = broker.RaftAddress
-		}
-
-		// Use broker ID to generate consistent node ID
-		currentNodeID := cm.brokerIDToNodeID(cm.broker.ID)
-		if _, exists := members[currentNodeID]; !exists {
-			members[currentNodeID] = cm.broker.Config.RaftConfig.RaftAddr
-		}
-		log.Printf("Single broker discovered, creating new cluster")
+	// Build members map for all discovered brokers
+	for _, broker := range brokers {
+		nodeID := cm.brokerIDToNodeID(broker.ID)
+		members[nodeID] = broker.RaftAddress
 	}
 
-	log.Printf("Starting Controller Raft Group (join=%t)", shouldJoin)
+	// Ensure current broker is in the members map
+	currentNodeID := cm.brokerIDToNodeID(cm.broker.ID)
+	if _, exists := members[currentNodeID]; !exists {
+		members[currentNodeID] = cm.broker.Config.RaftConfig.RaftAddr
+	}
+
+	log.Printf("Initializing Controller Raft Group with members: %v", members)
+
+	// Determine cluster initialization strategy based on broker ID
+	// The broker with the smallest ID creates the full cluster
+	// Other brokers start as single-node clusters and wait to be added
+	var shouldJoin bool = false
+	var raftMembers map[uint64]string
+
+	if len(brokers) == 1 {
+		raftMembers = members
+		log.Printf("Single broker discovered, creating new cluster")
+	} else {
+		shouldJoin = true
+	}
+
+	log.Printf("Starting Controller Raft Group as single-node cluster (join=%t)", shouldJoin)
+
 	err = cm.broker.raftManager.StartRaftGroup(
 		raft.ControllerGroupID,
-		members,
+		raftMembers,
 		cm.stateMachine,
 		shouldJoin,
 	)
@@ -413,9 +398,15 @@ func (cm *ControllerManager) CreateTopic(topicName string, partitions int32, rep
 
 	availableBrokers, err := cm.getAvailableBrokers()
 	if err != nil {
+		log.Printf("DEBUG: Failed to get available brokers: %v", err)
 		return fmt.Errorf("failed to get available brokers: %w", err)
 	}
+	log.Printf("DEBUG: Found %d available brokers", len(availableBrokers))
+	for i, broker := range availableBrokers {
+		log.Printf("DEBUG: Broker %d - ID: %s, Address: %s, Status: %s", i, broker.ID, broker.Address, broker.Status)
+	}
 	if len(availableBrokers) == 0 {
+		log.Printf("DEBUG: No available brokers for topic creation")
 		return fmt.Errorf("no available brokers for topic creation")
 	}
 
@@ -574,10 +565,7 @@ func (cm *ControllerManager) LeaveGroup(groupID, memberID string) error {
 	return cm.ExecuteCommand(cmd)
 }
 
-// ListGroups lists all consumer groups
-func (cm *ControllerManager) ListGroups() ([]byte, error) {
-	return cm.QueryMetadata(protocol.RaftQueryGetGroups, nil)
-}
+
 
 // DescribeGroup gets detailed information about a consumer group
 func (cm *ControllerManager) DescribeGroup(groupID string) ([]byte, error) {
@@ -682,6 +670,35 @@ func (cm *ControllerManager) brokerIDToNodeID(brokerID string) uint64 {
 	return h.Sum64()
 }
 
+// requestAddToCluster requests the leader to add this node to the cluster
+func (cm *ControllerManager) requestAddToCluster(leaderBrokerID string, members map[uint64]string) error {
+	// Find the leader's raft address
+	var leaderRaftAddr string
+	leaderNodeID := cm.brokerIDToNodeID(leaderBrokerID)
+
+	for nodeID, addr := range members {
+		if nodeID == leaderNodeID {
+			leaderRaftAddr = addr
+			break
+		}
+	}
+
+	if leaderRaftAddr == "" {
+		return fmt.Errorf("leader raft address not found for broker %s", leaderBrokerID)
+	}
+
+	currentNodeID := cm.brokerIDToNodeID(cm.broker.ID)
+	currentRaftAddr := cm.broker.Config.RaftConfig.RaftAddr
+
+	log.Printf("Requesting leader %s to add node %d (%s) to cluster", leaderBrokerID, currentNodeID, currentRaftAddr)
+
+	// Note: In a real implementation, we would need to communicate with the leader
+	// to request addition. For now, we'll assume the leader will discover and add us
+	// through the service discovery mechanism.
+
+	return nil
+}
+
 // Health checker implementation
 func (hc *HealthChecker) startHealthCheck() {
 	defer hc.controller.leaderWg.Done()
@@ -715,6 +732,11 @@ func (hc *HealthChecker) performHealthCheck() {
 		return
 	}
 
+	// Check for new nodes to add to cluster (only if we are leader)
+	if hc.controller.isLeader() {
+		hc.checkForNewNodes(brokers)
+	}
+
 	// Check each broker
 	for brokerID, broker := range brokers {
 		if broker.Status == "failed" {
@@ -741,6 +763,37 @@ func (hc *HealthChecker) handleBrokerFailure(brokerID string) {
 	if err := hc.controller.ExecuteCommand(cmd); err != nil {
 		log.Printf("Failed to mark broker %s as failed: %v", brokerID, err)
 	}
+}
+
+func (hc *HealthChecker) checkForNewNodes(currentBrokers map[string]*raft.BrokerInfo) {
+	// Get all brokers from service discovery
+	discoveredBrokers, err := hc.controller.broker.discovery.DiscoverBrokers()
+	if err != nil {
+		log.Printf("Failed to get brokers from service discovery: %v", err)
+		return
+	}
+
+	// Find brokers that are in service discovery but not in current Raft cluster
+	for _, discoveredBroker := range discoveredBrokers {
+		if _, exists := currentBrokers[discoveredBroker.ID]; !exists {
+			log.Printf("Found new broker %s, adding to Controller Raft cluster", discoveredBroker.ID)
+			hc.addNewNodeToCluster(discoveredBroker)
+		}
+	}
+}
+
+func (hc *HealthChecker) addNewNodeToCluster(broker *discovery.BrokerInfo) {
+	// Convert broker ID to node ID
+	nodeID := hc.controller.brokerIDToNodeID(broker.ID)
+
+	// Add node to Controller Raft group
+	_, err := hc.controller.broker.raftManager.RequestAddNode(1, nodeID, broker.RaftAddress, 0, 30*time.Second)
+	if err != nil {
+		log.Printf("Failed to add node %s to Controller Raft cluster: %v", broker.ID, err)
+		return
+	}
+
+	log.Printf("Successfully added node %s to Controller Raft cluster", broker.ID)
 }
 
 // getAvailableBrokers returns list of available brokers

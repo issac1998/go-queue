@@ -243,7 +243,6 @@ func (csm *ControllerStateMachine) unregisterBroker(data map[string]interface{})
 func (csm *ControllerStateMachine) createTopic(data map[string]interface{}) (interface{}, error) {
 	// IMPORTANT: StateMachine should only update metadata, not perform allocation
 	// The actual partition allocation should be done by Controller Leader BEFORE calling this
-
 	topicName := data["topic_name"].(string)
 	partitions := int32(data["partitions"].(float64))
 	replicationFactor := int32(data["replication_factor"].(float64))
