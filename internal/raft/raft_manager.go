@@ -116,6 +116,9 @@ func (rm *RaftManager) initNodeHost() error {
 }
 
 // StartRaftGroup starts a new Raft group with the specified configuration
+// Following dragonboat specification:
+// - For creating node (join=false): initialMembers contains all cluster members
+// - For joining node (join=true): initialMembers contains existing cluster members for discovery
 func (rm *RaftManager) StartRaftGroup(groupID uint64, members map[uint64]string, sm statemachine.IStateMachine, join bool) error {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
@@ -134,13 +137,21 @@ func (rm *RaftManager) StartRaftGroup(groupID uint64, members map[uint64]string,
 		CompactionOverhead: rm.config.CompactionOverhead,
 	}
 
-	
 	var initialMembers map[uint64]string
 	if join {
+		// For joining nodes, we still need to provide existing members for discovery
+		// Remove current node from the members list since it's joining
 		initialMembers = make(map[uint64]string)
+		for nodeID, address := range members {
+			if nodeID != rm.config.NodeID {
+				initialMembers[nodeID] = address
+			}
+		}
 	} else {
 		initialMembers = members
 	}
+
+	log.Printf("Starting Raft group %d (join=%t) with initialMembers: %v", groupID, join, initialMembers)
 
 	err := rm.nodeHost.StartCluster(initialMembers, join, func(uint64, uint64) statemachine.IStateMachine {
 		return sm
@@ -157,7 +168,7 @@ func (rm *RaftManager) StartRaftGroup(groupID uint64, members map[uint64]string,
 		IsController: groupID == 1,
 	}
 
-	log.Printf("Raft group %d started successfully", groupID)
+	log.Printf("Raft group %d started successfully (join=%t)", groupID, join)
 	return nil
 }
 
