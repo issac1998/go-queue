@@ -130,8 +130,8 @@ func NewBroker(config *BrokerConfig) (*Broker, error) {
 		Address: config.BindAddr,
 		Port:    config.BindPort,
 		Config:  config,
-		Ctx:    ctx,
-		Cancel: cancel,
+		Ctx:     ctx,
+		Cancel:  cancel,
 	}
 
 	return broker, nil
