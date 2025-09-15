@@ -272,8 +272,13 @@ func (pa *PartitionAssigner) StartPartitionRaftGroups(assignments []*PartitionAs
 
 // startSinglePartitionRaftGroup coordinates the startup of a single partition Raft group
 func (pa *PartitionAssigner) startSinglePartitionRaftGroup(assignment *PartitionAssignment) error {
-	log.Printf("Starting Raft group %d for partition %s-%d with replicas %v",
-		assignment.RaftGroupID, assignment.TopicName, assignment.PartitionID, assignment.Replicas)
+	log.Printf("Starting Raft group %d for partition %s-%d with replicas %v, preferred leader: %s",
+		assignment.RaftGroupID, assignment.TopicName, assignment.PartitionID, assignment.Replicas, assignment.PreferredLeader)
+
+	// Validate PreferredLeader is set
+	if assignment.PreferredLeader == "" {
+		return fmt.Errorf("PreferredLeader must be set for partition assignment")
+	}
 
 	// Convert broker IDs to node IDs and addresses
 	nodeMembers := make(map[uint64]string)
@@ -290,11 +295,18 @@ func (pa *PartitionAssigner) startSinglePartitionRaftGroup(assignment *Partition
 			return fmt.Errorf("broker %s not found in metadata", brokerID)
 		}
 	}
-	
-	for i, brokerID := range assignment.Replicas {
-		err := pa.startRaftGroupOnBroker(assignment, nodeMembers, brokerID, i == 0)
-		if err != nil {
-			return fmt.Errorf("failed to start Raft group on broker %s: %w", brokerID, err)
+
+	err := pa.startRaftGroupOnBroker(assignment, nodeMembers, assignment.PreferredLeader, true)
+	if err != nil {
+		return fmt.Errorf("failed to start Raft group on preferred leader %s: %w", assignment.PreferredLeader, err)
+	}
+
+	for _, brokerID := range assignment.Replicas {
+		if brokerID != assignment.PreferredLeader {
+			err := pa.startRaftGroupOnBroker(assignment, nodeMembers, brokerID, false)
+			if err != nil {
+				return fmt.Errorf("failed to start Raft group on replica %s: %w", brokerID, err)
+			}
 		}
 	}
 
@@ -306,21 +318,17 @@ func (pa *PartitionAssigner) startRaftGroupOnBroker(
 	assignment *PartitionAssignment,
 	nodeMembers map[uint64]string,
 	brokerID string,
-	isPreferredLeader bool,
+	join bool,
 ) error {
-	// Determine if this broker should create (join=false) or join (join=true) the cluster
-	join := !isPreferredLeader // First broker (preferred leader) creates, others join
 
-	log.Printf("Starting Raft group %d on broker %s (join=%t, isPreferredLeader=%t)",
-		assignment.RaftGroupID, brokerID, join, isPreferredLeader)
+	log.Printf("Starting Raft group %d on broker %s (join=%t)",
+		assignment.RaftGroupID, brokerID, join)
 
 	if brokerID == pa.getCurrentBrokerID() {
 		// This is the current broker - start directly
-		// maybe not contain local node ID
 		return pa.startRaftGroupLocally(assignment, nodeMembers, join)
 	}
 	return pa.sendStartRaftGroupCommand(assignment, nodeMembers, brokerID, join)
-
 }
 
 // startRaftGroupLocally starts the Raft group on the current broker
@@ -347,7 +355,6 @@ func (pa *PartitionAssigner) startRaftGroupLocally(
 		return fmt.Errorf("failed to create partition state machine: %w", err)
 	}
 
-	// Start the Raft group with correct join parameter
 	err = pa.raftManager.StartRaftGroup(
 		assignment.RaftGroupID,
 		nodeMembers,
