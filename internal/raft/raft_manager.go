@@ -211,16 +211,6 @@ func (rm *RaftManager) SyncPropose(ctx context.Context, groupID uint64, data []b
 	return result, nil
 }
 
-// SyncRead performs a linearizable read from the specified Raft group
-func (rm *RaftManager) SyncRead(ctx context.Context, groupID uint64, query []byte) (interface{}, error) {
-	result, err := rm.nodeHost.SyncRead(ctx, groupID, query)
-	if err != nil {
-		return nil, fmt.Errorf("sync read failed for group %d: %v", groupID, err)
-	}
-
-	return result, nil
-}
-
 // TransferLeadership transfers leadership of the specified group to target node
 func (rm *RaftManager) TransferLeadership(groupID uint64, targetNodeID uint64) error {
 	return rm.nodeHost.RequestLeaderTransfer(groupID, targetNodeID)
@@ -277,6 +267,19 @@ func (rm *RaftManager) GetGroups() map[uint64]*RaftGroup {
 		groups[id] = group
 	}
 	return groups
+}
+
+// GetStateMachine returns the state machine for a specific Raft group
+func (rm *RaftManager) GetStateMachine(groupID uint64) (statemachine.IStateMachine, error) {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+
+	group, exists := rm.groups[groupID]
+	if !exists {
+		return nil, fmt.Errorf("raft group %d not found", groupID)
+	}
+
+	return group.StateMachine, nil
 }
 
 // WaitForLeadershipReady waits for the raft group to have a leader within the timeout

@@ -174,7 +174,7 @@ func (cm *ControllerManager) initControllerRaftGroup() error {
 	// The broker with the smallest ID creates the full cluster
 	// Other brokers join the existing cluster
 	var shouldJoin bool = false
-	var raftMembers map[uint64]string = members
+	var raftMembers map[uint64]string 
 
 	if len(brokers) == 1 {
 		raftMembers = members
@@ -334,8 +334,7 @@ func (cm *ControllerManager) GetControlledLeaderID() (uint64, bool) {
 	return leaderNodeID, true
 }
 
-// QueryMetadata queries cluster metadata
-// TODO: Should We use sync Read, or just read it from stateMachine?
+// QueryMetadata queries cluster metadata directly from local state machine
 func (cm *ControllerManager) QueryMetadata(queryType string, params map[string]interface{}) ([]byte, error) {
 	query := map[string]interface{}{
 		"type": queryType,
@@ -349,15 +348,8 @@ func (cm *ControllerManager) QueryMetadata(queryType string, params map[string]i
 		return nil, fmt.Errorf("failed to marshal query: %v", err)
 	}
 
-	// Use longer timeout for SyncRead operations to avoid premature timeouts
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	//TODO: Should We use sync Read, or just read it from stateMachine?
-	result, err := cm.broker.raftManager.SyncRead(
-		ctx,
-		raft.ControllerGroupID,
-		queryData,
-	)
+	// Read directly from local state machine since syncPropose ensures latest state
+	result, err := cm.stateMachine.Lookup(queryData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query metadata: %v", err)
 	}
@@ -804,9 +796,8 @@ func (cm *ControllerManager) getAvailableBrokers() ([]*raft.BrokerInfo, error) {
 		return nil, fmt.Errorf("failed to marshal query: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	result, err := cm.broker.raftManager.SyncRead(ctx, uint64(1), queryBytes)
+	// Read directly from local state machine since syncPropose ensures latest state
+	result, err := cm.stateMachine.Lookup(queryBytes)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query brokers: %w", err)
 	}
@@ -888,7 +879,8 @@ func (cm *ControllerManager) getTopicAssignments(topicName string) ([]*raft.Part
 		return nil, fmt.Errorf("failed to marshal query: %w", err)
 	}
 
-	result, err := cm.broker.raftManager.SyncRead(context.Background(), uint64(1), queryBytes)
+	// Read directly from local state machine since syncPropose ensures latest state
+	result, err := cm.stateMachine.Lookup(queryBytes)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query assignments: %w", err)
 	}
