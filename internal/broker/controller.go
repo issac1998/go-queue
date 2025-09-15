@@ -172,18 +172,17 @@ func (cm *ControllerManager) initControllerRaftGroup() error {
 
 	// Determine cluster initialization strategy based on broker ID
 	// The broker with the smallest ID creates the full cluster
-	// Other brokers start as single-node clusters and wait to be added
+	// Other brokers join the existing cluster
 	var shouldJoin bool = false
-	var raftMembers map[uint64]string
+	var raftMembers map[uint64]string = members
 
 	if len(brokers) == 1 {
 		raftMembers = members
-		log.Printf("Single broker discovered, creating new cluster")
 	} else {
 		shouldJoin = true
 	}
 
-	log.Printf("Starting Controller Raft Group as single-node cluster (join=%t)", shouldJoin)
+	log.Printf("Starting Controller Raft Group with members %v (join=%t)", raftMembers, shouldJoin)
 
 	err = cm.broker.raftManager.StartRaftGroup(
 		raft.ControllerGroupID,
@@ -564,8 +563,6 @@ func (cm *ControllerManager) LeaveGroup(groupID, memberID string) error {
 
 	return cm.ExecuteCommand(cmd)
 }
-
-
 
 // DescribeGroup gets detailed information about a consumer group
 func (cm *ControllerManager) DescribeGroup(groupID string) ([]byte, error) {

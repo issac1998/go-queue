@@ -290,7 +290,7 @@ func (pa *PartitionAssigner) startSinglePartitionRaftGroup(assignment *Partition
 			return fmt.Errorf("broker %s not found in metadata", brokerID)
 		}
 	}
-
+	
 	for i, brokerID := range assignment.Replicas {
 		err := pa.startRaftGroupOnBroker(assignment, nodeMembers, brokerID, i == 0)
 		if err != nil {
@@ -316,6 +316,7 @@ func (pa *PartitionAssigner) startRaftGroupOnBroker(
 
 	if brokerID == pa.getCurrentBrokerID() {
 		// This is the current broker - start directly
+		// maybe not contain local node ID
 		return pa.startRaftGroupLocally(assignment, nodeMembers, join)
 	}
 	return pa.sendStartRaftGroupCommand(assignment, nodeMembers, brokerID, join)
