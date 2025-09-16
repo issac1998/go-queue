@@ -247,9 +247,12 @@ func (csm *ControllerStateMachine) createTopic(data map[string]interface{}) (int
 	partitions := int32(data["partitions"].(float64))
 	replicationFactor := int32(data["replication_factor"].(float64))
 
-	// Check if topic already exists
+	// Check if topic already exists - return result instead of error to avoid panic
 	if _, exists := csm.metadata.Topics[topicName]; exists {
-		return nil, fmt.Errorf("topic %s already exists", topicName)
+		return map[string]interface{}{
+			"success": false,
+			"error":   fmt.Sprintf("topic %s already exists", topicName),
+		}, nil
 	}
 
 	// Parse pre-allocated assignments from the command data
@@ -292,6 +295,7 @@ func (csm *ControllerStateMachine) createTopic(data map[string]interface{}) (int
 	log.Printf("Topic %s created with %d partitions (metadata updated in StateMachine)", topicName, len(assignments))
 
 	return map[string]interface{}{
+		"success":                  true,
 		"topic":                    topic,
 		"assignments":              assignments,
 		"partition_groups_created": len(assignments),

@@ -174,7 +174,7 @@ func (cm *ControllerManager) initControllerRaftGroup() error {
 	// The broker with the smallest ID creates the full cluster
 	// Other brokers join the existing cluster
 	var shouldJoin bool = false
-	var raftMembers map[uint64]string 
+	var raftMembers map[uint64]string
 
 	if len(brokers) == 1 {
 		raftMembers = members
@@ -290,10 +290,17 @@ func (cm *ControllerManager) ExecuteRaftCommandWithRetry(cmd *raft.ControllerCom
 	var lastErr error
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		// TODO: DO we really need to retry?
 		err := cm.executeRaftCommand(cmd)
+
 		if err == nil {
 			return nil
+		}
+		
+		lastErr = err
+		log.Printf("Raft command execution failed (attempt %d/%d): %v", attempt+1, maxRetries, err)
+		
+		if attempt < maxRetries-1 {
+			time.Sleep(time.Millisecond * 100)
 		}
 	}
 
@@ -311,13 +318,31 @@ func (cm *ControllerManager) executeRaftCommand(cmd *raft.ControllerCommand) err
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	_, err = cm.broker.raftManager.SyncPropose(
+	result, err := cm.broker.raftManager.SyncPropose(
 		ctx,
 		raft.ControllerGroupID,
 		data,
 	)
+	if err != nil {
+		return err
+	}
 
-	return err
+	// Check if the result indicates a logical error (like topic already exists)
+	if result.Data != nil {
+		var resultMap map[string]interface{}
+		if err := json.Unmarshal(result.Data, &resultMap); err == nil {
+			if success, exists := resultMap["success"]; exists {
+				if successBool, ok := success.(bool); ok && !successBool {
+					if errorMsg, exists := resultMap["error"]; exists {
+						return fmt.Errorf("%v", errorMsg)
+					}
+					return fmt.Errorf("operation failed")
+				}
+			}
+		}
+	}
+
+	return nil
 }
 
 // ExecuteCommand executes a controller command through Raft with retry logic
