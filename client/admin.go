@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log"
 	"time"
 
 	"github.com/issac1998/go-queue/internal/protocol"
@@ -256,7 +257,19 @@ func (a *Admin) parseCreateTopicResponse(topicName string, data []byte) (*Create
 	}
 
 	if errorCode != 0 {
-		result.Error = fmt.Errorf("failed to create topic, error code: %d", errorCode)
+		var errorMsgLen int32
+		if err := binary.Read(buf, binary.BigEndian, &errorMsgLen); err != nil {
+			return nil, fmt.Errorf("failed to read error message length: %v", err)
+		}
+
+		errorMsgBytes := make([]byte, errorMsgLen)
+		if _, err := io.ReadFull(buf, errorMsgBytes); err != nil {
+			return nil, fmt.Errorf("failed to read error message: %v", err)
+		}
+
+		errorMsg := string(errorMsgBytes)
+		result.Error = fmt.Errorf("server error %d: %s", errorCode, errorMsg)
+		log.Printf("CreateTopic failed for topic '%s': error code %d, message: %s", topicName, errorCode, errorMsg)
 	}
 
 	return result, nil
