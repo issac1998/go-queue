@@ -271,12 +271,18 @@ func (cs *ClientServer) sendErrorResponse(conn net.Conn, err error) {
 	errorCode := int16(protocol.ErrorInvalidRequest)
 	binary.Write(&buf, binary.BigEndian, errorCode)
 
+	// Add error message
+	errorMsg := err.Error()
+	errorMsgBytes := []byte(errorMsg)
+	binary.Write(&buf, binary.BigEndian, int32(len(errorMsgBytes)))
+	buf.Write(errorMsgBytes)
+
 	responseData := buf.Bytes()
 	responseLen := int32(len(responseData))
 
 	binary.Write(conn, binary.BigEndian, responseLen)
 	conn.Write(responseData)
-	log.Printf("Sent error response with error code: %d", errorCode)
+	log.Printf("Sent error response with error code: %d, message: %s", errorCode, errorMsg)
 }
 
 func (cs *ClientServer) sendSuccessResponse(conn net.Conn, data []byte) {
@@ -416,6 +422,11 @@ func (h *CreateTopicHandler) Handle(conn net.Conn, cs *ClientServer) error {
 	buf := new(bytes.Buffer)
 	if err := binary.Write(buf, binary.BigEndian, int16(protocol.ErrorNone)); err != nil {
 		return fmt.Errorf("failed to write success response: %v", err)
+	}
+
+	// Add empty error message for consistency with error response format
+	if err := binary.Write(buf, binary.BigEndian, int32(0)); err != nil {
+		return fmt.Errorf("failed to write error message length: %v", err)
 	}
 
 	cs.sendSuccessResponse(conn, buf.Bytes())

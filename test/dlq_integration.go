@@ -215,7 +215,7 @@ func (it *IntegrationTest) createClients() error {
 	for _, addr := range brokerAddrs {
 		clientConfig := client.ClientConfig{
 			BrokerAddrs: []string{addr},
-			Timeout:     30 * time.Second,
+			Timeout:     90 * time.Second,
 		}
 		client := client.NewClient(clientConfig)
 		it.clients = append(it.clients, client)

@@ -296,14 +296,14 @@ func (pa *PartitionAssigner) startSinglePartitionRaftGroup(assignment *Partition
 		}
 	}
 
-	err := pa.startRaftGroupOnBroker(assignment, nodeMembers, assignment.PreferredLeader, true)
+	err := pa.startRaftGroupOnBroker(assignment, nodeMembers, assignment.PreferredLeader, false)
 	if err != nil {
 		return fmt.Errorf("failed to start Raft group on preferred leader %s: %w", assignment.PreferredLeader, err)
 	}
 
 	for _, brokerID := range assignment.Replicas {
 		if brokerID != assignment.PreferredLeader {
-			err := pa.startRaftGroupOnBroker(assignment, nodeMembers, brokerID, false)
+			err := pa.startRaftGroupOnBroker(assignment, map[uint64]string{}, brokerID, true)
 			if err != nil {
 				return fmt.Errorf("failed to start Raft group on replica %s: %w", brokerID, err)
 			}
