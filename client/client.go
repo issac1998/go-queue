@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/issac1998/go-queue/internal/async"
 	"github.com/issac1998/go-queue/internal/pool"
 	"github.com/issac1998/go-queue/internal/protocol"
@@ -39,6 +40,10 @@ type Client struct {
 
 	pendingRequests map[uint64]*PendingRequest
 	pendingMutex    sync.RWMutex
+
+	producerID          string
+	deduplicatorEnabled bool
+	DeduplicatorManager *DeduplicatorManager
 }
 
 var metadataRequestTypes = map[int32]bool{
@@ -134,13 +139,16 @@ func NewClient(config ClientConfig) *Client {
 	}
 
 	client := &Client{
-		brokerAddrs:      brokerAddrs,
-		timeout:          timeout,
-		config:           config,
-		topicMetadata:    make(map[string]*TopicMetadata),
-		metadataTTL:      5 * time.Minute,
-		asyncConnections: make(map[string]*async.AsyncConnection),
-		pendingRequests:  make(map[uint64]*PendingRequest),
+		brokerAddrs:         brokerAddrs,
+		timeout:             timeout,
+		config:              config,
+		topicMetadata:       make(map[string]*TopicMetadata),
+		metadataTTL:         5 * time.Minute,
+		asyncConnections:    make(map[string]*async.AsyncConnection),
+		pendingRequests:     make(map[uint64]*PendingRequest),
+		producerID:          generateProducerID(),
+		deduplicatorEnabled: true,
+		DeduplicatorManager: NewDeduplicatorManager(),
 	}
 
 	if config.EnableConnectionPool {
@@ -784,4 +792,48 @@ func (c *Client) AsyncRequestWithCallback(brokerAddr string, requestType int32, 
 
 		c.handleAsyncStreamResponse(userData, conn, nil)
 	})
+}
+
+func generateProducerID() string {
+	return uuid.New().String()
+}
+
+// GetProducerID returns the unique producer ID for this client
+func (c *Client) GetProducerID() string {
+	return c.producerID
+}
+
+// DeduplicatorManager manages sequence numbers for idempotent producers using lock-free atomic operations
+type DeduplicatorManager struct {
+	// Use sync.Map for concurrent access with atomic counters as values
+	// Key format: "producerID:partition", Value: *atomic.Int64
+	sequenceCounters sync.Map
+}
+
+// NewDeduplicatorManager creates a new producer state manager
+func NewDeduplicatorManager() *DeduplicatorManager {
+	return &DeduplicatorManager{}
+}
+
+// GetNextSequenceNumber returns the next sequence number for a producer-partition pair
+// Uses atomic operations for high-performance concurrent access
+func (psm *DeduplicatorManager) GetNextSequenceNumber(producerID string, partition int32) int64 {
+	key := fmt.Sprintf("%s:%d", producerID, partition)
+
+	// LoadOrStore ensures atomic creation of counter if not exists
+	value, _ := psm.sequenceCounters.LoadOrStore(key, &atomic.Int64{})
+	counter := value.(*atomic.Int64)
+
+	// Atomic increment and return new value
+	return counter.Add(1)
+}
+
+// IsdeduplicatorEnabled returns whether deduplicator is enabled for this client
+func (c *Client) IsdeduplicatorEnabled() bool {
+	return c.deduplicatorEnabled
+}
+
+// GetDeduplicatorManager returns the producer state manager
+func (c *Client) GetDeduplicatorManager() *DeduplicatorManager {
+	return c.DeduplicatorManager
 }

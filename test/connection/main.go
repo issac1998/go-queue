@@ -55,9 +55,6 @@ func main() {
 		log.Printf("Failed to list topics: %v", err)
 	} else {
 		log.Printf("Found %d topics:", len(topics))
-		for _, topic := range topics {
-			log.Printf("  - %s (partitions: %d, messages: %d)", 
-				topic.Name, topic.Partitions, topic.MessageCount)
-		}
+		
 	}
 }

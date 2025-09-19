@@ -6,11 +6,14 @@ import (
 	"io"
 	"log"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/issac1998/go-queue/internal/compression"
-	"github.com/issac1998/go-queue/internal/deduplication"
+	"github.com/issac1998/go-queue/internal/deduplicator"
+
+	"github.com/issac1998/go-queue/internal/ordering"
 	"github.com/issac1998/go-queue/internal/protocol"
 	"github.com/issac1998/go-queue/internal/storage"
 	"github.com/lni/dragonboat/v3/statemachine"
@@ -18,12 +21,15 @@ import (
 
 // ProduceMessage represents a message to be produced
 type ProduceMessage struct {
-	Topic     string            `json:"topic"`
-	Partition int32             `json:"partition"`
-	Key       []byte            `json:"key,omitempty"`
-	Value     []byte            `json:"value"`
-	Headers   map[string]string `json:"headers,omitempty"`
-	Timestamp time.Time         `json:"timestamp"`
+	ProducerID     string            `json:"producer_id,omitempty"`
+	SequenceNumber int64             `json:"sequence_number,omitempty"`
+	AsyncIO        bool              `json:"async_io,omitempty"`
+	Topic          string            `json:"topic"`
+	Partition      int32             `json:"partition"`
+	Key            []byte            `json:"key,omitempty"`
+	Value          []byte            `json:"value"`
+	Headers        map[string]string `json:"headers,omitempty"`
+	Timestamp      time.Time         `json:"timestamp"`
 }
 
 // WriteResult represents the result of a write operation
@@ -98,7 +104,7 @@ type PartitionCommand struct {
 // Command types for partition operations
 const (
 	CmdProduceMessage = "produce_message"
-	CmdProduceBatch   = "produce_batch" // 新增批量写入命令
+	CmdProduceBatch   = "produce_batch"
 	CmdCleanup        = "cleanup"
 )
 
@@ -113,6 +119,20 @@ type BatchWriteResult struct {
 	Error   string        `json:"error,omitempty"`
 }
 
+// deduplicatorCommand represents producer state persistence operations
+type deduplicatorCommand struct {
+	ProducerID string          `json:"producer_id"`
+	States     map[int32]int64 `json:"states,omitempty"` // partition -> last sequence number
+	Timestamp  time.Time       `json:"timestamp"`
+}
+
+// deduplicatorResult represents the result of producer state operations
+type deduplicatorResult struct {
+	Success   bool      `json:"success"`
+	Error     string    `json:"error,omitempty"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
 // PartitionStateMachine implements statemachine.IStateMachine for partition data
 type PartitionStateMachine struct {
 	TopicName   string
@@ -124,8 +144,14 @@ type PartitionStateMachine struct {
 	mu        sync.RWMutex
 
 	// Message processing components
-	compressor   compression.Compressor
-	deduplicator *deduplication.Deduplicator
+	compressor compression.Compressor
+
+	// Deduplicator components
+	DeduplicatorManager *deduplicator.DeduplicatorManager
+	deduplicatorEnabled bool
+
+	// Ordering components
+	orderedMessageManager *ordering.OrderedMessageManager
 
 	// Metrics
 	messageCount int64
@@ -138,7 +164,7 @@ type PartitionStateMachine struct {
 }
 
 // NewPartitionStateMachine creates a state machine for a partition
-func NewPartitionStateMachine(topicName string, partitionID int32, dataDir string, compressor compression.Compressor, deduplicator *deduplication.Deduplicator) (*PartitionStateMachine, error) {
+func NewPartitionStateMachine(topicName string, partitionID int32, dataDir string, compressor compression.Compressor) (*PartitionStateMachine, error) {
 	partitionDir := filepath.Join(dataDir, "partitions", fmt.Sprintf("%s-%d", topicName, partitionID))
 
 	// Create storage partition
@@ -153,15 +179,17 @@ func NewPartitionStateMachine(topicName string, partitionID int32, dataDir strin
 	}
 
 	psm := &PartitionStateMachine{
-		TopicName:    topicName,
-		PartitionID:  partitionID,
-		DataDir:      dataDir,
-		partition:    partition,
-		compressor:   compressor,
-		deduplicator: deduplicator,
-		isReady:      true,
-		lastWrite:    time.Now(),
-		lastRead:     time.Now(),
+		TopicName:             topicName,
+		PartitionID:           partitionID,
+		DataDir:               dataDir,
+		partition:             partition,
+		compressor:            compressor,
+		DeduplicatorManager:   deduplicator.NewDeduplicatorManager(),
+		deduplicatorEnabled:   true,
+		orderedMessageManager: ordering.NewOrderedMessageManager(100, 30*time.Second), // 100 message window, 30s timeout
+		isReady:               true,
+		lastWrite:             time.Now(),
+		lastRead:              time.Now(),
 	}
 
 	log.Printf("Created PartitionStateMachine for %s-%d", topicName, partitionID)
@@ -194,7 +222,7 @@ func (psm *PartitionStateMachine) Update(data []byte) (statemachine.Result, erro
 	}
 }
 
-// handleProduceMessage handles message production
+// handleProduceMessage handles message production with ordering support
 func (psm *PartitionStateMachine) handleProduceMessage(data map[string]interface{}) (statemachine.Result, error) {
 	// Parse message data
 	var msg ProduceMessage
@@ -207,7 +235,181 @@ func (psm *PartitionStateMachine) handleProduceMessage(data map[string]interface
 		return statemachine.Result{Value: 0}, fmt.Errorf("failed to unmarshal message: %w", err)
 	}
 
-	// Create stored message
+	// Handle messages with sequence numbers using ordered processing (only for async IO producers)
+	if psm.deduplicatorEnabled && msg.ProducerID != "" && msg.SequenceNumber > 0 && msg.AsyncIO {
+		deduplicator := psm.DeduplicatorManager.GetOrCreatededuplicator(msg.ProducerID)
+
+		// Check for duplicate messages first
+		if deduplicator.IsDuplicateSequenceNumber(psm.PartitionID, msg.SequenceNumber, msg.AsyncIO) {
+			log.Printf("Duplicate sequence number %d for producer %s on partition %d",
+				msg.SequenceNumber, msg.ProducerID, psm.PartitionID)
+
+			lastOffset := deduplicator.GetLastSequenceNumber(psm.PartitionID)
+			result := WriteResult{
+				Offset:    lastOffset,
+				Timestamp: msg.Timestamp,
+			}
+			resultBytes, _ := json.Marshal(result)
+			return statemachine.Result{
+				Value: uint64(lastOffset),
+				Data:  resultBytes,
+			}, nil
+		}
+
+		// Validate sequence number
+		if !deduplicator.IsValidSequenceNumber(psm.PartitionID, msg.SequenceNumber, msg.AsyncIO) {
+
+			result := WriteResult{
+				Error: fmt.Sprintf("Invalid sequence number %d for AsyncIO producer %s",
+					msg.SequenceNumber, msg.ProducerID),
+			}
+			resultBytes, _ := json.Marshal(result)
+			return statemachine.Result{
+				Value: 0,
+				Data:  resultBytes,
+			}, nil
+		}
+
+		if msg.AsyncIO {
+			readyMessages, err := psm.orderedMessageManager.ProcessMessage(
+				psm.PartitionID, msg.ProducerID, msg.SequenceNumber, &msg)
+			if err != nil {
+				// Message is outside window or other ordering error,nor a really error
+				result := WriteResult{
+					Error: fmt.Sprintf("Ordering error for producer %s seq %d: %v",
+						msg.ProducerID, msg.SequenceNumber, err),
+				}
+				resultBytes, _ := json.Marshal(result)
+				return statemachine.Result{
+					Value: 0,
+					Data:  resultBytes,
+				}, nil
+			}
+
+			if len(readyMessages) > 0 {
+				return psm.processOrderedMessages(readyMessages)
+			} else {
+				// this is not a error
+				result := WriteResult{
+					Offset:    -1,
+					Timestamp: msg.Timestamp,
+				}
+				resultBytes, _ := json.Marshal(result)
+				return statemachine.Result{
+					Value: 0,
+					Data:  resultBytes,
+				}, nil
+			}
+		}
+	}
+
+	// non-AsyncIO messages
+	if psm.deduplicatorEnabled && msg.ProducerID != "" && msg.SequenceNumber > 0 && !msg.AsyncIO {
+		deduplicator := psm.DeduplicatorManager.GetOrCreatededuplicator(msg.ProducerID)
+
+		// Check for duplicate messages first
+		if deduplicator.IsDuplicateSequenceNumber(psm.PartitionID, msg.SequenceNumber, msg.AsyncIO) {
+			log.Printf("Duplicate sequence number %d for producer %s on partition %d",
+				msg.SequenceNumber, msg.ProducerID, psm.PartitionID)
+
+			lastOffset := deduplicator.GetLastSequenceNumber(psm.PartitionID)
+			result := WriteResult{
+				Offset:    lastOffset,
+				Timestamp: msg.Timestamp,
+			}
+			resultBytes, _ := json.Marshal(result)
+			return statemachine.Result{
+				Value: uint64(lastOffset),
+				Data:  resultBytes,
+			}, nil
+		}
+
+		// Validate sequence number for non-AsyncIO (must be strictly sequential)
+		if !deduplicator.IsValidSequenceNumber(psm.PartitionID, msg.SequenceNumber, msg.AsyncIO) {
+			log.Printf("Invalid sequence number %d for producer %s on partition %d, expected %d",
+				msg.SequenceNumber, msg.ProducerID, psm.PartitionID,
+				deduplicator.GetLastSequenceNumber(psm.PartitionID)+1)
+
+			result := WriteResult{
+				Error: fmt.Sprintf("Invalid sequence number %d, expected %d",
+					msg.SequenceNumber, deduplicator.GetLastSequenceNumber(psm.PartitionID)+1),
+			}
+			resultBytes, _ := json.Marshal(result)
+			return statemachine.Result{
+				Value: 0,
+				Data:  resultBytes,
+			}, nil
+		}
+	}
+
+	// Store message
+	offset, err := psm.storeMessage(&msg)
+	if err != nil {
+		return statemachine.Result{Value: 0}, fmt.Errorf("failed to store message: %w", err)
+	}
+
+	// Update producer state after successful write for deduplicator
+	if psm.deduplicatorEnabled && msg.ProducerID != "" && msg.SequenceNumber > 0 {
+		deduplicator := psm.DeduplicatorManager.GetOrCreatededuplicator(msg.ProducerID)
+		deduplicator.UpdateSequenceNumber(psm.PartitionID, msg.SequenceNumber)
+	}
+
+	result := WriteResult{
+		Offset:    offset,
+		Timestamp: msg.Timestamp,
+	}
+
+	resultBytes, err := json.Marshal(result)
+	if err != nil {
+		log.Printf("Failed to marshal write result: %v", err)
+		resultBytes = []byte(fmt.Sprintf(`{"offset":%d,"timestamp":"%s"}`, offset, msg.Timestamp.Format(time.RFC3339)))
+	}
+
+	return statemachine.Result{
+		Value: uint64(offset),
+		Data:  resultBytes,
+	}, nil
+}
+
+func (psm *PartitionStateMachine) processOrderedMessages(readyMessages []*ordering.PendingMessage) (statemachine.Result, error) {
+	var results []WriteResult
+	lastOffset := int64(-1)
+
+	for _, pendingMsg := range readyMessages {
+		msg, ok := pendingMsg.Data.(*ProduceMessage)
+		if !ok {
+			return statemachine.Result{Value: 0}, fmt.Errorf("invalid message type in ordered processing")
+		}
+
+		offset, err := psm.storeMessage(msg)
+		if err != nil {
+			return statemachine.Result{Value: 0}, fmt.Errorf("failed to store ordered message: %w", err)
+		}
+
+		if psm.deduplicatorEnabled && msg.ProducerID != "" {
+			deduplicator := psm.DeduplicatorManager.GetOrCreatededuplicator(msg.ProducerID)
+			deduplicator.UpdateSequenceNumber(psm.PartitionID, msg.SequenceNumber)
+		}
+
+		results = append(results, WriteResult{
+			Offset:    offset,
+			Timestamp: msg.Timestamp,
+		})
+		lastOffset = offset
+	}
+
+	if len(results) > 0 {
+		resultBytes, _ := json.Marshal(results[len(results)-1])
+		return statemachine.Result{
+			Value: uint64(lastOffset),
+			Data:  resultBytes,
+		}, nil
+	}
+
+	return statemachine.Result{Value: 0}, fmt.Errorf("no messages processed")
+}
+
+func (psm *PartitionStateMachine) storeMessage(msg *ProduceMessage) (int64, error) {
 	messageData := StoredMessage{
 		Key:       msg.Key,
 		Value:     msg.Value,
@@ -215,31 +417,9 @@ func (psm *PartitionStateMachine) handleProduceMessage(data map[string]interface
 		Timestamp: msg.Timestamp,
 	}
 
-	// Serialize message for storage
 	serializedMsg, err := json.Marshal(messageData)
 	if err != nil {
-		return statemachine.Result{Value: 0}, fmt.Errorf("failed to serialize message: %w", err)
-	}
-
-	if psm.deduplicator != nil && psm.deduplicator.IsEnabled() {
-		isDuplicate, existingOffset, err := psm.deduplicator.IsDuplicate(serializedMsg, -1)
-		if err != nil {
-			log.Printf("Deduplication check failed: %v", err)
-		} else if isDuplicate {
-			log.Printf("Duplicate message detected for %s-%d, returning existing offset %d",
-				psm.TopicName, psm.PartitionID, existingOffset)
-
-			result := WriteResult{
-				Offset:    existingOffset,
-				Timestamp: msg.Timestamp,
-			}
-
-			resultBytes, _ := json.Marshal(result)
-			return statemachine.Result{
-				Value: uint64(existingOffset),
-				Data:  resultBytes,
-			}, nil
-		}
+		return 0, fmt.Errorf("failed to serialize message: %w", err)
 	}
 
 	var finalMsg []byte
@@ -253,10 +433,6 @@ func (psm *PartitionStateMachine) handleProduceMessage(data map[string]interface
 				finalMsg = make([]byte, 1+len(compressedMsg))
 				finalMsg[0] = byte(psm.compressor.Type())
 				copy(finalMsg[1:], compressedMsg)
-
-				compressionRatio := float64(len(compressedMsg)) / float64(len(serializedMsg))
-				log.Printf("Message compressed: %d -> %d bytes (ratio: %.2f)",
-					len(serializedMsg), len(compressedMsg), compressionRatio)
 			}
 		} else {
 			finalMsg = make([]byte, 1+len(serializedMsg))
@@ -271,40 +447,16 @@ func (psm *PartitionStateMachine) handleProduceMessage(data map[string]interface
 
 	offset, err := psm.partition.Append(finalMsg, msg.Timestamp)
 	if err != nil {
-		return statemachine.Result{Value: 0}, fmt.Errorf("failed to append message: %w", err)
-	}
-
-	if psm.deduplicator != nil && psm.deduplicator.IsEnabled() {
-		_, _, err := psm.deduplicator.IsDuplicate(serializedMsg, offset)
-		if err != nil {
-			log.Printf("Failed to update deduplication index: %v", err)
-		}
+		return 0, fmt.Errorf("failed to append message: %w", err)
 	}
 
 	psm.messageCount++
 	psm.bytesStored += int64(len(serializedMsg))
 	psm.lastWrite = time.Now()
 
-	result := WriteResult{
-		Offset:    offset,
-		Timestamp: msg.Timestamp,
-	}
-
-	resultBytes, err := json.Marshal(result)
-	if err != nil {
-		log.Printf("Failed to marshal write result: %v", err)
-		resultBytes = []byte(fmt.Sprintf(`{"offset":%d,"timestamp":"%s"}`, offset, msg.Timestamp.Format(time.RFC3339)))
-	}
-
-	log.Printf("Produced message to %s-%d at offset %d", psm.TopicName, psm.PartitionID, offset)
-
-	return statemachine.Result{
-		Value: uint64(offset),
-		Data:  resultBytes,
-	}, nil
+	return offset, nil
 }
 
-// handleProduceBatch handles batch message production
 func (psm *PartitionStateMachine) handleProduceBatch(data map[string]interface{}) (statemachine.Result, error) {
 	var batchCmd ProduceBatchCommand
 	batchCmdBytes, err := json.Marshal(data["batch"])
@@ -318,6 +470,24 @@ func (psm *PartitionStateMachine) handleProduceBatch(data map[string]interface{}
 
 	results := make([]WriteResult, len(batchCmd.Messages))
 	for i, msg := range batchCmd.Messages {
+		if psm.deduplicatorEnabled && msg.ProducerID != "" && msg.SequenceNumber > 0 {
+			deduplicator := psm.DeduplicatorManager.GetOrCreatededuplicator(msg.ProducerID)
+			if deduplicator.IsDuplicateSequenceNumber(psm.PartitionID, msg.SequenceNumber, msg.AsyncIO) {
+				lastOffset := deduplicator.GetLastSequenceNumber(psm.PartitionID)
+				results[i] = WriteResult{
+					Offset:    lastOffset,
+					Timestamp: msg.Timestamp,
+				}
+				log.Printf("Duplicate sequence number %d detected for producer %s in batch message %d", msg.SequenceNumber, msg.ProducerID, i)
+				continue
+			}
+
+			if !deduplicator.IsValidSequenceNumber(psm.PartitionID, msg.SequenceNumber, msg.AsyncIO) {
+				results[i] = WriteResult{Error: fmt.Sprintf("invalid sequence number %d for producer %s in message %d", msg.SequenceNumber, msg.ProducerID, i)}
+				continue
+			}
+		}
+
 		messageData := StoredMessage{
 			Key:       msg.Key,
 			Value:     msg.Value,
@@ -329,21 +499,6 @@ func (psm *PartitionStateMachine) handleProduceBatch(data map[string]interface{}
 		if err != nil {
 			results[i] = WriteResult{Error: fmt.Sprintf("failed to serialize message %d: %v", i, err)}
 			continue
-		}
-
-		if psm.deduplicator != nil && psm.deduplicator.IsEnabled() {
-			isDuplicate, existingOffset, err := psm.deduplicator.IsDuplicate(serializedMsg, -1)
-			if err != nil {
-				results[i] = WriteResult{Error: fmt.Sprintf("deduplication check failed for message %d: %v", i, err)}
-			} else if isDuplicate {
-				results[i] = WriteResult{
-					Offset:    existingOffset,
-					Timestamp: msg.Timestamp,
-				}
-				log.Printf("Duplicate message detected for %s-%d, returning existing offset %d for message %d",
-					psm.TopicName, psm.PartitionID, existingOffset, i)
-				continue
-			}
 		}
 
 		var finalMsg []byte
@@ -381,11 +536,9 @@ func (psm *PartitionStateMachine) handleProduceBatch(data map[string]interface{}
 			continue
 		}
 
-		if psm.deduplicator != nil && psm.deduplicator.IsEnabled() {
-			_, _, err := psm.deduplicator.IsDuplicate(serializedMsg, offset)
-			if err != nil {
-				log.Printf("Failed to update deduplication index for message %d: %v", i, err)
-			}
+		if psm.deduplicatorEnabled && msg.ProducerID != "" {
+			deduplicator := psm.DeduplicatorManager.GetOrCreatededuplicator(msg.ProducerID)
+			deduplicator.UpdateSequenceNumber(psm.PartitionID, msg.SequenceNumber)
 		}
 
 		psm.messageCount++
@@ -684,14 +837,18 @@ func (psm *PartitionStateMachine) SaveSnapshot(w io.Writer, fc statemachine.ISna
 	psm.mu.RLock()
 	defer psm.mu.RUnlock()
 
+	// Get producer states for persistence
+	deduplicators := psm.DeduplicatorManager.GetAlldeduplicators()
+
 	// Create snapshot metadata
 	snapshot := map[string]interface{}{
-		"topic_name":    psm.TopicName,
-		"partition_id":  psm.PartitionID,
-		"message_count": psm.messageCount,
-		"bytes_stored":  psm.bytesStored,
-		"last_write":    psm.lastWrite,
-		"last_read":     psm.lastRead,
+		"topic_name":      psm.TopicName,
+		"partition_id":    psm.PartitionID,
+		"message_count":   psm.messageCount,
+		"bytes_stored":    psm.bytesStored,
+		"last_write":      psm.lastWrite,
+		"last_read":       psm.lastRead,
+		"producer_states": deduplicators,
 	}
 
 	// Write snapshot metadata
@@ -704,7 +861,7 @@ func (psm *PartitionStateMachine) SaveSnapshot(w io.Writer, fc statemachine.ISna
 		return fmt.Errorf("failed to write snapshot: %w", err)
 	}
 
-	log.Printf("Saved snapshot for %s-%d", psm.TopicName, psm.PartitionID)
+	log.Printf("Saved snapshot for %s-%d with %d producer states", psm.TopicName, psm.PartitionID, len(deduplicators))
 	return nil
 }
 
@@ -732,14 +889,59 @@ func (psm *PartitionStateMachine) RecoverFromSnapshot(r io.Reader, files []state
 		psm.bytesStored = int64(bs)
 	}
 
+	if deduplicatorsData, ok := snapshot["producer_states"]; ok {
+		if err := psm.restorededuplicators(deduplicatorsData); err != nil {
+			log.Printf("Failed to restore producer states: %v", err)
+		}
+	}
+
 	log.Printf("Recovered from snapshot for %s-%d", psm.TopicName, psm.PartitionID)
 	return nil
 }
 
-// Close implements statemachine.IStateMachine interface
+func (psm *PartitionStateMachine) restorededuplicators(data interface{}) error {
+	statesMap, ok := data.(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("invalid producer states data type")
+	}
+
+	restoredCount := 0
+	for producerID, stateData := range statesMap {
+		stateMap, ok := stateData.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		deduplicator := deduplicator.NewDeduplicator(producerID)
+
+		if lastSeqData, exists := stateMap["last_sequence_num"]; exists {
+			if lastSeqMap, ok := lastSeqData.(map[string]interface{}); ok {
+				for partStr, seqVal := range lastSeqMap {
+					if partition, err := strconv.ParseInt(partStr, 10, 32); err == nil {
+						if seqNum, ok := seqVal.(float64); ok {
+							deduplicator.UpdateSequenceNumber(int32(partition), int64(seqNum))
+						}
+					}
+				}
+			}
+		}
+
+		psm.DeduplicatorManager.Setdeduplicator(producerID, deduplicator)
+		restoredCount++
+	}
+
+	log.Printf("Restored %d producer states for partition %s-%d", restoredCount, psm.TopicName, psm.PartitionID)
+	return nil
+}
+
 func (psm *PartitionStateMachine) Close() error {
 	psm.mu.Lock()
 	defer psm.mu.Unlock()
+
+	// Close ordered message manager
+	if psm.orderedMessageManager != nil {
+		psm.orderedMessageManager.Close()
+	}
 
 	if psm.partition != nil {
 		if err := psm.partition.Close(); err != nil {

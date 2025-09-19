@@ -47,6 +47,7 @@ type BrokerInfo struct {
 
 	LoadMetrics *LoadMetrics `json:"load_metrics"`
 	LastSeen    time.Time    `json:"last_seen"`
+	RegisteredAt time.Time   `json:"registered_at"`
 
 	RaftAddress string `json:"raft_address"`
 }
@@ -205,6 +206,8 @@ func (csm *ControllerStateMachine) registerBroker(data map[string]interface{}) (
 		existingBroker.RaftAddress = raftAddress
 		existingBroker.Status = "active"
 		existingBroker.LastSeen = time.Now()
+		// Reset registration time to provide grace period for health checks
+		existingBroker.RegisteredAt = time.Now()
 		if existingBroker.LoadMetrics == nil {
 			existingBroker.LoadMetrics = &LoadMetrics{
 				LastUpdated: time.Now(),
@@ -214,7 +217,7 @@ func (csm *ControllerStateMachine) registerBroker(data map[string]interface{}) (
 		return existingBroker, nil
 	}
 
-	// Create new broker
+	// Create new broker with grace period for health checks
 	broker := &BrokerInfo{
 		ID:          brokerID,
 		Address:     address,
@@ -225,6 +228,8 @@ func (csm *ControllerStateMachine) registerBroker(data map[string]interface{}) (
 			LastUpdated: time.Now(),
 		},
 		LastSeen: time.Now(),
+		// Set registration time to provide grace period for health checks
+		RegisteredAt: time.Now(),
 	}
 
 	csm.metadata.Brokers[brokerID] = broker
@@ -235,9 +240,29 @@ func (csm *ControllerStateMachine) registerBroker(data map[string]interface{}) (
 
 func (csm *ControllerStateMachine) unregisterBroker(data map[string]interface{}) (interface{}, error) {
 	brokerID := data["broker_id"].(string)
+	
+	var affectedAssignments []*PartitionAssignment
+	for _, assignment := range csm.metadata.PartitionAssignments {
+		for _, replica := range assignment.Replicas {
+			if replica == brokerID {
+				affectedAssignments = append(affectedAssignments, assignment)
+				break
+			}
+		}
+	}
+	
+	for _, assignment := range affectedAssignments {
+		partitionKey := fmt.Sprintf("%s-%d", assignment.TopicName, assignment.PartitionID)
+		delete(csm.metadata.PartitionAssignments, partitionKey)
+		log.Printf("Removed partition assignment %s due to broker %s unregistration", partitionKey, brokerID)
+	}
+	
 	delete(csm.metadata.Brokers, brokerID)
-	log.Printf("Unregistered broker %s", brokerID)
-	return map[string]string{"status": "success"}, nil
+	log.Printf("Unregistered broker %s and cleaned up %d partition assignments", brokerID, len(affectedAssignments))
+	return map[string]interface{}{
+		"status": "success",
+		"cleaned_partitions": len(affectedAssignments),
+	}, nil
 }
 
 func (csm *ControllerStateMachine) createTopic(data map[string]interface{}) (interface{}, error) {
@@ -247,11 +272,51 @@ func (csm *ControllerStateMachine) createTopic(data map[string]interface{}) (int
 	partitions := int32(data["partitions"].(float64))
 	replicationFactor := int32(data["replication_factor"].(float64))
 
-	// Check if topic already exists - return result instead of error to avoid panic
-	if _, exists := csm.metadata.Topics[topicName]; exists {
+	// Check if topic already exists
+	if existingTopic, exists := csm.metadata.Topics[topicName]; exists {
+		log.Printf("Topic %s already exists in state machine, checking partition assignments", topicName)
+		
+		// Check if partition assignments exist for this topic
+		missingAssignments := false
+		for i := int32(0); i < existingTopic.Partitions; i++ {
+			partitionKey := fmt.Sprintf("%s-%d", topicName, i)
+			if _, exists := csm.metadata.PartitionAssignments[partitionKey]; !exists {
+				missingAssignments = true
+				break
+			}
+		}
+		
+		// If assignments are missing, recreate them from the provided data
+		if missingAssignments {
+			log.Printf("Topic %s exists but partition assignments are missing, recreating assignments", topicName)
+			// Parse and restore assignments
+			assignmentsData, ok := data["assignments"]
+			if ok {
+				assignments, err := csm.parseAssignments(assignmentsData)
+				if err == nil {
+					for _, assignment := range assignments {
+						partitionKey := fmt.Sprintf("%s-%d", topicName, assignment.PartitionID)
+						csm.metadata.PartitionAssignments[partitionKey] = assignment
+						csm.metadata.LeaderAssignments[partitionKey] = assignment.Leader
+					}
+					log.Printf("Restored %d partition assignments for topic %s", len(assignments), topicName)
+					return map[string]interface{}{
+						"success":                  true,
+						"topic":                    existingTopic,
+						"assignments":              assignments,
+						"partition_groups_created": len(assignments),
+						"status":                   "assignments_restored",
+					}, nil
+				}
+			}
+		}
+		
+		// Topic exists and assignments are complete
 		return map[string]interface{}{
-			"success": false,
-			"error":   fmt.Sprintf("topic %s already exists", topicName),
+			"success":                  true,
+			"topic":                    existingTopic,
+			"status":                   "already_exists",
+			"partition_groups_created": 0,
 		}, nil
 	}
 
@@ -571,6 +636,11 @@ func (csm *ControllerStateMachine) updateBrokerLoad(data map[string]interface{})
 		if broker.LoadMetrics != nil {
 			broker.LoadMetrics.LastUpdated = time.Now()
 		}
+		// If broker was marked as failed but is now sending heartbeats, restore it to active
+		if broker.Status == "failed" {
+			broker.Status = "active"
+			log.Printf("Restored broker %s to active status after receiving heartbeat", brokerID)
+		}
 	}
 
 	return map[string]string{"status": "success"}, nil
@@ -715,9 +785,17 @@ func (csm *ControllerStateMachine) RecoverFromSnapshot(r io.Reader, files []stat
 
 	csm.mu.Lock()
 	csm.metadata = &metadata
+	// CRITICAL: Re-initialize partition assigner with recovered metadata
+	// This ensures the assigner uses the correct metadata reference
+	var raftManager *RaftManager
+	if csm.partitionAssigner != nil {
+		raftManager = csm.partitionAssigner.raftManager
+	}
+	csm.partitionAssigner = NewPartitionAssigner(csm.metadata, raftManager)
 	csm.mu.Unlock()
 
-	log.Printf("Recovered controller state machine from snapshot, version: %d", metadata.Version)
+	log.Printf("Recovered controller state machine from snapshot, version: %d, partitions: %d", 
+		metadata.Version, len(metadata.PartitionAssignments))
 	return nil
 }
 

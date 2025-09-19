@@ -3,11 +3,11 @@
   "timeout": "10s",
   "log_file": "logs/client.log",
   "command": {
-    "type": "list-topics",
-    "topic": "",
+    "type": "produce",
+    "topic": "test-topic",
     "partition": 0,
-    "message": "",
+    "message": "Hello World from Go-Queue!",
     "offset": 0,
-    "count": 1
+    "count": 5
   }
 }

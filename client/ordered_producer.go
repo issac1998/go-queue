@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"time"
 
 	"github.com/issac1998/go-queue/internal/protocol"
@@ -43,16 +44,9 @@ func (op *OrderedPartitioner) hashMessageGroup(messageGroup string, numPartition
 		return 0
 	}
 
-	hash := int32(0)
-	for _, char := range messageGroup {
-		hash = hash*31 + int32(char)
-	}
-
-	if hash < 0 {
-		hash = -hash
-	}
-
-	return hash % numPartitions
+	h := fnv.New64a()
+	h.Write([]byte(fmt.Sprintf("%s", messageGroup)))
+	return int32(h.Sum64()) % (numPartitions)
 }
 
 // OrderedMessage message

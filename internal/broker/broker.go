@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/issac1998/go-queue/internal/compression"
-	"github.com/issac1998/go-queue/internal/deduplication"
 	"github.com/issac1998/go-queue/internal/discovery"
 	"github.com/issac1998/go-queue/internal/protocol"
 	"github.com/issac1998/go-queue/internal/raft"
@@ -57,7 +56,6 @@ type Broker struct {
 	LoadMetrics   *LoadMetrics
 
 	compressor   compression.Compressor
-	deduplicator *deduplication.Deduplicator
 
 	// Ordered message routing
 	orderedRouter *OrderedMessageRouter
@@ -213,10 +211,6 @@ func (b *Broker) GetCompressor() compression.Compressor {
 	return b.compressor
 }
 
-// GetDeduplicator returns the broker's deduplicator (implements BrokerInterface)
-func (b *Broker) GetDeduplicator() *deduplication.Deduplicator {
-	return b.deduplicator
-}
 
 // Stop gracefully shuts down the broker
 func (b *Broker) Stop() error {
@@ -247,9 +241,6 @@ func (b *Broker) Stop() error {
 		b.raftManager.Close()
 	}
 
-	if b.deduplicator != nil {
-		b.deduplicator.Close()
-	}
 	if zstdCompressor, ok := b.compressor.(*compression.ZstdCompression); ok {
 		zstdCompressor.Close()
 	}
@@ -346,7 +337,7 @@ func (b *Broker) initController() error {
 
 	if b.Controller.stateMachine != nil {
 		if partitionAssigner := b.Controller.stateMachine.GetPartitionAssigner(); partitionAssigner != nil {
-			partitionAssigner.SetBroker(b)
+			partitionAssigner.SetBroker(b,b.ID)
 		}
 	}
 
@@ -536,32 +527,6 @@ func (b *Broker) initMessageProcessing() error {
 	} else {
 		b.compressor, _ = compression.GetCompressor(compression.None)
 		log.Printf("Compression disabled")
-	}
-
-	if b.Config.DeduplicationEnabled {
-		dedupConfig := &deduplication.Config{
-			HashType:   deduplication.SHA256,
-			MaxEntries: b.Config.DeduplicationMaxSize,
-			TTL:        time.Duration(b.Config.DeduplicationTTL) * time.Hour,
-			Enabled:    true,
-		}
-
-		if dedupConfig.MaxEntries <= 0 {
-			dedupConfig.MaxEntries = 100000
-		}
-		if dedupConfig.TTL <= 0 {
-			dedupConfig.TTL = 24 * time.Hour
-		}
-
-		b.deduplicator = deduplication.NewDeduplicator(dedupConfig)
-		log.Printf("Deduplication enabled with max entries: %d, TTL: %v",
-			dedupConfig.MaxEntries, dedupConfig.TTL)
-	} else {
-		dedupConfig := &deduplication.Config{
-			Enabled: false,
-		}
-		b.deduplicator = deduplication.NewDeduplicator(dedupConfig)
-		log.Printf("Deduplication disabled")
 	}
 
 	// Initialize ordered message router

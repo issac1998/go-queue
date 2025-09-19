@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -66,10 +67,13 @@ func NewProducerWithStrategy(client *Client, strategy PartitionStrategy) *Produc
 
 // ProduceMessage single message structure
 type ProduceMessage struct {
-	Topic     string
-	Partition int32
-	Key       []byte
-	Value     []byte
+	ProducerID     string
+	SequenceNumber int64
+	AsyncIO        bool
+	Topic          string
+	Partition      int32
+	Key            []byte
+	Value          []byte
 }
 
 // ProduceResult production result
@@ -109,9 +113,17 @@ func (p *Producer) SendBatch(messages []ProduceMessage) (*ProduceResult, error) 
 		if err != nil {
 			return nil, fmt.Errorf("failed to select partition: %v", err)
 		}
+		producerID := p.client.GetProducerID()
+		stateManager := p.client.GetDeduplicatorManager()
 
 		for i := range messages {
 			messages[i].Partition = partition
+			messages[i].AsyncIO = p.client.config.EnableAsyncIO
+			if p.client.IsdeduplicatorEnabled() {
+				messages[i].ProducerID = producerID
+				messages[i].SequenceNumber = stateManager.GetNextSequenceNumber(producerID, messages[i].Partition)
+			}
+
 		}
 	}
 
@@ -249,7 +261,6 @@ func (p *Producer) sendWithConnectionPool(brokerAddr string, requestData []byte)
 }
 
 func (p *Producer) sendWithAsyncConnection(brokerAddr string, requestData []byte) (*ProduceResult, error) {
-	// Use the generic async request function
 	handler := func(responseData []byte) (interface{}, error) {
 		return p.parseProduceResponse(responseData)
 	}
@@ -266,7 +277,6 @@ func (p *Producer) sendWithAsyncConnection(brokerAddr string, requestData []byte
 	if err != nil {
 		return p.sendWithConnectionPoolFallback(brokerAddr, requestData)
 	}
-	// 返回空值
 	return &ProduceResult{}, nil
 }
 
@@ -324,80 +334,11 @@ func (p *Producer) sendSynchronously(conn net.Conn, requestData []byte) (*Produc
 	return p.parseProduceResponse(responseData)
 }
 
-// sendWithAsyncIO 使用异步IO发送数据
-func (p *Producer) sendWithAsyncIO(conn net.Conn, requestData []byte) (*ProduceResult, error) {
-	// 设置超时
-	conn.SetDeadline(time.Now().Add(p.client.timeout))
-
-	// 准备完整请求数据: requestType + dataLength + requestData
-	requestType := protocol.ProduceRequestType
-	fullRequest := make([]byte, 4+4+len(requestData))
-	binary.BigEndian.PutUint32(fullRequest[:4], uint32(requestType))
-	binary.BigEndian.PutUint32(fullRequest[4:8], uint32(len(requestData)))
-	copy(fullRequest[8:], requestData)
-
-	// 创建结果通道
-	resultChan := make(chan *ProduceResult, 1)
-	errorChan := make(chan error, 1)
-
-	// 异步发送请求
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				errorChan <- fmt.Errorf("panic in async send: %v", r)
-			}
-		}()
-
-		// 发送请求
-		if _, writeErr := conn.Write(fullRequest); writeErr != nil {
-			errorChan <- fmt.Errorf("failed to send async request: %v", writeErr)
-			return
-		}
-
-		// 读取响应长度
-		var responseLen int32
-		if readErr := binary.Read(conn, binary.BigEndian, &responseLen); readErr != nil {
-			errorChan <- fmt.Errorf("failed to read response length: %v", readErr)
-			return
-		}
-
-		// 读取响应数据
-		responseData := make([]byte, responseLen)
-		if _, readErr := io.ReadFull(conn, responseData); readErr != nil {
-			errorChan <- fmt.Errorf("failed to read response data: %v", readErr)
-			return
-		}
-
-		// 解析响应
-		result, parseErr := p.parseProduceResponse(responseData)
-		if parseErr != nil {
-			errorChan <- fmt.Errorf("failed to parse response: %v", parseErr)
-			return
-		}
-
-		resultChan <- result
-	}()
-
-	// 等待结果
-	select {
-	case result := <-resultChan:
-		return result, nil
-	case err := <-errorChan:
-		return nil, err
-	case <-time.After(p.client.timeout):
-		return nil, fmt.Errorf("async send timeout")
-	}
-}
-
 // buildProduceRequest builds produce request
 func (p *Producer) buildProduceRequest(topic string, partition int32, messages []ProduceMessage) ([]byte, error) {
 	buf := new(bytes.Buffer)
 
-	if err := binary.Write(buf, binary.BigEndian, int16(protocol.ProtocolVersion)); err != nil {
-		return nil, err
-	}
-
-	if err := binary.Write(buf, binary.BigEndian, int16(len(topic))); err != nil {
+	if err := binary.Write(buf, binary.BigEndian, int32(len(topic))); err != nil {
 		return nil, err
 	}
 	if _, err := buf.WriteString(topic); err != nil {
@@ -408,52 +349,131 @@ func (p *Producer) buildProduceRequest(topic string, partition int32, messages [
 		return nil, err
 	}
 
-	if err := binary.Write(buf, binary.BigEndian, int8(protocol.CompressionNone)); err != nil {
+	if err := binary.Write(buf, binary.BigEndian, int32(len(messages))); err != nil {
 		return nil, err
 	}
 
-	messagesBuf := new(bytes.Buffer)
 	for _, msg := range messages {
-		if err := binary.Write(messagesBuf, binary.BigEndian, int32(len(msg.Value))); err != nil {
+		producerIDLen := int32(len(msg.ProducerID))
+		if err := binary.Write(buf, binary.BigEndian, producerIDLen); err != nil {
 			return nil, err
 		}
-		if _, err := messagesBuf.Write(msg.Value); err != nil {
+		if producerIDLen > 0 {
+			if _, err := buf.WriteString(msg.ProducerID); err != nil {
+				return nil, err
+			}
+		}
+
+		if err := binary.Write(buf, binary.BigEndian, msg.SequenceNumber); err != nil {
 			return nil, err
 		}
-	}
 
-	if err := binary.Write(buf, binary.BigEndian, int32(messagesBuf.Len())); err != nil {
-		return nil, err
-	}
+		asyncIOByte := byte(0)
+		if msg.AsyncIO {
+			asyncIOByte = byte(1)
+		}
+		if err := binary.Write(buf, binary.BigEndian, asyncIOByte); err != nil {
+			return nil, err
+		}
 
-	if _, err := buf.Write(messagesBuf.Bytes()); err != nil {
-		return nil, err
+		keyLen := int32(0)
+		if msg.Key != nil {
+			keyLen = int32(len(msg.Key))
+		}
+		if err := binary.Write(buf, binary.BigEndian, keyLen); err != nil {
+			return nil, err
+		}
+		if keyLen > 0 {
+			if _, err := buf.Write(msg.Key); err != nil {
+				return nil, err
+			}
+		}
+
+		if err := binary.Write(buf, binary.BigEndian, int32(len(msg.Value))); err != nil {
+			return nil, err
+		}
+		if _, err := buf.Write(msg.Value); err != nil {
+			return nil, err
+		}
 	}
 
 	return buf.Bytes(), nil
 }
 
-// parseProduceResponse parses produce response
-func (p *Producer) parseProduceResponse(data []byte) (*ProduceResult, error) {
-	buf := bytes.NewReader(data)
+// ProduceResponseFromBroker represents the JSON response from broker
+type ProduceResponseFromBroker struct {
+	Topic     string                    `json:"topic"`
+	Partition int32                     `json:"partition"`
+	Results   []ProduceResultFromBroker `json:"results"`
+	ErrorCode int16                     `json:"error_code"`
+	Error     string                    `json:"error,omitempty"`
+}
 
+// ProduceResultFromBroker represents individual message result from broker
+type ProduceResultFromBroker struct {
+	Offset    int64  `json:"offset"`
+	Timestamp string `json:"timestamp"`
+	Error     string `json:"error,omitempty"`
+}
+
+func (p *Producer) parseProduceResponse(data []byte) (*ProduceResult, error) {
+	var brokerResponse ProduceResponseFromBroker
+	if err := json.Unmarshal(data, &brokerResponse); err == nil {
+		if brokerResponse.ErrorCode != 0 || brokerResponse.Error != "" {
+			return &ProduceResult{
+				Error: fmt.Errorf("broker error (code %d): %s", brokerResponse.ErrorCode, brokerResponse.Error),
+			}, nil
+		}
+
+		if len(brokerResponse.Results) == 0 {
+			return &ProduceResult{
+				Error: fmt.Errorf("no results in response"),
+			}, nil
+		}
+
+		firstResult := brokerResponse.Results[0]
+		result := &ProduceResult{
+			Offset: firstResult.Offset,
+		}
+
+		if firstResult.Error != "" {
+			result.Error = fmt.Errorf("%s", firstResult.Error)
+		}
+
+		return result, nil
+	}
+
+	buf := bytes.NewReader(data)
+	result := &ProduceResult{}
+
+	var errorCode int16
+	if err := binary.Read(buf, binary.BigEndian, &errorCode); err != nil {
+		return nil, fmt.Errorf("failed to parse response: not JSON and not valid binary format: %v", err)
+	}
+
+	if errorCode != 0 {
+		var errorMsgLen int32
+		if err := binary.Read(buf, binary.BigEndian, &errorMsgLen); err != nil {
+			return nil, fmt.Errorf("failed to read error message length: %v", err)
+		}
+
+		errorMsg := make([]byte, errorMsgLen)
+		if _, err := buf.Read(errorMsg); err != nil {
+			return nil, fmt.Errorf("failed to read error message: %v", err)
+		}
+
+		result.Error = fmt.Errorf("server error (code %d): %s", errorCode, string(errorMsg))
+		return result, nil
+	}
+
+	buf = bytes.NewReader(data)
 	var baseOffset int64
 	if err := binary.Read(buf, binary.BigEndian, &baseOffset); err != nil {
 		return nil, fmt.Errorf("failed to read base offset: %v", err)
 	}
+	result.Offset = baseOffset
 
-	var errorCode int16
-	if err := binary.Read(buf, binary.BigEndian, &errorCode); err != nil {
-		return nil, fmt.Errorf("failed to read error code: %v", err)
-	}
-
-	result := &ProduceResult{
-		Offset: baseOffset,
-	}
-
-	if errorCode != 0 {
-		result.Error = fmt.Errorf("server error, error code: %d", errorCode)
-	}
+	binary.Read(buf, binary.BigEndian, &errorCode)
 
 	return result, nil
 }

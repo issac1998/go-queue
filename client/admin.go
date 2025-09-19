@@ -27,7 +27,7 @@ func NewAdmin(client *Client) *Admin {
 type CreateTopicRequest struct {
 	Name       string
 	Partitions int32
-	Replicas   int32 
+	Replicas   int32
 }
 
 // CreateTopicResult create topic result
@@ -41,8 +41,6 @@ type TopicInfo struct {
 	Name             string
 	Partitions       int32
 	Replicas         int32
-	MessageCount     int64
-	Size             int64
 	CreatedAt        time.Time
 	PartitionDetails []PartitionInfo
 }
@@ -318,13 +316,6 @@ func (a *Admin) parseListTopicsResponse(data []byte) ([]TopicInfo, error) {
 			return nil, fmt.Errorf("failed to read created time: %v", err)
 		}
 		topics[i].CreatedAt = time.Unix(createdAtUnix, 0)
-
-		if err := binary.Read(buf, binary.BigEndian, &topics[i].Size); err != nil {
-			return nil, fmt.Errorf("failed to read size: %v", err)
-		}
-		if err := binary.Read(buf, binary.BigEndian, &topics[i].MessageCount); err != nil {
-			return nil, fmt.Errorf("failed to read message count: %v", err)
-		}
 	}
 
 	return topics, nil
@@ -368,12 +359,6 @@ func (a *Admin) parseGetTopicInfoResponse(data []byte) (*TopicInfo, error) {
 	}
 	topic.CreatedAt = time.Unix(createdAtUnix, 0)
 
-	if err := binary.Read(buf, binary.BigEndian, &topic.Size); err != nil {
-		return nil, fmt.Errorf("failed to read size: %v", err)
-	}
-	if err := binary.Read(buf, binary.BigEndian, &topic.MessageCount); err != nil {
-		return nil, fmt.Errorf("failed to read message count: %v", err)
-	}
 
 	var partitionCount int32
 	if err := binary.Read(buf, binary.BigEndian, &partitionCount); err != nil {
