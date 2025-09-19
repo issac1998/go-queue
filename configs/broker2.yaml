@@ -1,0 +1,45 @@
+# Broker 2 configuration
+node_id: "broker2"
+bind_addr: "localhost"
+bind_port: 9093
+data_dir: "./data/broker2"
+
+# Raft configuration
+raft:
+  rtt_millisecond: 200
+  heartbeat_rtt: 5
+  election_rtt: 10
+  check_quorum: true
+  snapshot_entries: 10000
+  compaction_overhead: 5000
+  max_in_mem_log_size: 67108864
+  controller_snapshot_freq: 1000
+  raft_addr: "localhost:7002"
+
+# Service discovery configuration - using etcd
+discovery:
+  type: "etcd"
+  endpoints:
+    - "localhost:2379"
+  timeout: "5s"
+
+# Performance configuration
+performance:
+  max_batch_size: 500
+  max_batch_bytes: 1048576
+  batch_timeout: "10ms"
+  write_cache_size: 33554432
+  read_cache_size: 67108864
+  connection_pool_size: 100
+  connection_idle_timeout: "5m"
+  compression_type: "snappy"
+  compression_threshold: 1024
+
+# Feature flags
+enable_follower_read: true
+compression_enabled: true
+compression_type: "snappy"
+compression_threshold: 1024
+deduplication_enabled: true
+deduplication_ttl: 3600
+deduplication_max_size: 10000

@@ -7,12 +7,10 @@ import (
 	"time"
 
 	"github.com/issac1998/go-queue/internal/compression"
-	"github.com/issac1998/go-queue/internal/deduplication"
 )
 
 // BrokerConfig represents the complete broker configuration
 type BrokerConfig struct {
-	// Legacy storage configuration (for compatibility with existing tests)
 	DataDir            string        `json:"data_dir"`
 	MaxTopicPartitions int           `json:"max_topic_partitions"`
 	SegmentSize        int64         `json:"segment_size"`
@@ -29,7 +27,6 @@ type BrokerConfig struct {
 
 	// Deduplication configuration
 	DeduplicationEnabled bool                  `json:"deduplication_enabled"`
-	DeduplicationConfig  *deduplication.Config `json:"deduplication_config"`
 
 	// Server configuration
 	Server ServerConfig `json:"server"`
@@ -65,7 +62,6 @@ type CommandConfig struct {
 
 // deduplicationConfigJSON is a temporary struct for JSON parsing
 type deduplicationConfigJSON struct {
-	HashType   deduplication.HashType `json:"hash_type"`
 	MaxEntries int                    `json:"max_entries"`
 	TTL        string                 `json:"ttl"`
 	Enabled    bool                   `json:"enabled"`
@@ -120,22 +116,7 @@ func LoadBrokerConfig(configPath string) (*BrokerConfig, error) {
 		return nil, fmt.Errorf("invalid cleanup_interval: %v", err)
 	}
 
-	// Parse deduplication config if provided
-	var dedupConfig *deduplication.Config
-	if configJSON.DeduplicationConfig != nil {
-		ttl, err := time.ParseDuration(configJSON.DeduplicationConfig.TTL)
-		if err != nil {
-			return nil, fmt.Errorf("invalid deduplication ttl: %v", err)
-		}
-
-		dedupConfig = &deduplication.Config{
-			HashType:   configJSON.DeduplicationConfig.HashType,
-			MaxEntries: configJSON.DeduplicationConfig.MaxEntries,
-			TTL:        ttl,
-			Enabled:    configJSON.DeduplicationConfig.Enabled,
-		}
-	}
-
+	
 	// Create the final config
 	config := &BrokerConfig{
 		DataDir:            configJSON.DataDir,
@@ -152,7 +133,6 @@ func LoadBrokerConfig(configPath string) (*BrokerConfig, error) {
 		CompressionThreshold: configJSON.CompressionThreshold,
 
 		DeduplicationEnabled: configJSON.DeduplicationEnabled,
-		DeduplicationConfig:  dedupConfig,
 		Server:               configJSON.Server,
 	}
 

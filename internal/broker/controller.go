@@ -255,6 +255,9 @@ func (cm *ControllerManager) StartLeaderTasks() {
 	// Create a new context for leader tasks
 	cm.leaderCtx, cm.leaderCancel = context.WithCancel(cm.ctx)
 
+	// Start existing partition Raft groups for recovery
+	go cm.startExistingPartitionGroups()
+
 	cm.leaderWg.Add(2)
 	go cm.healthChecker.startHealthCheck()
 	go cm.rebalanceScheduler.startRebalancing()
@@ -273,6 +276,104 @@ func (cm *ControllerManager) StopLeaderTasks() {
 	cm.leaderWg.Wait()
 
 	log.Printf("All leader tasks stopped for broker %s", cm.broker.ID)
+}
+
+// startExistingPartitionGroups starts Raft groups for existing partitions during leader recovery
+func (cm *ControllerManager) startExistingPartitionGroups() {
+	log.Printf("Starting existing partition Raft groups for leader recovery")
+
+	// Get all existing partition assignments from metadata
+	allAssignments, err := cm.getAllPartitionAssignments()
+	if err != nil {
+		log.Printf("Failed to get existing partition assignments: %v", err)
+		return
+	}
+
+	if len(allAssignments) == 0 {
+		log.Printf("No existing partitions found")
+		return
+	}
+
+	log.Printf("Found %d existing partition assignments to recover", len(allAssignments))
+
+	// Get partition assigner
+	partitionAssigner, err := cm.getPartitionAssigner()
+	if err != nil {
+		log.Printf("Failed to get partition assigner: %v", err)
+		return
+	}
+
+	// Start Raft groups for existing partitions
+	err = partitionAssigner.StartPartitionRaftGroups(allAssignments)
+	if err != nil {
+		log.Printf("Failed to start existing partition Raft groups: %v", err)
+		return
+	}
+
+	log.Printf("Successfully started %d existing partition Raft groups", len(allAssignments))
+}
+
+// getAllPartitionAssignments gets all partition assignments from the state machine
+func (cm *ControllerManager) getAllPartitionAssignments() ([]*raft.PartitionAssignment, error) {
+	// Query partition assignments using the existing QueryMetadata method
+	result, err := cm.QueryMetadata(protocol.RaftQueryGetPartitionAssignments, map[string]interface{}{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to query partition assignments: %w", err)
+	}
+
+	log.Printf("Query result type: %T, length: %d", result, len(result))
+
+	// The QueryMetadata returns []byte, so we need to unmarshal it
+	var assignmentsMap map[string]*raft.PartitionAssignment
+	if err := json.Unmarshal(result, &assignmentsMap); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal partition assignments: %w", err)
+	}
+
+	log.Printf("Unmarshaled %d partition assignments", len(assignmentsMap))
+
+	// Convert map to slice
+	var allAssignments []*raft.PartitionAssignment
+	for _, assignment := range assignmentsMap {
+		allAssignments = append(allAssignments, assignment)
+	}
+
+	log.Printf("Found %d partition assignments", len(allAssignments))
+	return allAssignments, nil
+}
+
+// mapToPartitionAssignment converts a map to PartitionAssignment
+func (cm *ControllerManager) mapToPartitionAssignment(data map[string]interface{}) (*raft.PartitionAssignment, error) {
+	assignment := &raft.PartitionAssignment{}
+
+	if v, ok := data["topic_name"]; ok {
+		assignment.TopicName = v.(string)
+	}
+
+	if v, ok := data["partition_id"]; ok {
+		assignment.PartitionID = int32(v.(float64))
+	}
+
+	if v, ok := data["raft_group_id"]; ok {
+		assignment.RaftGroupID = uint64(v.(float64))
+	}
+
+	if v, ok := data["replicas"]; ok {
+		if replicas, ok := v.([]interface{}); ok {
+			for _, replica := range replicas {
+				assignment.Replicas = append(assignment.Replicas, replica.(string))
+			}
+		}
+	}
+
+	if v, ok := data["leader"]; ok {
+		assignment.Leader = v.(string)
+	}
+
+	if v, ok := data["preferred_leader"]; ok {
+		assignment.PreferredLeader = v.(string)
+	}
+
+	return assignment, nil
 }
 
 // IsLeader returns whether this broker is the Controller leader
@@ -412,6 +513,9 @@ func (cm *ControllerManager) CreateTopic(topicName string, partitions int32, rep
 	log.Printf("Controller Leader creating topic %s with %d partitions (replication factor: %d)",
 		topicName, partitions, replicationFactor)
 
+	// Note: Topic existence check is now handled by the state machine
+	// which will restore missing partition assignments if needed
+
 	availableBrokers, err := cm.getAvailableBrokers()
 	if err != nil {
 		log.Printf("DEBUG: Failed to get available brokers: %v", err)
@@ -438,13 +542,7 @@ func (cm *ControllerManager) CreateTopic(topicName string, partitions int32, rep
 
 	log.Printf("Allocated %d partitions for topic %s", len(assignments), topicName)
 
-	err = partitionAssigner.StartPartitionRaftGroups(assignments)
-	if err != nil {
-		return fmt.Errorf("failed to start partition Raft groups: %w", err)
-	}
-
-	log.Printf("Started Raft groups for topic %s", topicName)
-
+	// First, update metadata via Raft command
 	cmd := &raft.ControllerCommand{
 		Type:      protocol.RaftCmdCreateTopic,
 		ID:        uuid.New().String(),
@@ -460,6 +558,17 @@ func (cm *ControllerManager) CreateTopic(topicName string, partitions int32, rep
 	err = cm.ExecuteCommand(cmd)
 	if err != nil {
 		return fmt.Errorf("failed to update topic metadata: %w", err)
+	}
+
+	log.Printf("Topic metadata updated for %s, now starting Raft groups", topicName)
+
+	// Then, start Raft groups after metadata is committed
+	err = partitionAssigner.StartPartitionRaftGroups(assignments)
+	if err != nil {
+		// If Raft groups fail to start, we should clean up the metadata
+		log.Printf("Failed to start Raft groups for topic %s, attempting cleanup: %v", topicName, err)
+		// Note: In production, we might want to implement a cleanup mechanism
+		return fmt.Errorf("failed to start partition Raft groups: %w", err)
 	}
 
 	log.Printf("Topic %s created successfully with %d partitions", topicName, len(assignments))
@@ -757,7 +866,14 @@ func (hc *HealthChecker) performHealthCheck() {
 			continue
 		}
 
-		if time.Since(broker.LastSeen) > 60*time.Second {
+		// Provide grace period for newly registered brokers (5 minutes)
+		graceTime := 180 * time.Second
+		if !broker.RegisteredAt.IsZero() && time.Since(broker.RegisteredAt) < 300*time.Second {
+			graceTime = 300 * time.Second
+		}
+		
+		// Check if broker hasn't sent heartbeat in too long
+		if time.Since(broker.LastSeen) > graceTime {
 			log.Printf("Broker %s appears to be unhealthy, last seen: %v", brokerID, broker.LastSeen)
 			hc.handleBrokerFailure(brokerID)
 		}
@@ -910,9 +1026,10 @@ func (cm *ControllerManager) getTopicAssignments(topicName string) ([]*raft.Part
 		return nil, fmt.Errorf("failed to query assignments: %w", err)
 	}
 
-	var assignmentsMap map[string]*raft.PartitionAssignment
-	if err := json.Unmarshal(result.([]byte), &assignmentsMap); err != nil {
-		return nil, fmt.Errorf("failed to parse assignments: %w", err)
+	// State machine returns map[string]*raft.PartitionAssignment directly
+	assignmentsMap, ok := result.(map[string]*raft.PartitionAssignment)
+	if !ok {
+		return nil, fmt.Errorf("unexpected result type: %T", result)
 	}
 
 	var topicAssignments []*raft.PartitionAssignment

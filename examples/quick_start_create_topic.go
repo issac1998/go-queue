@@ -76,10 +76,6 @@ func main() {
 		log.Printf("❌ 列出主题失败: %v", err)
 	} else {
 		fmt.Printf("✓ 发现 %d 个主题:\n", len(topics))
-		for _, topic := range topics {
-			fmt.Printf("  - %s (分区: %d, 消息数: %d)\n",
-				topic.Name, topic.Partitions, topic.MessageCount)
-		}
 	}
 
 	fmt.Println("\n🎉 快速入门完成！")

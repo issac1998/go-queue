@@ -74,10 +74,7 @@ func main() {
 		log.Printf("Failed to list topics: %v", err)
 	} else {
 		fmt.Printf("Found %d topics:\n", len(topics))
-		for _, topic := range topics {
-			fmt.Printf("  - %s: %d partitions, %d messages, %.2f KB\n",
-				topic.Name, topic.Partitions, topic.MessageCount, float64(topic.Size)/1024)
-		}
+	
 	}
 
 	// 4. Describe topic details
@@ -90,8 +87,7 @@ func main() {
 		fmt.Printf("Topic '%s' details:\n", topicDetail.Name)
 		fmt.Printf("  Partitions: %d\n", topicDetail.Partitions)
 		fmt.Printf("  Replicas: %d\n", topicDetail.Replicas)
-		fmt.Printf("  Total Size: %.2f KB\n", float64(topicDetail.Size)/1024)
-		fmt.Printf("  Total Messages: %d\n", topicDetail.MessageCount)
+	
 		fmt.Printf("  Created At: %s\n", topicDetail.CreatedAt.Format(time.RFC3339))
 
 		fmt.Printf("  Partition Details:\n")
@@ -109,8 +105,7 @@ func main() {
 		log.Printf("Failed to get topic info: %v", err)
 	} else {
 		fmt.Printf("Simple info for '%s':\n", simpleInfo.Name)
-		fmt.Printf("  Partitions: %d, Messages: %d, Size: %.2f KB\n",
-			simpleInfo.Partitions, simpleInfo.MessageCount, float64(simpleInfo.Size)/1024)
+
 	}
 
 	// 6. Delete a topic
@@ -131,10 +126,8 @@ func main() {
 		log.Printf("Failed to list topics after deletion: %v", err)
 	} else {
 		fmt.Printf("Topics after deletion (%d remaining):\n", len(topicsAfterDeletion))
-		for _, topic := range topicsAfterDeletion {
-			fmt.Printf("  - %s: %d partitions, %d messages\n",
-				topic.Name, topic.Partitions, topic.MessageCount)
-		}
+	
+		
 	}
 
 	// 8. Cleanup test topics

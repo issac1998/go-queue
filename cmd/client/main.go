@@ -301,8 +301,7 @@ func listTopics(c *client.Client) {
 		fmt.Printf("Topic %d: %s\n", i+1, topic.Name)
 		fmt.Printf("  Partitions: %d\n", topic.Partitions)
 		fmt.Printf("  Replicas: %d\n", topic.Replicas)
-		fmt.Printf("  Messages: %d\n", topic.MessageCount)
-		fmt.Printf("  Size: %.2f KB\n", float64(topic.Size)/1024)
+
 		fmt.Printf("  Created: %s\n", topic.CreatedAt.Format("2006-01-02 15:04:05"))
 		if i < len(topics)-1 {
 			fmt.Println(strings.Repeat("-", 40))
@@ -331,8 +330,7 @@ func describeTopic(c *client.Client, topicName string) {
 	fmt.Printf("  Name: %s\n", topic.Name)
 	fmt.Printf("  Partitions: %d\n", topic.Partitions)
 	fmt.Printf("  Replicas: %d\n", topic.Replicas)
-	fmt.Printf("  Total Messages: %d\n", topic.MessageCount)
-	fmt.Printf("  Total Size: %.2f KB\n", float64(topic.Size)/1024)
+
 	fmt.Printf("  Created At: %s\n", topic.CreatedAt.Format("2006-01-02 15:04:05"))
 
 	fmt.Printf("\nPartition Details:\n")
@@ -385,8 +383,7 @@ func getTopicInfo(c *client.Client, topicName string) {
 	fmt.Println(strings.Repeat("=", 50))
 	fmt.Printf("  Name: %s\n", info.Name)
 	fmt.Printf("  Partitions: %d\n", info.Partitions)
-	fmt.Printf("  Messages: %d\n", info.MessageCount)
-	fmt.Printf("  Size: %.2f KB\n", float64(info.Size)/1024)
+
 	fmt.Println(strings.Repeat("=", 50))
 	log.Printf("Topic info for %s retrieved successfully", topicName)
 }

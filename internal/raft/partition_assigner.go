@@ -13,14 +13,12 @@ import (
 	"time"
 
 	"github.com/issac1998/go-queue/internal/compression"
-	"github.com/issac1998/go-queue/internal/deduplication"
 	"github.com/issac1998/go-queue/internal/protocol"
 )
 
 // BrokerInterface defines the interface to access broker components
 type BrokerInterface interface {
 	GetCompressor() compression.Compressor
-	GetDeduplicator() *deduplication.Deduplicator
 }
 
 // StartPartitionRaftGroupRequest represents the request to start a partition Raft group
@@ -56,9 +54,10 @@ type StopPartitionRaftGroupResponse struct {
 // PartitionAssigner implements partition assignment for Multi-Raft architecture
 // Each partition is a separate Raft group with its own leader election
 type PartitionAssigner struct {
-	metadata    *ClusterMetadata
-	raftManager *RaftManager
-	broker      BrokerInterface
+	metadata        *ClusterMetadata
+	raftManager     *RaftManager
+	broker          BrokerInterface
+	currentBrokerID string // Store the current broker ID
 }
 
 // NewPartitionAssigner creates a new Multi-Raft partition assigner
@@ -66,13 +65,15 @@ func NewPartitionAssigner(metadata *ClusterMetadata, raftManager *RaftManager) *
 	return &PartitionAssigner{
 		metadata:    metadata,
 		raftManager: raftManager,
-		broker:      nil, //
+		broker:      nil,
 	}
 }
 
 // SetBroker sets the broker interface for accessing components
-func (pa *PartitionAssigner) SetBroker(broker BrokerInterface) {
+func (pa *PartitionAssigner) SetBroker(broker BrokerInterface, brokerID string) {
 	pa.broker = broker
+	pa.currentBrokerID = brokerID
+
 }
 
 // AllocatePartitions allocates partitions as independent Raft groups
@@ -303,7 +304,7 @@ func (pa *PartitionAssigner) startSinglePartitionRaftGroup(assignment *Partition
 
 	for _, brokerID := range assignment.Replicas {
 		if brokerID != assignment.PreferredLeader {
-			err := pa.startRaftGroupOnBroker(assignment, map[uint64]string{}, brokerID, true)
+			err := pa.startRaftGroupOnBroker(assignment, nodeMembers, brokerID, true)
 			if err != nil {
 				return fmt.Errorf("failed to start Raft group on replica %s: %w", brokerID, err)
 			}
@@ -338,18 +339,14 @@ func (pa *PartitionAssigner) startRaftGroupLocally(
 ) error {
 	// Create partition state machine
 	var compressor compression.Compressor
-	var deduplicator *deduplication.Deduplicator
 
 	if pa.broker != nil {
 		compressor = pa.broker.GetCompressor()
-		deduplicator = pa.broker.GetDeduplicator()
 	} else {
-		// Fallback to no compression/deduplication
-		compressor, _ = compression.GetCompressor(compression.None)
-		deduplicator = deduplication.NewDeduplicator(&deduplication.Config{Enabled: false})
+		return fmt.Errorf("no broker found for partition assignment")
 	}
 
-	stateMachine, err := NewPartitionStateMachine(assignment.TopicName, assignment.PartitionID, pa.raftManager.dataDir, compressor, deduplicator)
+	stateMachine, err := NewPartitionStateMachine(assignment.TopicName, assignment.PartitionID, pa.raftManager.dataDir, compressor)
 	if err != nil {
 		return fmt.Errorf("failed to create partition state machine: %w", err)
 	}
@@ -479,9 +476,7 @@ func receiveStopPartitionRaftGroupResponse(conn net.Conn) (*StopPartitionRaftGro
 
 // getCurrentBrokerID returns the current broker's ID
 func (pa *PartitionAssigner) getCurrentBrokerID() string {
-	// This would be injected or available from the broker context
-	// For now, we'll implement this as a method that needs to be set
-	return fmt.Sprintf("%d", pa.raftManager.config.NodeID) // Convert uint64 to string
+	return pa.currentBrokerID
 }
 
 // waitForLeadershipEstablishment waits for all partition Raft groups to elect leaders

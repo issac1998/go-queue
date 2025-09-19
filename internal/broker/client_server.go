@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"net"
@@ -533,13 +534,6 @@ func (h *ListTopicsHandler) buildListTopicsResponse(topicsData []byte) ([]byte, 
 		if err := binary.Write(buf, binary.BigEndian, topicMeta.CreatedAt.Unix()); err != nil {
 			return nil, err
 		}
-
-		if err := binary.Write(buf, binary.BigEndian, int64(0)); err != nil { // Size
-			return nil, err
-		}
-		if err := binary.Write(buf, binary.BigEndian, int64(0)); err != nil { // Message count
-			return nil, err
-		}
 	}
 
 	return buf.Bytes(), nil
@@ -649,10 +643,16 @@ func (h *GetTopicInfoHandler) Handle(conn net.Conn, cs *ClientServer) error {
 
 	topicInfo, err := cs.broker.Controller.GetTopicInfo(topicName)
 	if err != nil {
-		return fmt.Errorf("failed to get topic info: %v", err)
+		errorResponse, buildErr := h.buildGetTopicInfoErrorResponse(err.Error())
+		if buildErr != nil {
+			return fmt.Errorf("failed to build error response: %v", buildErr)
+		}
+		cs.sendSuccessResponse(conn, errorResponse)
+		log.Printf("Topic '%s' not found: %v", topicName, err)
+		return nil
 	}
 
-	responseData, err := h.buildGetTopicInfoResponse(topicInfo)
+	responseData, err := h.buildGetTopicInfoResponse(topicInfo, cs)
 	if err != nil {
 		return fmt.Errorf("failed to build response: %v", err)
 	}
@@ -682,10 +682,10 @@ func (h *GetTopicInfoHandler) parseGetTopicInfoRequest(data []byte) (string, err
 	return string(nameBytes), nil
 }
 
-func (h *GetTopicInfoHandler) buildGetTopicInfoResponse(topicInfo *raft.TopicMetadata) ([]byte, error) {
+func (h *GetTopicInfoHandler) buildGetTopicInfoResponse(topicInfo *raft.TopicMetadata, cs *ClientServer) ([]byte, error) {
 	buf := new(bytes.Buffer)
 
-	if err := binary.Write(buf, binary.BigEndian, int16(0)); err != nil {
+	if err := binary.Write(buf, binary.BigEndian, protocol.ErrorNone); err != nil {
 		return nil, err
 	}
 
@@ -700,10 +700,122 @@ func (h *GetTopicInfoHandler) buildGetTopicInfoResponse(topicInfo *raft.TopicMet
 	if err := binary.Write(buf, binary.BigEndian, topicInfo.Partitions); err != nil {
 		return nil, err
 	}
-	if err := binary.Write(buf, binary.BigEndian, int64(0)); err != nil { // Message count (placeholder)
+
+	if err := binary.Write(buf, binary.BigEndian, topicInfo.ReplicationFactor); err != nil {
 		return nil, err
 	}
-	if err := binary.Write(buf, binary.BigEndian, int64(0)); err != nil { // Size (placeholder)
+
+	createdAtUnix := topicInfo.CreatedAt.Unix()
+	if err := binary.Write(buf, binary.BigEndian, createdAtUnix); err != nil {
+		return nil, err
+	}
+
+	if err := binary.Write(buf, binary.BigEndian, topicInfo.Partitions); err != nil {
+		return nil, err
+	}
+
+	for i := int32(0); i < topicInfo.Partitions; i++ {
+		if err := binary.Write(buf, binary.BigEndian, i); err != nil {
+			return nil, err
+		}
+
+		var leaderNodeID int32 = 0
+		if cs.broker.Controller != nil {
+			leaderBrokerID, err := cs.broker.Controller.GetPartitionLeader(topicInfo.Name, i)
+			if err == nil && leaderBrokerID != "" {
+				// Convert broker ID to node ID for client response
+				nodeID := cs.brokerIDToNodeID(leaderBrokerID)
+				leaderNodeID = int32(nodeID)
+			}
+		}
+
+		if err := binary.Write(buf, binary.BigEndian, leaderNodeID); err != nil {
+			return nil, err
+		}
+		partitionSize, messageCount, startOffset, endOffset := cs.getPartitionStatistics(topicInfo.Name, i)
+		// return 0 if failed ,it's okay ,we don't want to return err if one partition is failed
+		if err := binary.Write(buf, binary.BigEndian, partitionSize); err != nil {
+			return nil, err
+		}
+		if err := binary.Write(buf, binary.BigEndian, messageCount); err != nil {
+			return nil, err
+		}
+		if err := binary.Write(buf, binary.BigEndian, startOffset); err != nil {
+			return nil, err
+		}
+		if err := binary.Write(buf, binary.BigEndian, endOffset); err != nil {
+			return nil, err
+		}
+	}
+
+	return buf.Bytes(), nil
+}
+
+func (cs *ClientServer) getPartitionStatistics(topicName string, partitionID int32) (int64, int64, int64, int64) {
+	raftGroupID := cs.generateRaftGroupID(topicName, partitionID)
+
+	sm, err := cs.broker.raftManager.GetStateMachine(raftGroupID)
+	if err != nil {
+		return 0, 0, 0, 0
+	}
+
+	psm, ok := sm.(*raft.PartitionStateMachine)
+	if !ok {
+		return 0, 0, 0, 0
+	}
+
+	metrics := psm.GetMetrics()
+
+	var partitionSize, messageCount int64
+	if bytesStored, ok := metrics["bytes_stored"].(int64); ok {
+		partitionSize = bytesStored
+	}
+	if msgCount, ok := metrics["message_count"].(int64); ok {
+		messageCount = msgCount
+	}
+
+	var startOffset, endOffset int64
+	startOffset = 0
+	endOffset = messageCount
+
+	return partitionSize, messageCount, startOffset, endOffset
+}
+
+// generateRaftGroupID generates a raft group ID for a topic-partition pair
+func (cs *ClientServer) generateRaftGroupID(topicName string, partitionID int32) uint64 {
+	h := fnv.New64a()
+	h.Write([]byte(fmt.Sprintf("%s-%d", topicName, partitionID)))
+	return h.Sum64()
+}
+
+func (h *GetTopicInfoHandler) buildGetTopicInfoErrorResponse(errorMsg string) ([]byte, error) {
+	buf := new(bytes.Buffer)
+
+	if err := binary.Write(buf, binary.BigEndian, int16(1)); err != nil {
+		return nil, err
+	}
+
+	if err := binary.Write(buf, binary.BigEndian, int16(0)); err != nil {
+		return nil, err
+	}
+
+	if err := binary.Write(buf, binary.BigEndian, int32(0)); err != nil { // partitions
+		return nil, err
+	}
+	if err := binary.Write(buf, binary.BigEndian, int32(0)); err != nil { // replicas
+		return nil, err
+	}
+	if err := binary.Write(buf, binary.BigEndian, int64(0)); err != nil { // created time
+		return nil, err
+	}
+	if err := binary.Write(buf, binary.BigEndian, int64(0)); err != nil { // size
+		return nil, err
+	}
+	if err := binary.Write(buf, binary.BigEndian, int64(0)); err != nil { // message count
+		return nil, err
+	}
+
+	if err := binary.Write(buf, binary.BigEndian, int32(0)); err != nil {
 		return nil, err
 	}
 
@@ -1086,11 +1198,41 @@ func (h *ProduceHandler) parseProduceRequest(data []byte) (*ProduceRequest, erro
 
 	messages := make([]ProduceMessage, messageCount)
 	for i := uint32(0); i < messageCount; i++ {
-		if len(data) < offset+8 {
+		if len(data) < offset+4 {
 			return nil, fmt.Errorf("invalid message %d", i)
 		}
 
+		// Read ProducerID length (4 bytes)
+		producerIDLen := binary.BigEndian.Uint32(data[offset:])
+		offset += 4
+
+		var producerID string
+		if producerIDLen > 0 {
+			if len(data) < offset+int(producerIDLen) {
+				return nil, fmt.Errorf("invalid producer ID length for message %d", i)
+			}
+			producerID = string(data[offset : offset+int(producerIDLen)])
+			offset += int(producerIDLen)
+		}
+
+		// Read SequenceNumber (8 bytes)
+		if len(data) < offset+8 {
+			return nil, fmt.Errorf("invalid sequence number for message %d", i)
+		}
+		sequenceNumber := int64(binary.BigEndian.Uint64(data[offset:]))
+		offset += 8
+
+		// Read AsyncIO (1 byte)
+		if len(data) < offset+1 {
+			return nil, fmt.Errorf("invalid async IO flag for message %d", i)
+		}
+		asyncIO := data[offset] == 1
+		offset += 1
+
 		// Read key length (4 bytes)
+		if len(data) < offset+4 {
+			return nil, fmt.Errorf("invalid key length for message %d", i)
+		}
 		keyLen := binary.BigEndian.Uint32(data[offset:])
 		offset += 4
 
@@ -1119,8 +1261,11 @@ func (h *ProduceHandler) parseProduceRequest(data []byte) (*ProduceRequest, erro
 		offset += int(valueLen)
 
 		messages[i] = ProduceMessage{
-			Key:   key,
-			Value: value,
+			ProducerID:     producerID,
+			SequenceNumber: sequenceNumber,
+			AsyncIO:        asyncIO,
+			Key:            key,
+			Value:          value,
 		}
 	}
 
@@ -1250,7 +1395,6 @@ func (h *StartPartitionRaftGroupHandler) startPartitionRaftGroup(
 		request.PartitionID,
 		cs.broker.Config.DataDir,
 		cs.broker.GetCompressor(),
-		cs.broker.GetDeduplicator(),
 	)
 	if err != nil {
 		return &raft.StartPartitionRaftGroupResponse{

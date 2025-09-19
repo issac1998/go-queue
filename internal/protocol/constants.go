@@ -49,12 +49,13 @@ const (
 const (
 	ErrorNone = 0
 
-	ErrorInvalidRequest   = 1
-	ErrorInvalidTopic     = 2
-	ErrorUnknownPartition = 3
-	ErrorInvalidMessage   = 4
-	ErrorMessageTooLarge  = 5
-	ErrorOffsetOutOfRange = 6
+	ErrorInvalidRequest       = 1
+	ErrorInvalidTopic         = 2
+	ErrorUnknownPartition     = 3
+	ErrorInvalidMessage       = 4
+	ErrorMessageTooLarge      = 5
+	ErrorOffsetOutOfRange     = 6
+	ErrorInvalidSequenceNumber = 7
 
 	// Broker and network errors
 	ErrorBrokerNotAvailable = 10

@@ -332,7 +332,7 @@ func (aio *AsyncIO) executeOperation(entry SubmissionEntry) {
 		error:    err,
 		data:     data,
 		callback: entry.callback,
-		conn:     entry.conn.conn, 
+		conn:     entry.conn.conn,
 	}
 
 	aio.submitCQE(cqe)
