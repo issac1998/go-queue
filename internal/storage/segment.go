@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	typederrors "github.com/issac1998/go-queue/internal/errors"
 )
 
 const (
@@ -56,7 +58,11 @@ type IndexEntry struct {
 func NewSegment(dir string, baseOffset int64, maxBytes int64) (*Segment, error) {
 	// make or create dir and open file
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return nil, fmt.Errorf("create directory failed: %v", err)
+		return nil, &typederrors.TypedError{
+			Type:    typederrors.StorageError,
+			Message: "create directory failed",
+			Cause:   err,
+		}
 	}
 
 	logPath := filepath.Join(dir, fmt.Sprintf("%020d.log", baseOffset))
@@ -65,20 +71,32 @@ func NewSegment(dir string, baseOffset int64, maxBytes int64) (*Segment, error) 
 
 	logFile, err := os.OpenFile(logPath, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
-		return nil, fmt.Errorf("open log file failed: %v", err)
+		return nil, &typederrors.TypedError{
+			Type:    typederrors.StorageError,
+			Message: "open log file failed",
+			Cause:   err,
+		}
 	}
 
 	indexFile, err := os.OpenFile(indexPath, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		logFile.Close()
-		return nil, fmt.Errorf("open index file failed: %v", err)
+		return nil, &typederrors.TypedError{
+			Type:    typederrors.StorageError,
+			Message: "open index file failed",
+			Cause:   err,
+		}
 	}
 
 	timeIndexFile, err := os.OpenFile(timeIndexPath, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		logFile.Close()
 		indexFile.Close()
-		return nil, fmt.Errorf("open time index file failed: %v", err)
+		return nil, &typederrors.TypedError{
+			Type:    typederrors.StorageError,
+			Message: "open time index file failed",
+			Cause:   err,
+		}
 	}
 
 	stat, err := logFile.Stat()
@@ -86,7 +104,11 @@ func NewSegment(dir string, baseOffset int64, maxBytes int64) (*Segment, error) 
 		logFile.Close()
 		indexFile.Close()
 		timeIndexFile.Close()
-		return nil, fmt.Errorf("get log file size failed: %v", err)
+		return nil, &typederrors.TypedError{
+			Type:    typederrors.StorageError,
+			Message: "get log file size failed",
+			Cause:   err,
+		}
 	}
 
 	segment := &Segment{
@@ -106,7 +128,11 @@ func NewSegment(dir string, baseOffset int64, maxBytes int64) (*Segment, error) 
 	// load index to mem
 	if err := segment.loadIndex(); err != nil {
 		segment.Close()
-		return nil, fmt.Errorf("load index failed: %v", err)
+		return nil, &typederrors.TypedError{
+			Type:    typederrors.StorageError,
+			Message: "load index failed",
+			Cause:   err,
+		}
 	}
 
 	// Update WriteCount based on loaded index entries
@@ -139,17 +165,29 @@ func (s *Segment) loadIndex() error {
 
 	// Reset file pointer to the beginning
 	if _, err := s.IndexFile.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("seek index file failed: %v", err)
+		return &typederrors.TypedError{
+			Type:    typederrors.StorageError,
+			Message: "seek index file failed",
+			Cause:   err,
+		}
 	}
 
 	// Read all index entries (only read offset and position)
 	for i := int64(0); i < numEntries; i++ {
 		var entry IndexEntry
 		if err := binary.Read(s.IndexFile, binary.BigEndian, &entry.Offset); err != nil {
-			return fmt.Errorf("read offset failed at entry %d: %v", i, err)
+			return &typederrors.TypedError{
+				Type:    typederrors.StorageError,
+				Message: fmt.Sprintf("read offset failed at entry %d", i),
+				Cause:   err,
+			}
 		}
 		if err := binary.Read(s.IndexFile, binary.BigEndian, &entry.Position); err != nil {
-			return fmt.Errorf("read position failed at entry %d: %v", i, err)
+			return &typederrors.TypedError{
+				Type:    typederrors.StorageError,
+				Message: fmt.Sprintf("read position failed at entry %d", i),
+				Cause:   err,
+			}
 		}
 		// TimeMs field is not read from the index file during loading because it was not stored in old versions
 		entry.TimeMs = 0
@@ -174,23 +212,43 @@ func (s *Segment) Append(msg []byte, timestamp time.Time) (offset int64, err err
 	// Get current file position
 	currentFilePos, err := s.LogFile.Seek(0, io.SeekCurrent)
 	if err != nil {
-		return 0, fmt.Errorf("get file position failed: %v", err)
+		return 0, &typederrors.TypedError{
+			Type:    typederrors.StorageError,
+			Message: "get file position failed",
+			Cause:   err,
+		}
 	}
 
 	// Write message length and content
 	if err := binary.Write(s.LogFile, binary.BigEndian, int32(len(msg))); err != nil {
-		return 0, fmt.Errorf("write message length failed: %v", err)
+		return 0, &typederrors.TypedError{
+			Type:    typederrors.StorageError,
+			Message: "write message length failed",
+			Cause:   err,
+		}
 	}
 	if _, err := s.LogFile.Write(msg); err != nil {
-		return 0, fmt.Errorf("write message content failed: %v", err)
+		return 0, &typederrors.TypedError{
+			Type:    typederrors.StorageError,
+			Message: "write message content failed",
+			Cause:   err,
+		}
 	}
 
 	// Force write index entry (index is established for each message)
 	if err := binary.Write(s.IndexFile, binary.BigEndian, offset); err != nil {
-		return 0, fmt.Errorf("write index offset failed: %v", err)
+		return 0, &typederrors.TypedError{
+			Type:    typederrors.StorageError,
+			Message: "write index offset failed",
+			Cause:   err,
+		}
 	}
 	if err := binary.Write(s.IndexFile, binary.BigEndian, currentFilePos); err != nil {
-		return 0, fmt.Errorf("write index position failed: %v", err)
+		return 0, &typederrors.TypedError{
+			Type:    typederrors.StorageError,
+			Message: "write index position failed",
+			Cause:   err,
+		}
 	}
 
 	// Add to memory index
@@ -285,7 +343,10 @@ func (s *Segment) FindPosition(offset int64) (int64, error) {
 		}
 	}
 
-	return 0, fmt.Errorf("offset %d not found in segment", offset)
+	return 0, &typederrors.TypedError{
+		Type:    typederrors.StorageError,
+		Message: fmt.Sprintf("offset %d not found in segment", offset),
+	}
 }
 
 // ReadAt reads data from a specified position
@@ -298,13 +359,21 @@ func (s *Segment) ReadAt(pos int64, buf []byte) (int, error) {
 	}
 
 	if _, err := s.LogFile.Seek(pos, io.SeekStart); err != nil {
-		return 0, fmt.Errorf("seek failed: %v", err)
+		return 0, &typederrors.TypedError{
+			Type:    typederrors.StorageError,
+			Message: "seek failed",
+			Cause:   err,
+		}
 	}
 
 	// Read is better to use io.ReadFull to ensure full read
 	n, err := s.LogFile.Read(buf)
 	if err != nil && err != io.EOF {
-		return n, fmt.Errorf("read failed: %v", err)
+		return n, &typederrors.TypedError{
+			Type:    typederrors.StorageError,
+			Message: "read failed",
+			Cause:   err,
+		}
 	}
 
 	return n, nil
@@ -319,22 +388,38 @@ func (s *Segment) Close() error {
 
 	if s.LogFile != nil {
 		if err := s.LogFile.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("close log file failed: %v", err))
+			errs = append(errs, &typederrors.TypedError{
+				Type:    typederrors.StorageError,
+				Message: "close log file failed",
+				Cause:   err,
+			})
 		}
 	}
 	if s.IndexFile != nil {
 		if err := s.IndexFile.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("close index file failed: %v", err))
+			errs = append(errs, &typederrors.TypedError{
+				Type:    typederrors.StorageError,
+				Message: "close index file failed",
+				Cause:   err,
+			})
 		}
 	}
 	if s.TimeIndexFile != nil {
 		if err := s.TimeIndexFile.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("close time index file failed: %v", err))
+			errs = append(errs, &typederrors.TypedError{
+				Type:    typederrors.StorageError,
+				Message: "close time index file failed",
+				Cause:   err,
+			})
 		}
 	}
 
 	if len(errs) > 0 {
-		return fmt.Errorf("close segment failed: %v", errs)
+		return &typederrors.TypedError{
+			Type:    typederrors.StorageError,
+			Message: "close segment failed",
+			Cause:   errs[0], // Use first error as cause
+		}
 	}
 	return nil
 }
@@ -345,10 +430,18 @@ func (s *Segment) Sync() error {
 	defer s.Mu.Unlock()
 
 	if err := s.LogFile.Sync(); err != nil {
-		return fmt.Errorf("sync log file failed: %v", err)
+		return &typederrors.TypedError{
+			Type:    typederrors.StorageError,
+			Message: "sync log file failed",
+			Cause:   err,
+		}
 	}
 	if err := s.IndexFile.Sync(); err != nil {
-		return fmt.Errorf("sync index file failed: %v", err)
+		return &typederrors.TypedError{
+			Type:    typederrors.StorageError,
+			Message: "sync index file failed",
+			Cause:   err,
+		}
 	}
 	s.LastSynced = s.CurrentSize
 	return nil

@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/issac1998/go-queue/internal/errors"
 )
 
 func TestNewConsumer(t *testing.T) {
@@ -219,7 +221,8 @@ func TestConsumerFetchValidation(t *testing.T) {
 	}
 
 	// Both should fail with connection error, confirming the method works
-	if !strings.Contains(err.Error(), "failed to get topic metadata") &&
+	if !errors.IsConnectionError(err) &&
+		!strings.Contains(err.Error(), "failed to get topic metadata") &&
 		!strings.Contains(err.Error(), "failed to connect") {
 		t.Errorf("Expected metadata or connection error, got: %v", err)
 	}

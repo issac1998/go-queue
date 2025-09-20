@@ -9,6 +9,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/issac1998/go-queue/internal/errors"
 	"github.com/issac1998/go-queue/internal/protocol"
 	"github.com/issac1998/go-queue/internal/transaction"
 )
@@ -96,7 +97,11 @@ func (t *Transaction) SendHalfMessageAndDoLocal(msg *TransactionMessage) (*Trans
 
 	conn, err := t.producer.client.connectForDataOperation(msg.Topic, msg.Partition, false)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to partition leader: %w", err)
+		return nil, &errors.TypedError{
+			Type:    errors.PartitionLeaderError,
+			Message: errors.FailedToConnectToPartitionMsg,
+			Cause:   err,
+		}
 	}
 	defer conn.Close()
 

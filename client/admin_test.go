@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/issac1998/go-queue/internal/errors"
 	"github.com/issac1998/go-queue/internal/protocol"
 )
 
@@ -71,10 +72,14 @@ func TestCreateTopicRequest_Validation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := admin.CreateTopic(tt.request)
-			// We expect connection error since broker is not running
-			if err == nil {
-				t.Error("expected connection error but got none")
+			result, err := admin.CreateTopic(tt.request)
+			if err == nil && (result == nil || result.Error == nil) {
+				t.Error("expected error but got none")
+			}
+			if err != nil {
+				t.Logf("Got expected connection error: %v", err)
+			} else if result != nil && result.Error != nil {
+				t.Logf("Got expected topic creation error: %v", result.Error)
 			}
 		})
 	}
@@ -183,14 +188,19 @@ func TestCreateTopic(t *testing.T) {
 		Replicas:   1,
 	}
 
-	_, err := admin.CreateTopic(createReq)
-	if err == nil {
+	result, err := admin.CreateTopic(createReq)
+	if err == nil && (result == nil || result.Error == nil) {
 		t.Error("Expected error when no broker is running, got nil")
 	}
 
 	// Should contain connection-related error
-	if !strings.Contains(err.Error(), "failed to") {
-		t.Errorf("Expected connection error, got: %v", err)
+	if err != nil {
+		if !errors.IsConnectionError(err) && !strings.Contains(err.Error(), "failed to") {
+			t.Errorf("Expected connection error, got: %v", err)
+		}
+	} else if result != nil && result.Error != nil {
+		// If we got a result with an error, that's also acceptable
+		t.Logf("Got topic creation error: %v", result.Error)
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/issac1998/go-queue/client"
+	typederrors "github.com/issac1998/go-queue/internal/errors"
 )
 
 // Manager manages dead letter queue operations
@@ -70,30 +71,44 @@ func (m *Manager) HandleFailedMessage(originalMsg *client.Message, failureInfo *
 
 	// Update retry state
 	retryState.LastFailureTime = failureInfo.FailureTime
-	retryState.RetryCount++
 
-	// Add retry attempt
-	attempt := RetryAttempt{
-		AttemptNumber: retryState.RetryCount,
-		AttemptTime:   failureInfo.FailureTime,
-		Error:         failureInfo.ErrorMessage,
-	}
-
+	// Check if we should retry BEFORE incrementing retry count
 	if retryState.ShouldRetry() {
+		// Increment retry count for next attempt
+		retryState.RetryCount++
+		
 		// Schedule next retry
 		retryState.NextRetryTime = retryState.CalculateNextRetryTime()
-		attempt.NextRetryTime = retryState.NextRetryTime
+		
+		// Add retry attempt
+		attempt := RetryAttempt{
+			AttemptNumber: retryState.RetryCount,
+			AttemptTime:   failureInfo.FailureTime,
+			Error:         failureInfo.ErrorMessage,
+			NextRetryTime: retryState.NextRetryTime,
+		}
+		retryState.RetryAttempts = append(retryState.RetryAttempts, attempt)
 	} else {
+		// Increment retry count for final attempt
+		retryState.RetryCount++
+		
+		// Add final attempt
+		attempt := RetryAttempt{
+			AttemptNumber: retryState.RetryCount,
+			AttemptTime:   failureInfo.FailureTime,
+			Error:         failureInfo.ErrorMessage,
+		}
+		retryState.RetryAttempts = append(retryState.RetryAttempts, attempt)
+		
 		// Send to dead letter queue
 		if err := m.sendToDeadLetterQueue(originalMsg, failureInfo, retryState); err != nil {
-			return fmt.Errorf("failed to send message to DLQ: %w", err)
+			return typederrors.NewTypedError(typederrors.GeneralError, "failed to send message to DLQ", err)
 		}
 
 		// Remove from retry states
 		delete(m.retryStates, key)
 	}
 
-	retryState.RetryAttempts = append(retryState.RetryAttempts, attempt)
 	return nil
 }
 
@@ -109,7 +124,7 @@ func (m *Manager) ShouldRetryMessage(topic string, partition int32, offset int64
 	key := fmt.Sprintf("%s-%d-%d-%s", topic, partition, offset, consumerGroup)
 	retryState, exists := m.retryStates[key]
 
-	return exists && retryState.ShouldRetry() && time.Now().After(retryState.NextRetryTime)
+	return exists && retryState.ShouldRetry()
 }
 
 // GetRetryDelay returns the delay before next retry for a message
@@ -166,7 +181,7 @@ func (m *Manager) sendToDeadLetterQueue(originalMsg *client.Message, failureInfo
 	// Serialize DLQ message
 	dlqData, err := json.Marshal(dlqMessage)
 	if err != nil {
-		return fmt.Errorf("failed to serialize DLQ message: %w", err)
+		return typederrors.NewTypedError(typederrors.GeneralError, "failed to serialize DLQ message", err)
 	}
 
 	// Send to DLQ topic
@@ -178,7 +193,7 @@ func (m *Manager) sendToDeadLetterQueue(originalMsg *client.Message, failureInfo
 
 	_, err = m.producer.Send(produceMessage)
 	if err != nil {
-		return fmt.Errorf("failed to send message to DLQ topic %s: %w", dlqTopic, err)
+		return typederrors.NewTypedError(typederrors.GeneralError, fmt.Sprintf("failed to send message to DLQ topic %s", dlqTopic), err)
 	}
 
 	return nil
@@ -212,7 +227,7 @@ func (m *Manager) GetDLQMessages(topic string, limit int) ([]*DeadLetterMessage,
 		MaxBytes:  int32(limit * 1024), // Estimate 1KB per message
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch DLQ messages: %w", err)
+		return nil, typederrors.NewTypedError(typederrors.GeneralError, "failed to fetch DLQ messages", err)
 	}
 
 	// Parse messages

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/issac1998/go-queue/internal/compression"
+	typederrors "github.com/issac1998/go-queue/internal/errors"
 	"github.com/issac1998/go-queue/internal/protocol"
 )
 
@@ -57,7 +58,7 @@ type PartitionAssigner struct {
 	metadata        *ClusterMetadata
 	raftManager     *RaftManager
 	broker          BrokerInterface
-	currentBrokerID string // Store the current broker ID
+	currentBrokerID string
 }
 
 // NewPartitionAssigner creates a new Multi-Raft partition assigner
@@ -105,7 +106,8 @@ func (pa *PartitionAssigner) AllocatePartitions(
 		}
 
 		assignment.PreferredLeader = selectedBrokers[0].ID
-
+		// init Leader, might be false
+		assignment.Leader = selectedBrokers[0].ID
 		assignments[i] = assignment
 
 		pa.updateBrokerLoadAfterAssignment(selectedBrokers, assignment.PreferredLeader)
@@ -207,17 +209,17 @@ func (pa *PartitionAssigner) executeLeaderTransfers(plans []LeaderTransferPlan) 
 func (pa *PartitionAssigner) getCurrentRaftLeader(raftGroupID uint64) (string, error) {
 	leaderNodeID, valid, err := pa.raftManager.GetLeaderID(raftGroupID)
 	if err != nil {
-		return "", fmt.Errorf("failed to get leader for group %d: %w", raftGroupID, err)
+		return "", typederrors.NewTypedError(typederrors.PartitionLeaderError, fmt.Sprintf("failed to get leader for group %d", raftGroupID), err)
 	}
 
 	if !valid || leaderNodeID == 0 {
-		return "", fmt.Errorf("no valid leader for group %d", raftGroupID)
+		return "", typederrors.NewTypedError(typederrors.PartitionLeaderError, fmt.Sprintf("no valid leader for group %d", raftGroupID), nil)
 	}
 
 	// Convert node ID back to broker ID
 	brokerID, err := pa.nodeIDToBrokerID(leaderNodeID)
 	if err != nil {
-		return "", fmt.Errorf("failed to convert node ID %d to broker ID: %w", leaderNodeID, err)
+		return "", typederrors.NewTypedError(typederrors.PartitionLeaderError, fmt.Sprintf("failed to convert node ID %d to broker ID", leaderNodeID), err)
 	}
 
 	return brokerID, nil
@@ -256,11 +258,12 @@ func (pa *PartitionAssigner) StartPartitionRaftGroups(assignments []*PartitionAs
 				assignment.TopicName, assignment.PartitionID, err)
 			return err
 		}
+		log.Printf("start Raft group : %v",
+			assignment.RaftGroupID)
 	}
 
 	log.Printf("Successfully coordinated startup of %d partition Raft groups", len(assignments))
 
-	// Wait for leadership establishment to ensure partitions are ready for use
 	log.Printf("Waiting for leadership establishment across all partition Raft groups...")
 	err := pa.waitForLeadershipEstablishment(assignments)
 	if err != nil {
@@ -281,32 +284,30 @@ func (pa *PartitionAssigner) startSinglePartitionRaftGroup(assignment *Partition
 		return fmt.Errorf("PreferredLeader must be set for partition assignment")
 	}
 
-	// Convert broker IDs to node IDs and addresses
 	nodeMembers := make(map[uint64]string)
 	for _, brokerID := range assignment.Replicas {
 		nodeID, err := pa.BrokerIDToNodeID(brokerID)
 		if err != nil {
-			return fmt.Errorf("failed to convert broker ID %s to node ID: %w", brokerID, err)
+			return typederrors.NewTypedError(typederrors.GeneralError, fmt.Sprintf("failed to convert broker ID %s to node ID", brokerID), err)
 		}
 
-		// Get broker info for address
 		if broker, exists := pa.metadata.Brokers[brokerID]; exists {
 			nodeMembers[nodeID] = broker.RaftAddress
 		} else {
-			return fmt.Errorf("broker %s not found in metadata", brokerID)
+			return typederrors.NewTypedError(typederrors.GeneralError, fmt.Sprintf("broker %s not found in metadata", brokerID), nil)
 		}
 	}
 
 	err := pa.startRaftGroupOnBroker(assignment, nodeMembers, assignment.PreferredLeader, false)
 	if err != nil {
-		return fmt.Errorf("failed to start Raft group on preferred leader %s: %w", assignment.PreferredLeader, err)
+		return typederrors.NewTypedError(typederrors.PartitionLeaderError, fmt.Sprintf("failed to start Raft group on preferred leader %s", assignment.PreferredLeader), err)
 	}
 
 	for _, brokerID := range assignment.Replicas {
 		if brokerID != assignment.PreferredLeader {
-			err := pa.startRaftGroupOnBroker(assignment, nodeMembers, brokerID, true)
+			err := pa.startRaftGroupOnBroker(assignment, make(map[uint64]string), brokerID, true)
 			if err != nil {
-				return fmt.Errorf("failed to start Raft group on replica %s: %w", brokerID, err)
+				return typederrors.NewTypedError(typederrors.PartitionLeaderError, fmt.Sprintf("failed to start Raft group on replica %s", brokerID), err)
 			}
 		}
 	}
@@ -348,7 +349,7 @@ func (pa *PartitionAssigner) startRaftGroupLocally(
 
 	stateMachine, err := NewPartitionStateMachine(assignment.TopicName, assignment.PartitionID, pa.raftManager.dataDir, compressor)
 	if err != nil {
-		return fmt.Errorf("failed to create partition state machine: %w", err)
+		return typederrors.NewTypedError(typederrors.GeneralError, "failed to create partition state machine", err)
 	}
 
 	err = pa.raftManager.StartRaftGroup(
@@ -358,7 +359,7 @@ func (pa *PartitionAssigner) startRaftGroupLocally(
 		join,
 	)
 	if err != nil {
-		return fmt.Errorf("failed to start local Raft group %d: %w", assignment.RaftGroupID, err)
+		return typederrors.NewTypedError(typederrors.GeneralError, fmt.Sprintf("failed to start local Raft group %d", assignment.RaftGroupID), err)
 	}
 
 	log.Printf("Successfully started Raft group %d locally (join=%t)", assignment.RaftGroupID, join)
@@ -391,8 +392,7 @@ func (pa *PartitionAssigner) sendStartRaftGroupCommand(
 
 	resp, err := pa.sendStartPartitionRaftGroupRequest(broker.Address, broker.Port, request)
 	if err != nil {
-		return fmt.Errorf("failed to send request to broker %s:%d: %w",
-			broker.Address, broker.Port, err)
+		return typederrors.NewTypedError(typederrors.ConnectionError, fmt.Sprintf("failed to send request to broker %s:%d", broker.Address, broker.Port), err)
 	}
 	if resp.Success {
 		log.Printf("Successfully sent StartPartitionRaftGroup request to broker %s:%d",
@@ -412,7 +412,7 @@ func (pa *PartitionAssigner) sendStopPartitionRaftGroupRequest(
 	addr := fmt.Sprintf("%s:%d", brokerAddress, brokerPort)
 	conn, err := protocol.ConnectToSpecificBroker(addr, 10*time.Second)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to broker %s: %w", addr, err)
+		return nil, typederrors.NewTypedError(typederrors.ConnectionError, fmt.Sprintf("failed to connect to broker %s", addr), err)
 	}
 	defer conn.Close()
 
@@ -421,21 +421,21 @@ func (pa *PartitionAssigner) sendStopPartitionRaftGroupRequest(
 	log.Printf("Connected to broker at %s for StopPartitionRaftGroup request", addr)
 
 	if err := binary.Write(conn, binary.BigEndian, protocol.StopPartitionRaftGroupRequestType); err != nil {
-		return nil, fmt.Errorf("failed to write request type: %w", err)
+		return nil, typederrors.NewTypedError(typederrors.ConnectionError, "failed to write request type", err)
 	}
 
 	requestData, err := json.Marshal(request)
 	if err != nil {
-		return nil, fmt.Errorf("failed to serialize request: %w", err)
+		return nil, typederrors.NewTypedError(typederrors.GeneralError, "failed to serialize request", err)
 	}
 
 	if err := binary.Write(conn, binary.BigEndian, int32(len(requestData))); err != nil {
-		return nil, fmt.Errorf("failed to write request length: %w", err)
+		return nil, typederrors.NewTypedError(typederrors.ConnectionError, "failed to write request length", err)
 	}
 
 	// Send request data
 	if _, err := conn.Write(requestData); err != nil {
-		return nil, fmt.Errorf("failed to write request data: %w", err)
+		return nil, typederrors.NewTypedError(typederrors.ConnectionError, "failed to write request data", err)
 	}
 
 	log.Printf("Sent StopPartitionRaftGroup request: GroupID=%d", request.RaftGroupID)
@@ -449,19 +449,19 @@ func receiveStopPartitionRaftGroupResponse(conn net.Conn) (*StopPartitionRaftGro
 	// Read response data length
 	var dataLength int32
 	if err := binary.Read(conn, binary.BigEndian, &dataLength); err != nil {
-		return nil, fmt.Errorf("failed to read response length: %w", err)
+		return nil, typederrors.NewTypedError(typederrors.ConnectionError, "failed to read response length", err)
 	}
 
 	// Read response data
 	responseData := make([]byte, dataLength)
 	if _, err := io.ReadFull(conn, responseData); err != nil {
-		return nil, fmt.Errorf("failed to read response data: %w", err)
+		return nil, typederrors.NewTypedError(typederrors.ConnectionError, "failed to read response data", err)
 	}
 
 	// Parse response
 	var response StopPartitionRaftGroupResponse
 	if err := json.Unmarshal(responseData, &response); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
+		return nil, typederrors.NewTypedError(typederrors.GeneralError, "failed to parse response", err)
 	}
 
 	log.Printf("Received StopPartitionRaftGroup response: Success=%t, Message=%s",
@@ -481,8 +481,7 @@ func (pa *PartitionAssigner) getCurrentBrokerID() string {
 
 // waitForLeadershipEstablishment waits for all partition Raft groups to elect leaders
 func (pa *PartitionAssigner) waitForLeadershipEstablishment(assignments []*PartitionAssignment) error {
-	// 30s is enough?
-	timeout := 30 * time.Second
+	timeout := 60 * time.Second
 	// todo: do we need to concurrently check ?
 	for _, assignment := range assignments {
 		err := pa.raftManager.WaitForLeadershipReady(assignment.RaftGroupID, timeout)
@@ -679,7 +678,7 @@ func (pa *PartitionAssigner) sendStartPartitionRaftGroupRequest(
 	addr := fmt.Sprintf("%s:%d", brokerAddress, brokerPort)
 	conn, err := protocol.ConnectToSpecificBroker(addr, 10*time.Second)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to broker %s: %w", addr, err)
+		return nil, typederrors.NewTypedError(typederrors.ConnectionError, fmt.Sprintf("failed to connect to broker %s", addr), err)
 	}
 	defer conn.Close()
 
@@ -688,20 +687,20 @@ func (pa *PartitionAssigner) sendStartPartitionRaftGroupRequest(
 	log.Printf("Connected to broker at %s for StartPartitionRaftGroup request", addr)
 
 	if err := binary.Write(conn, binary.BigEndian, protocol.StartPartitionRaftGroupRequestType); err != nil {
-		return nil, fmt.Errorf("failed to write request type: %w", err)
+		return nil, typederrors.NewTypedError(typederrors.ConnectionError, "failed to write request type", err)
 	}
 
 	requestData, err := json.Marshal(request)
 	if err != nil {
-		return nil, fmt.Errorf("failed to serialize request: %w", err)
+		return nil, typederrors.NewTypedError(typederrors.GeneralError, "failed to serialize request", err)
 	}
 
 	if err := binary.Write(conn, binary.BigEndian, int32(len(requestData))); err != nil {
-		return nil, fmt.Errorf("failed to write request length: %w", err)
+		return nil, typederrors.NewTypedError(typederrors.ConnectionError, "failed to write request length", err)
 	}
 
 	if _, err := conn.Write(requestData); err != nil {
-		return nil, fmt.Errorf("failed to write request data: %w", err)
+		return nil, typederrors.NewTypedError(typederrors.ConnectionError, "failed to write request data", err)
 	}
 
 	log.Printf("Sent StartPartitionRaftGroup request: GroupID=%d, Join=%t",
@@ -714,17 +713,17 @@ func (pa *PartitionAssigner) sendStartPartitionRaftGroupRequest(
 func receiveStartPartitionRaftGroupResponse(conn net.Conn) (*StartPartitionRaftGroupResponse, error) {
 	var dataLength int32
 	if err := binary.Read(conn, binary.BigEndian, &dataLength); err != nil {
-		return nil, fmt.Errorf("failed to read response length: %w", err)
+		return nil, typederrors.NewTypedError(typederrors.ConnectionError, "failed to read response length", err)
 	}
 
 	responseData := make([]byte, dataLength)
 	if _, err := io.ReadFull(conn, responseData); err != nil {
-		return nil, fmt.Errorf("failed to read response data: %w", err)
+		return nil, typederrors.NewTypedError(typederrors.ConnectionError, "failed to read response data", err)
 	}
 
 	var response StartPartitionRaftGroupResponse
 	if err := json.Unmarshal(responseData, &response); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
+		return nil, typederrors.NewTypedError(typederrors.GeneralError, "failed to parse response", err)
 	}
 
 	log.Printf("Received StartPartitionRaftGroup response: Success=%t, Message=%s",
@@ -759,7 +758,7 @@ func (pa *PartitionAssigner) StopPartitionRaftGroups(assignments []*PartitionAss
 	if len(errors) > 0 {
 		log.Printf("Successfully stopped %d/%d Raft groups, %d failed",
 			stoppedGroups, len(assignments), len(errors))
-		return fmt.Errorf("failed to stop %d Raft groups: %v", len(errors), errors[0])
+		return typederrors.NewTypedError(typederrors.GeneralError, fmt.Sprintf("failed to stop %d Raft groups", len(errors)), errors[0])
 	}
 
 	log.Printf("Successfully stopped all %d partition Raft groups", len(assignments))
@@ -799,7 +798,7 @@ func (pa *PartitionAssigner) stopRaftGroupLocally(assignment *PartitionAssignmen
 
 	err := pa.raftManager.StopRaftGroup(assignment.RaftGroupID)
 	if err != nil {
-		return fmt.Errorf("failed to stop Raft group %d locally: %w", assignment.RaftGroupID, err)
+		return typederrors.NewTypedError(typederrors.GeneralError, fmt.Sprintf("failed to stop Raft group %d locally", assignment.RaftGroupID), err)
 	}
 
 	log.Printf("Successfully stopped Raft group %d locally", assignment.RaftGroupID)
@@ -824,8 +823,7 @@ func (pa *PartitionAssigner) sendStopRaftGroupCommand(assignment *PartitionAssig
 
 	resp, err := pa.sendStopPartitionRaftGroupRequest(broker.Address, broker.Port, request)
 	if err != nil {
-		return fmt.Errorf("failed to send stop request to broker %s:%d: %w",
-			broker.Address, broker.Port, err)
+		return typederrors.NewTypedError(typederrors.ConnectionError, fmt.Sprintf("failed to send stop request to broker %s:%d", broker.Address, broker.Port), err)
 	}
 
 	if resp.Success {

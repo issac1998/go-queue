@@ -7,13 +7,13 @@ import (
 	"io"
 	"log"
 	"net"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/issac1998/go-queue/internal/async"
+	"github.com/issac1998/go-queue/internal/errors"
 	"github.com/issac1998/go-queue/internal/pool"
 	"github.com/issac1998/go-queue/internal/protocol"
 )
@@ -125,7 +125,7 @@ func NewClient(config ClientConfig) *Client {
 
 	timeout := config.Timeout
 	if timeout == 0 {
-		timeout = 5 * time.Second
+		timeout = 500 * time.Second
 	}
 
 	if config.BatchSize <= 0 {
@@ -182,7 +182,10 @@ func (c *Client) DiscoverController() error {
 	}
 
 	if discoveredAddr == "" {
-		return fmt.Errorf("failed to discover controller leader from any broker,brokers:%v", c.brokerAddrs)
+		return &errors.TypedError{
+			Type:    errors.ControllerError,
+			Message: fmt.Sprintf("failed to discover controller leader from any broker,brokers:%v", c.brokerAddrs),
+		}
 	}
 
 	c.setControllerAddr(discoveredAddr)
@@ -256,7 +259,6 @@ func (c *Client) sendMetaRequest(requestType int32, requestData []byte) ([]byte,
 	isWrite := c.isMetadataWriteRequest(requestType)
 	log.Printf("Request is write operation: %v", isWrite)
 	conn, err = c.connectForMetadata(isWrite)
-
 	if err != nil {
 		log.Printf("Failed to connect for metadata: %v", err)
 		return nil, err
@@ -352,7 +354,11 @@ func (c *Client) refreshTopicMetadata(topic string) (*TopicMetadata, error) {
 				log.Printf("Failed to rediscover controller: %v", discoverErr)
 			}
 
-			lastErr = fmt.Errorf("controller error, rediscovered for retry: %v", err)
+			lastErr = &errors.TypedError{
+				Type:    errors.ControllerError,
+				Message: "controller error, rediscovered for retry",
+				Cause:   err,
+			}
 			continue // Retry with new controller
 		}
 
@@ -368,17 +374,28 @@ func (c *Client) tryRefreshTopicMetadata(topic string) (*TopicMetadata, error) {
 	controllerAddr := c.GetControllerAddr()
 	if controllerAddr == "" {
 		if err := c.DiscoverController(); err != nil {
-			return nil, fmt.Errorf("failed to discover controller: %v", err)
+			return nil, &errors.TypedError{
+				Type:    errors.ControllerError,
+				Message: "failed to discover controller",
+				Cause:   err,
+			}
 		}
 		controllerAddr = c.GetControllerAddr()
 		if controllerAddr == "" {
-			return nil, fmt.Errorf("no controller available")
+			return nil, &errors.TypedError{
+				Type:    errors.ControllerError,
+				Message: errors.ControllerNotAvailableMsg,
+			}
 		}
 	}
 
 	conn, err := protocol.ConnectToSpecificBroker(controllerAddr, c.timeout)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to controller %s: %v", controllerAddr, err)
+		return nil, &errors.TypedError{
+			Type:    errors.ControllerError,
+			Message: fmt.Sprintf("failed to connect to controller %s", controllerAddr),
+			Cause:   err,
+		}
 	}
 	defer conn.Close()
 
@@ -439,7 +456,7 @@ func (c *Client) buildTopicMetadataRequest(topic string) ([]byte, error) {
 func (c *Client) parseTopicMetadataResponse(topic string, responseData []byte) (*TopicMetadata, error) {
 	buf := bytes.NewReader(responseData)
 
-	var errorCode int32
+	var errorCode int16
 	if err := binary.Read(buf, binary.BigEndian, &errorCode); err != nil {
 		return nil, fmt.Errorf("failed to read error code: %v", err)
 	}
@@ -517,15 +534,17 @@ func (c *Client) parseTopicMetadataResponse(topic string, responseData []byte) (
 
 // isControllerError checks if the error indicates a controller-related issue
 func (c *Client) isControllerError(err error) bool {
-	if err == nil {
-		return false
-	}
+	return errors.IsControllerError(err)
+}
 
-	errStr := err.Error()
-	return strings.Contains(errStr, "controller") ||
-		strings.Contains(errStr, "not leader") ||
-		strings.Contains(errStr, "connection refused") ||
-		strings.Contains(errStr, "connection reset")
+func (c *Client) isPartitionLeaderError(err error) bool {
+	return errors.IsPartitionLeaderError(err)
+}
+
+// shouldRetryWithMetadataRefresh determines if an error should trigger
+// metadata refresh and retry
+func (c *Client) shouldRetryWithMetadataRefresh(err error) bool {
+	return errors.ShouldRetryWithMetadataRefresh(err)
 }
 
 // Close close client

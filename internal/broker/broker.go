@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -55,7 +57,7 @@ type Broker struct {
 	systemMetrics *SystemMetrics
 	LoadMetrics   *LoadMetrics
 
-	compressor   compression.Compressor
+	compressor compression.Compressor
 
 	// Ordered message routing
 	orderedRouter *OrderedMessageRouter
@@ -72,6 +74,9 @@ type BrokerConfig struct {
 
 	// Data directory
 	DataDir string `yaml:"data_dir"`
+
+	// Log configuration
+	LogDir string `yaml:"log_dir"`
 
 	// Raft configuration
 	RaftConfig *raft.RaftConfig `yaml:"raft"`
@@ -137,6 +142,11 @@ func NewBroker(config *BrokerConfig) (*Broker, error) {
 
 // Start initializes and starts the broker
 func (b *Broker) Start() error {
+	// 0. Initialize logging
+	if err := b.initLogging(); err != nil {
+		return fmt.Errorf("logging init failed: %v", err)
+	}
+
 	log.Printf("Starting Broker %s...", b.ID)
 
 	// 1. Load and validate configuration
@@ -206,11 +216,32 @@ func (b *Broker) Start() error {
 	return nil
 }
 
+func (b *Broker) initLogging() error {
+	if b.Config.LogDir == "" {
+		return nil
+	}
+
+	if err := os.MkdirAll(b.Config.LogDir, 0755); err != nil {
+		return fmt.Errorf("failed to create log directory: %v", err)
+	}
+
+	logFile := filepath.Join(b.Config.LogDir, fmt.Sprintf("broker-%s.log", b.ID))
+
+	file, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		return fmt.Errorf("failed to open log file: %v", err)
+	}
+
+	log.SetOutput(file)
+	log.Printf("Logging initialized, output to: %s", logFile)
+
+	return nil
+}
+
 // GetCompressor returns the broker's compressor (implements BrokerInterface)
 func (b *Broker) GetCompressor() compression.Compressor {
 	return b.compressor
 }
-
 
 // Stop gracefully shuts down the broker
 func (b *Broker) Stop() error {
@@ -337,7 +368,7 @@ func (b *Broker) initController() error {
 
 	if b.Controller.stateMachine != nil {
 		if partitionAssigner := b.Controller.stateMachine.GetPartitionAssigner(); partitionAssigner != nil {
-			partitionAssigner.SetBroker(b,b.ID)
+			partitionAssigner.SetBroker(b, b.ID)
 		}
 	}
 

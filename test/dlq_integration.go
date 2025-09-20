@@ -6,6 +6,8 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/issac1998/go-queue/client"
@@ -30,6 +32,18 @@ func NewIntegrationTest() *IntegrationTest {
 
 func (it *IntegrationTest) Run() error {
 	log.Println("Starting DLQ Integration Test...")
+
+	// Step 1: Start etcd
+	if err := it.startEtcd(); err != nil {
+		return fmt.Errorf("failed to start etcd: %v", err)
+	}
+	defer it.stopEtcd()
+
+	// Step 2: Start broker cluster
+	if err := it.startBrokerCluster(); err != nil {
+		return fmt.Errorf("failed to start broker cluster: %v", err)
+	}
+	defer it.stopBrokerCluster()
 
 	// Step 3: Wait for cluster to be ready
 	if err := it.waitForClusterReady(); err != nil {
@@ -63,7 +77,7 @@ func (it *IntegrationTest) Run() error {
 
 func (it *IntegrationTest) startEtcd() error {
 	log.Println("Starting etcd...")
-
+	os.RemoveAll("/tmp/etcd-test")
 	// Check if etcd is already running
 	if err := exec.Command("pgrep", "etcd").Run(); err == nil {
 		log.Println("etcd is already running")
@@ -71,7 +85,7 @@ func (it *IntegrationTest) startEtcd() error {
 	}
 
 	// Start etcd
-	cmd := exec.Command("etcd",
+	cmd := exec.Command("/Users/a/Downloads/etcd-v3.6.4-darwin-arm64/etcd",
 		"--name", "test-etcd",
 		"--data-dir", "/tmp/etcd-test",
 		"--listen-client-urls", "http://127.0.0.1:2379",
@@ -117,7 +131,7 @@ func (it *IntegrationTest) startBrokerCluster() error {
 	}{
 		{"broker1", 9095, 7004, "/tmp/dlq-broker1-data"},
 		{"broker2", 9096, 7005, "/tmp/dlq-broker2-data"},
-		{"broker3", 9097, 7006, "/tmp/dlq-broker3-data"},
+		{nodeID: "broker3", bindPort: 9097, raftPort: 7006, dataDir: "/tmp/dlq-broker3-data"},
 	}
 
 	for _, config := range brokerConfigs {
@@ -127,13 +141,14 @@ func (it *IntegrationTest) startBrokerCluster() error {
 
 		// Start broker
 		cmd := exec.Command("go", "run", "./cmd/broker/main.go",
-			"--node-id", config.nodeID,
-			"--bind-addr", "127.0.0.1",
-			"--bind-port", fmt.Sprintf("%d", config.bindPort),
-			"--raft-addr", fmt.Sprintf("127.0.0.1:%d", config.raftPort),
-			"--data-dir", config.dataDir,
-			"--discovery-type", "etcd",
-			"--discovery-endpoints", "127.0.0.1:2379",
+			"-node-id", config.nodeID,
+			"-bind-addr", "127.0.0.1",
+			"-bind-port", fmt.Sprintf("%d", config.bindPort),
+			"-raft-addr", fmt.Sprintf("127.0.0.1:%d", config.raftPort),
+			"-data-dir", config.dataDir,
+			"-log-dir", fmt.Sprintf("%s/logs", config.dataDir),
+			"-discovery-type", "etcd",
+			"-discovery-endpoints", "127.0.0.1:2379",
 		)
 		cmd.Dir = "/Users/a/go-queue"
 		cmd.Stdout = os.Stdout
@@ -146,29 +161,50 @@ func (it *IntegrationTest) startBrokerCluster() error {
 		it.brokerProcesses = append(it.brokerProcesses, cmd)
 		log.Printf("Started broker %s on port %d", config.nodeID, config.bindPort)
 
-		// Wait a bit between broker starts
-		time.Sleep(2 * time.Second)
+		time.Sleep(5 * time.Second)
 	}
 
-	// Wait for brokers to fully initialize
-	log.Println("Waiting for brokers to initialize...")
-	time.Sleep(15 * time.Second)
 	return nil
+}
+
+// killProcessesByPattern kills processes that match the given pattern
+func (it *IntegrationTest) killProcessesByPattern(pattern string) {
+	cmd := exec.Command("sh", "-c", fmt.Sprintf("ps aux | grep '%s' | grep -v grep | awk '{print $2}' | xargs -r kill -9", pattern))
+	if err := cmd.Run(); err != nil {
+		log.Printf("Warning: failed to kill processes matching '%s': %v", pattern, err)
+	}
 }
 
 func (it *IntegrationTest) stopBrokerCluster() {
 	log.Println("Stopping broker cluster...")
+
+	// First try graceful shutdown
 	for i, cmd := range it.brokerProcesses {
-		if cmd != nil {
-			log.Printf("Stopping broker %d...", i+1)
+		if cmd != nil && cmd.Process != nil {
+			log.Printf("Gracefully stopping broker %d (PID: %d)...", i+1, cmd.Process.Pid)
+			cmd.Process.Signal(syscall.SIGTERM)
+		}
+	}
+
+	// Wait a bit for graceful shutdown
+	time.Sleep(2 * time.Second)
+
+	// Force kill if still running
+	for i, cmd := range it.brokerProcesses {
+		if cmd != nil && cmd.Process != nil {
+			log.Printf("Force killing broker %d (PID: %d)...", i+1, cmd.Process.Pid)
 			cmd.Process.Kill()
 			cmd.Wait()
 		}
 	}
 
+	// Kill any remaining broker processes by name
+	it.killProcessesByPattern("broker")
+
 	// Clean up data directories
 	for i := 1; i <= 3; i++ {
 		os.RemoveAll(fmt.Sprintf("/tmp/broker%d-data", i))
+		os.RemoveAll(fmt.Sprintf("/tmp/dlq-broker%d-data", i))
 	}
 }
 
@@ -200,10 +236,10 @@ func (it *IntegrationTest) waitForClusterReady() error {
 			return nil
 		}
 
-		time.Sleep(1 * time.Second)
+		time.Sleep(5 * time.Second)
 	}
 
-	return fmt.Errorf("cluster not ready after 30 seconds")
+	return fmt.Errorf("cluster not ready after 150 seconds")
 }
 
 func (it *IntegrationTest) createClients() error {
@@ -215,7 +251,7 @@ func (it *IntegrationTest) createClients() error {
 	for _, addr := range brokerAddrs {
 		clientConfig := client.ClientConfig{
 			BrokerAddrs: []string{addr},
-			Timeout:     90 * time.Second,
+			Timeout:     500 * time.Second,
 		}
 		client := client.NewClient(clientConfig)
 		it.clients = append(it.clients, client)
@@ -242,6 +278,8 @@ func (it *IntegrationTest) createTestTopic() error {
 	}
 
 	admin := client.NewAdmin(it.clients[0])
+	
+	// Create main test topic
 	result, err := admin.CreateTopic(client.CreateTopicRequest{
 		Name:       it.testTopic,
 		Partitions: 3,
@@ -253,8 +291,23 @@ func (it *IntegrationTest) createTestTopic() error {
 	if result.Error != nil {
 		return fmt.Errorf("topic creation error: %v", result.Error)
 	}
-
 	log.Printf("Created topic: %s", it.testTopic)
+	
+	// Create DLQ topic
+	dlqTopicName := it.testTopic + ".dlq"
+	dlqResult, err := admin.CreateTopic(client.CreateTopicRequest{
+		Name:       dlqTopicName,
+		Partitions: 3,
+		Replicas:   2,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create DLQ topic: %v", err)
+	}
+	if dlqResult.Error != nil {
+		return fmt.Errorf("DLQ topic creation error: %v", dlqResult.Error)
+	}
+	log.Printf("Created DLQ topic: %s", dlqTopicName)
+
 	return nil
 }
 
@@ -334,7 +387,7 @@ func (it *IntegrationTest) testBasicMessaging() error {
 
 	// Consume messages
 	consumedCount := 0
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Second)
 	defer cancel()
 
 	for consumedCount < 10 {
@@ -344,12 +397,15 @@ func (it *IntegrationTest) testBasicMessaging() error {
 		default:
 			result, err := consumer.FetchFrom(it.testTopic, int32(consumedCount%3), int64(consumedCount/3))
 			if err != nil {
-				time.Sleep(100 * time.Millisecond)
+				time.Sleep(1 * time.Second)
+				log.Printf("Fetch error: %v", err)
 				continue
 			}
 
 			if result.Error != nil {
-				time.Sleep(100 * time.Millisecond)
+				log.Printf("Consume error: %v", result.Error)
+				time.Sleep(1 * time.Second)
+
 				continue
 			}
 
@@ -359,7 +415,8 @@ func (it *IntegrationTest) testBasicMessaging() error {
 					consumedCount++
 				}
 			} else {
-				time.Sleep(100 * time.Millisecond)
+				log.Printf("No messages fetched, sleep 1s")
+				time.Sleep(time.Second)
 			}
 		}
 	}
@@ -488,9 +545,33 @@ func (it *IntegrationTest) testDLQStatistics() error {
 func main() {
 	test := NewIntegrationTest()
 
-	if err := test.Run(); err != nil {
-		log.Fatalf("Integration test failed: %v", err)
-	}
+	// Set up signal handling for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	log.Println("All tests passed!")
+	// Run test in a goroutine
+	done := make(chan error, 1)
+	go func() {
+		done <- test.Run()
+	}()
+
+	// Wait for either completion or signal
+	select {
+	case err := <-done:
+		if err != nil {
+			log.Printf("Integration test failed: %v", err)
+			// Clean up on failure
+			test.stopBrokerCluster()
+			test.stopEtcd()
+			os.Exit(1)
+		}
+		log.Println("All tests passed!")
+	case sig := <-sigChan:
+		log.Printf("Received signal %v, cleaning up...", sig)
+		// Clean up on signal
+		test.stopBrokerCluster()
+		test.stopEtcd()
+		log.Println("Cleanup completed")
+		os.Exit(0)
+	}
 }

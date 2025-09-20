@@ -10,6 +10,7 @@ import (
 
 	"github.com/issac1998/go-queue/internal/protocol"
 	"github.com/issac1998/go-queue/internal/transaction"
+	typederrors "github.com/issac1998/go-queue/internal/errors"
 	"github.com/lni/dragonboat/v3/statemachine"
 )
 
@@ -87,7 +88,7 @@ func (tsm *TransactionStateMachine) storeHalfMessage(data map[string]interface{}
 	msgData, _ := json.Marshal(data["half_message"])
 	var halfMessage transaction.HalfMessage
 	if err := json.Unmarshal(msgData, &halfMessage); err != nil {
-		return nil, fmt.Errorf("failed to parse half message: %v", err)
+		return nil, typederrors.NewTypedError(typederrors.GeneralError, "failed to parse half message", err)
 	}
 
 	tsm.halfMessages[halfMessage.TransactionID] = &halfMessage
@@ -178,7 +179,7 @@ func (tsm *TransactionStateMachine) Lookup(query interface{}) (interface{}, erro
 
 	var queryCmd TransactionQuery
 	if err := json.Unmarshal(queryBytes, &queryCmd); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal query: %v", err)
+		return nil, typederrors.NewTypedError(typederrors.GeneralError, "failed to unmarshal query", err)
 	}
 
 	switch queryCmd.Type {
@@ -229,11 +230,11 @@ func (tsm *TransactionStateMachine) SaveSnapshot(w io.Writer, fc statemachine.IS
 
 	data, err := json.Marshal(snapshot)
 	if err != nil {
-		return fmt.Errorf("failed to marshal snapshot: %v", err)
+		return typederrors.NewTypedError(typederrors.GeneralError, "failed to marshal snapshot", err)
 	}
 
 	if _, err := w.Write(data); err != nil {
-		return fmt.Errorf("failed to write snapshot: %v", err)
+		return typederrors.NewTypedError(typederrors.GeneralError, "failed to write snapshot", err)
 	}
 
 	log.Printf("Saved transaction state machine snapshot")
@@ -247,12 +248,12 @@ func (tsm *TransactionStateMachine) RecoverFromSnapshot(r io.Reader, files []sta
 
 	data, err := io.ReadAll(r)
 	if err != nil {
-		return fmt.Errorf("failed to read snapshot: %v", err)
+		return typederrors.NewTypedError(typederrors.GeneralError, "failed to read snapshot", err)
 	}
 
 	var snapshot TransactionSnapshot
 	if err := json.Unmarshal(data, &snapshot); err != nil {
-		return fmt.Errorf("failed to unmarshal snapshot: %v", err)
+		return typederrors.NewTypedError(typederrors.GeneralError, "failed to unmarshal snapshot", err)
 	}
 
 	tsm.halfMessages = snapshot.HalfMessages

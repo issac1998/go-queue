@@ -20,6 +20,7 @@ func main() {
 	bindAddr := flag.String("bind-addr", "127.0.0.1", "Bind address")
 	bindPort := flag.Int("bind-port", 9092, "Bind port")
 	dataDir := flag.String("data-dir", "./data", "Data directory")
+	logDir := flag.String("log-dir", "", "Log directory (if empty, logs to stdout)")
 	raftAddr := flag.String("raft-addr", "", "Raft communication address")
 	discoveryType := flag.String("discovery-type", "memory", "Discovery type (etcd, memory)")
 	discoveryEndpoints := flag.String("discovery-endpoints", "", "Discovery endpoints (comma-separated)")
@@ -39,12 +40,13 @@ func main() {
 		BindAddr: *bindAddr,
 		BindPort: *bindPort,
 		DataDir:  *dataDir,
+		LogDir:   *logDir,
 		RaftConfig: &raft.RaftConfig{
 			NodeID:             hashedNodeID,
 			RaftAddr:           *raftAddr,
 			RTTMillisecond:     200,
 			HeartbeatRTT:       5,
-			ElectionRTT:        15,
+			ElectionRTT:        50,
 			CheckQuorum:        true,
 			SnapshotEntries:    10000,
 			CompactionOverhead: 5000,
