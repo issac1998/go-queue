@@ -12,6 +12,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/issac1998/go-queue/internal/errors"
 	"github.com/issac1998/go-queue/internal/protocol"
 	"github.com/issac1998/go-queue/internal/raft"
 )
@@ -190,10 +191,16 @@ func (cs *ClientServer) isLeader() bool {
 func (cs *ClientServer) handleMetadataWriteRequest(conn net.Conn, config RequestConfig) error {
 	leaderID, exists := cs.broker.Controller.GetControlledLeaderID()
 	if !exists {
-		return fmt.Errorf("not controller leader, no leader currently known")
+		return &errors.TypedError{
+			Type:    errors.ControllerError,
+			Message: errors.ControllerNotAvailableMsg,
+		}
 	}
 	if leaderID != cs.broker.Controller.brokerIDToNodeID(cs.broker.ID) {
-		return fmt.Errorf("not controller leader, please redirect to: %s", cs.getControllerLeaderAddr())
+		return &errors.TypedError{
+			Type:    errors.ControllerError,
+			Message: fmt.Sprintf("not controller leader, please redirect to: %s", cs.getControllerLeaderAddr()),
+		}
 	}
 
 	return config.Handler.Handle(conn, cs)
@@ -211,7 +218,6 @@ func (cs *ClientServer) handleMetadataReadRequest(conn net.Conn, config RequestC
 	isFollowerReadEnabled := cs.broker.Config.EnableFollowerRead
 
 	if isFollowerReadEnabled {
-		// wait readIndex
 		if err := cs.ensureReadIndexConsistency(); err != nil {
 			log.Printf("ReadIndex failed: %v", err)
 			return fmt.Errorf("read consistency check failed: %v", err)
@@ -219,13 +225,19 @@ func (cs *ClientServer) handleMetadataReadRequest(conn net.Conn, config RequestC
 		return config.Handler.Handle(conn, cs)
 	}
 
-	return fmt.Errorf("not controller leader, can't do follower read either")
+	return &errors.TypedError{
+		Type:    errors.ControllerError,
+		Message: "not controller leader, can't do follower read either",
+	}
 }
 
 // ensureReadIndexConsistency uses Dragonboat's ReadIndex to ensure read consistency
 func (cs *ClientServer) ensureReadIndexConsistency() error {
 	if cs.broker.Controller == nil {
-		return fmt.Errorf("controller not available")
+		return &errors.TypedError{
+			Type:    errors.ControllerError,
+			Message: errors.ControllerNotAvailableMsg,
+		}
 	}
 	// wait readindex catch up for 5 seconds
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -269,7 +281,7 @@ func (cs *ClientServer) sendErrorResponse(conn net.Conn, err error) {
 	conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 
 	var buf bytes.Buffer
-	errorCode := int16(protocol.ErrorInvalidRequest)
+	errorCode := int16(protocol.ErrorInternalError)
 	binary.Write(&buf, binary.BigEndian, errorCode)
 
 	// Add error message
@@ -408,16 +420,14 @@ func (h *CreateTopicHandler) Handle(conn net.Conn, cs *ClientServer) error {
 		return fmt.Errorf("partitions must be greater than 0")
 	}
 	if replicas <= 0 {
-		cs.sendErrorResponse(conn, fmt.Errorf("replicas must be greater than 0"))
-		return nil
+		return fmt.Errorf("replicas must be greater than 0")
 	}
 
 	err = cs.broker.Controller.CreateTopic(topicName, partitions, replicas)
 	fmt.Println("CreateTopic result:", err)
 	if err != nil {
-		cs.sendErrorResponse(conn, fmt.Errorf("failed to create topic: %v", err))
 		log.Printf("Failed to create topic '%s': %v", topicName, err)
-		return nil
+		return fmt.Errorf("failed to create topic: %v", err)
 	}
 
 	buf := new(bytes.Buffer)
@@ -426,7 +436,7 @@ func (h *CreateTopicHandler) Handle(conn net.Conn, cs *ClientServer) error {
 	}
 
 	// Add empty error message for consistency with error response format
-	if err := binary.Write(buf, binary.BigEndian, int32(0)); err != nil {
+	if err := binary.Write(buf, binary.BigEndian, int16(protocol.ErrorNone)); err != nil {
 		return fmt.Errorf("failed to write error message length: %v", err)
 	}
 
@@ -497,7 +507,7 @@ func (h *ListTopicsHandler) Handle(conn net.Conn, cs *ClientServer) error {
 func (h *ListTopicsHandler) buildListTopicsResponse(topicsData []byte) ([]byte, error) {
 	buf := new(bytes.Buffer)
 
-	if err := binary.Write(buf, binary.BigEndian, int16(0)); err != nil {
+	if err := binary.Write(buf, binary.BigEndian, int16(protocol.ErrorNone)); err != nil {
 		return nil, err
 	}
 
@@ -588,7 +598,10 @@ func (h *DeleteTopicHandler) Handle(conn net.Conn, cs *ClientServer) error {
 	}
 
 	if cs.broker.Controller == nil {
-		return fmt.Errorf("controller not available")
+		return &errors.TypedError{
+			Type:    errors.ControllerError,
+			Message: errors.ControllerNotAvailableMsg,
+		}
 	}
 
 	err = cs.broker.Controller.DeleteTopic(topicName)
@@ -598,7 +611,7 @@ func (h *DeleteTopicHandler) Handle(conn net.Conn, cs *ClientServer) error {
 
 	// Send success response
 	buf := new(bytes.Buffer)
-	if err := binary.Write(buf, binary.BigEndian, int16(0)); err != nil {
+	if err := binary.Write(buf, binary.BigEndian, int16(protocol.ErrorNone)); err != nil {
 		return fmt.Errorf("failed to write success response: %v", err)
 	}
 
@@ -685,7 +698,7 @@ func (h *GetTopicInfoHandler) parseGetTopicInfoRequest(data []byte) (string, err
 func (h *GetTopicInfoHandler) buildGetTopicInfoResponse(topicInfo *raft.TopicMetadata, cs *ClientServer) ([]byte, error) {
 	buf := new(bytes.Buffer)
 
-	if err := binary.Write(buf, binary.BigEndian, protocol.ErrorNone); err != nil {
+	if err := binary.Write(buf, binary.BigEndian, int16(protocol.ErrorNone)); err != nil {
 		return nil, err
 	}
 
@@ -791,11 +804,11 @@ func (cs *ClientServer) generateRaftGroupID(topicName string, partitionID int32)
 func (h *GetTopicInfoHandler) buildGetTopicInfoErrorResponse(errorMsg string) ([]byte, error) {
 	buf := new(bytes.Buffer)
 
-	if err := binary.Write(buf, binary.BigEndian, int16(1)); err != nil {
+	if err := binary.Write(buf, binary.BigEndian, protocol.ErrorInternalError); err != nil {
 		return nil, err
 	}
 
-	if err := binary.Write(buf, binary.BigEndian, int16(0)); err != nil {
+	if err := binary.Write(buf, binary.BigEndian, int16(protocol.ErrorNone)); err != nil {
 		return nil, err
 	}
 
@@ -1030,7 +1043,7 @@ func (h *LeaveGroupHandler) Handle(conn net.Conn, cs *ClientServer) error {
 	}
 
 	buf := new(bytes.Buffer)
-	if err := binary.Write(buf, binary.BigEndian, int16(0)); err != nil {
+	if err := binary.Write(buf, binary.BigEndian, int16(protocol.ErrorNone)); err != nil {
 		return fmt.Errorf("failed to write success response: %v", err)
 	}
 
@@ -1084,14 +1097,15 @@ func (h *GetTopicMetadataHandler) Handle(conn net.Conn, cs *ClientServer) error 
 
 	topicMetadata, err := cs.broker.Controller.GetTopicMetadata(topicName)
 	if err != nil {
-		return fmt.Errorf("failed to get topic metadata: %v", err)
+		return fmt.Errorf("topic '%s' not found: %v", topicName, err)
 	}
 
-	responseData, err := h.buildGetTopicMetadataResponse(topicMetadata)
+	responseData, err := h.buildGetTopicMetadataResponse(topicMetadata, cs)
 	if err != nil {
 		return fmt.Errorf("failed to build response: %v", err)
 	}
 
+	// Send success response directly here for now
 	cs.sendSuccessResponse(conn, responseData)
 	log.Printf("Successfully got topic metadata for '%s'", topicName)
 	return nil
@@ -1112,30 +1126,50 @@ func (h *GetTopicMetadataHandler) parseGetTopicMetadataRequest(data []byte) (str
 	return string(nameBytes), nil
 }
 
-func (h *GetTopicMetadataHandler) buildGetTopicMetadataResponse(topicMetadata *raft.TopicMetadata) ([]byte, error) {
+func (h *GetTopicMetadataHandler) buildGetTopicMetadataResponse(topicMetadata *raft.TopicMetadata, cs *ClientServer) ([]byte, error) {
 	buf := new(bytes.Buffer)
 
-	// Write error code (int32, 0 for success)
-	if err := binary.Write(buf, binary.BigEndian, int32(0)); err != nil {
+	if err := binary.Write(buf, binary.BigEndian, int16(protocol.ErrorNone)); err != nil {
 		return nil, err
 	}
 
-	// Write partition count
-	partitionCount := topicMetadata.Partitions
+	var topicMetadataResponse *raft.TopicMetadataResponse
+	if cs.broker.Controller != nil && cs.broker.Controller.stateMachine != nil {
+		var err error
+
+		if topicMetadataResponse, err = cs.broker.Controller.stateMachine.GetTopicMetadataWithPartitions(topicMetadata.Name); err == nil {
+		} else {
+			return nil, fmt.Errorf("failed to get topic metadata with partitions: %v", err)
+		}
+	}
+
+	partitionCount := topicMetadataResponse.Partitions
 	if err := binary.Write(buf, binary.BigEndian, partitionCount); err != nil {
 		return nil, err
 	}
 
-	// Write each partition's metadata
-	for i := int32(0); i < partitionCount; i++ {
+	// Get cluster metadata for broker address resolution
+	var clusterMetadata *raft.ClusterMetadata
+	if cs.broker.Controller != nil {
+		if metadata, err := cs.broker.Controller.GetMetadata(); err == nil {
+			clusterMetadata = metadata
+		}
+	}
+
+	// Write each partition's metadata using the combined response
+	for _, partitionInfo := range topicMetadataResponse.PartitionInfos {
 		// Write partition ID
-		if err := binary.Write(buf, binary.BigEndian, i); err != nil {
+		if err := binary.Write(buf, binary.BigEndian, partitionInfo.PartitionID); err != nil {
 			return nil, err
 		}
 
-		// For now, use a placeholder leader address
-		// In a real implementation, this should come from PartitionAssignments
-		leaderAddr := "127.0.0.1:9092"
+		var leaderAddr string
+		if partitionInfo.Leader != "" && clusterMetadata != nil {
+			if brokerInfo, exists := clusterMetadata.Brokers[partitionInfo.Leader]; exists {
+				leaderAddr = fmt.Sprintf("%s:%d", brokerInfo.Address, brokerInfo.Port)
+			}
+		}
+
 		if err := binary.Write(buf, binary.BigEndian, int32(len(leaderAddr))); err != nil {
 			return nil, err
 		}
@@ -1143,19 +1177,32 @@ func (h *GetTopicMetadataHandler) buildGetTopicMetadataResponse(topicMetadata *r
 			return nil, err
 		}
 
-		// Write replica count (1 for single broker setup)
-		replicaCount := int32(1)
+		// Get replica addresses
+		replicaAddrs := []string{"127.0.0.1:9092"} // fallback
+		if len(partitionInfo.Replicas) > 0 && clusterMetadata != nil {
+			replicaAddrs = make([]string, 0, len(partitionInfo.Replicas))
+			for _, replicaID := range partitionInfo.Replicas {
+				if brokerInfo, exists := clusterMetadata.Brokers[replicaID]; exists {
+					replicaAddr := fmt.Sprintf("%s:%d", brokerInfo.Address, brokerInfo.Port)
+					replicaAddrs = append(replicaAddrs, replicaAddr)
+				}
+			}
+		}
+
+		// Write replica count
+		replicaCount := int32(len(replicaAddrs))
 		if err := binary.Write(buf, binary.BigEndian, replicaCount); err != nil {
 			return nil, err
 		}
 
-		// Write replica address
-		replicaAddr := "127.0.0.1:9092"
-		if err := binary.Write(buf, binary.BigEndian, int32(len(replicaAddr))); err != nil {
-			return nil, err
-		}
-		if _, err := buf.Write([]byte(replicaAddr)); err != nil {
-			return nil, err
+		// Write replica addresses
+		for _, replicaAddr := range replicaAddrs {
+			if err := binary.Write(buf, binary.BigEndian, int32(len(replicaAddr))); err != nil {
+				return nil, err
+			}
+			if _, err := buf.Write([]byte(replicaAddr)); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -1280,16 +1327,14 @@ func (h *ProduceHandler) Handle(conn net.Conn, cs *ClientServer) error {
 	requestData, err := cs.readRequestData(conn)
 	if err != nil {
 		log.Printf("Failed to read produce request: %v", err)
-		cs.sendErrorResponse(conn, fmt.Errorf("Failed to read request: %v", err))
-		return err
+		return fmt.Errorf("Failed to read request: %v", err)
 	}
 
 	// Parse binary produce request from client
 	produceReq, err := h.parseProduceRequest(requestData)
 	if err != nil {
 		log.Printf("Failed to parse produce request: %v", err)
-		cs.sendErrorResponse(conn, fmt.Errorf("Invalid request format: %v", err))
-		return err
+		return fmt.Errorf("Invalid request format: %v", err)
 	}
 
 	log.Printf("Handling produce request for topic %s, partition %d", produceReq.Topic, produceReq.Partition)
@@ -1298,24 +1343,32 @@ func (h *ProduceHandler) Handle(conn net.Conn, cs *ClientServer) error {
 	leader, err := cs.findPartitionLeader(partitionKey)
 	if err != nil {
 		log.Printf("Failed to find partition leader: %v", err)
-		cs.sendErrorResponse(conn, fmt.Errorf("Partition leader not found: %v", err))
-		return err
+		leaderErr := &errors.TypedError{
+			Type:    errors.PartitionLeaderError,
+			Message: fmt.Sprintf("Partition leader not found: %v", err),
+			Cause:   err,
+		}
+		return leaderErr
 	}
 	//must be leader
 	if leader != cs.broker.ID {
 		log.Printf("Not the leader for partition %s, leader is %s", partitionKey, leader)
-		cs.sendErrorResponse(conn, fmt.Errorf("Not the leader, leader is %s", leader))
-		return fmt.Errorf("not the leader")
+		leaderErr := &errors.TypedError{
+			Type:    errors.PartitionLeaderError,
+			Message: fmt.Sprintf("Not the leader, leader is %s", leader),
+		}
+		return leaderErr
 	}
 
 	response, err := cs.handleProduceToRaft(produceReq)
 	if err != nil {
 		log.Printf("Failed to produce to Raft: %v", err)
-		cs.sendErrorResponse(conn, fmt.Errorf("Failed to produce: %v", err))
-		return err
+		return fmt.Errorf("Failed to produce: %v", err)
 	}
 
-	return cs.sendProduceResponse(conn, response)
+	// Send produce response
+	cs.sendProduceResponse(conn, response)
+	return nil
 }
 
 // FetchHandler handles fetch requests
@@ -1325,32 +1378,75 @@ func (h *FetchHandler) Handle(conn net.Conn, cs *ClientServer) error {
 	// Read the fetch request data
 	requestData, err := cs.readRequestData(conn)
 	if err != nil {
-		log.Printf("Failed to read fetch request: %v", err)
-		cs.sendErrorResponse(conn, fmt.Errorf("Failed to read request: %v", err))
-		return err
+		return fmt.Errorf("failed to read request data: %w", err)
 	}
 
-	// Parse the fetch request
-	var fetchReq FetchRequest
-	if err := json.Unmarshal(requestData, &fetchReq); err != nil {
-		log.Printf("Failed to unmarshal fetch request: %v", err)
-		cs.sendErrorResponse(conn, fmt.Errorf("Invalid request format: %v", err))
-		return err
+	// Parse the fetch request using binary format
+	fetchReq, err := h.parseFetchRequest(requestData)
+	if err != nil {
+		return fmt.Errorf("failed to parse fetch request: %w", err)
 	}
 
 	log.Printf("Handling fetch request for topic %s, partition %d, offset %d",
 		fetchReq.Topic, fetchReq.Partition, fetchReq.Offset)
 
 	partitionKey := fmt.Sprintf("%s-%d", fetchReq.Topic, fetchReq.Partition)
-	response, err := cs.handleFetchFromRaft(&fetchReq, partitionKey)
+	response, err := cs.handleFetchFromRaft(fetchReq, partitionKey)
 	if err != nil {
-		log.Printf("Failed to fetch from Raft: %v", err)
-		cs.sendErrorResponse(conn, fmt.Errorf("Failed to fetch: %v", err))
-		return err
+		return fmt.Errorf("failed to handle fetch from raft: %w", err)
 	}
 
 	// Send fetch response
-	return cs.sendFetchResponse(conn, response)
+	err = cs.sendFetchResponse(conn, response)
+	return nil
+}
+
+// parseFetchRequest parses binary fetch request from client
+func (h *FetchHandler) parseFetchRequest(data []byte) (*FetchRequest, error) {
+	buf := bytes.NewReader(data)
+
+	// Read version (2 bytes)
+	var version int16
+	if err := binary.Read(buf, binary.BigEndian, &version); err != nil {
+		return nil, fmt.Errorf("failed to read version: %v", err)
+	}
+
+	// Read topic length (2 bytes)
+	var topicLen int16
+	if err := binary.Read(buf, binary.BigEndian, &topicLen); err != nil {
+		return nil, fmt.Errorf("failed to read topic length: %v", err)
+	}
+
+	// Read topic
+	topicBytes := make([]byte, topicLen)
+	if _, err := io.ReadFull(buf, topicBytes); err != nil {
+		return nil, fmt.Errorf("failed to read topic: %v", err)
+	}
+
+	// Read partition (4 bytes)
+	var partition int32
+	if err := binary.Read(buf, binary.BigEndian, &partition); err != nil {
+		return nil, fmt.Errorf("failed to read partition: %v", err)
+	}
+
+	// Read offset (8 bytes)
+	var offset int64
+	if err := binary.Read(buf, binary.BigEndian, &offset); err != nil {
+		return nil, fmt.Errorf("failed to read offset: %v", err)
+	}
+
+	// Read max bytes (4 bytes)
+	var maxBytes int32
+	if err := binary.Read(buf, binary.BigEndian, &maxBytes); err != nil {
+		return nil, fmt.Errorf("failed to read max bytes: %v", err)
+	}
+
+	return &FetchRequest{
+		Topic:     string(topicBytes),
+		Partition: partition,
+		Offset:    offset,
+		MaxBytes:  maxBytes,
+	}, nil
 }
 
 // StartPartitionRaftGroupHandler handles requests to start partition Raft groups
@@ -1619,7 +1715,7 @@ func (h *CommitOffsetHandler) Handle(conn net.Conn, cs *ClientServer) error {
 	}
 
 	buf := new(bytes.Buffer)
-	if err := binary.Write(buf, binary.BigEndian, int16(0)); err != nil {
+	if err := binary.Write(buf, binary.BigEndian, int16(protocol.ErrorNone)); err != nil {
 		return fmt.Errorf("failed to write success response: %v", err)
 	}
 
@@ -1696,7 +1792,7 @@ func (h *FetchOffsetHandler) Handle(conn net.Conn, cs *ClientServer) error {
 	}
 
 	buf := new(bytes.Buffer)
-	if err := binary.Write(buf, binary.BigEndian, int16(0)); err != nil {
+	if err := binary.Write(buf, binary.BigEndian, int16(protocol.ErrorNone)); err != nil {
 		return fmt.Errorf("failed to write success response: %v", err)
 	}
 	if err := binary.Write(buf, binary.BigEndian, offset); err != nil {

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/issac1998/go-queue/internal/errors"
 	"github.com/issac1998/go-queue/internal/protocol"
 )
 
@@ -118,16 +119,16 @@ func TestRefreshTopicMetadata(t *testing.T) {
 
 	// Test isControllerError function
 	testCases := []struct {
-		err      error
-		expected bool
-	}{
-		{nil, false},
-		{fmt.Errorf("not controller"), true},
-		{fmt.Errorf("not leader"), true},
-		{fmt.Errorf("connection refused"), true},
-		{fmt.Errorf("connection reset"), true},
-		{fmt.Errorf("some other error"), false},
-	}
+			err      error
+			expected bool
+		}{
+			{nil, false},
+			{&errors.TypedError{Type: errors.ControllerError, Message: errors.NotControllerMsg, Cause: nil}, true},
+		{&errors.TypedError{Type: errors.LeadershipError, Message: errors.NotLeaderMsg, Cause: nil}, true},
+		{&errors.TypedError{Type: errors.ConnectionError, Message: errors.ConnectionRefusedMsg, Cause: nil}, true},
+		{&errors.TypedError{Type: errors.ConnectionError, Message: errors.ConnectionResetMsg, Cause: nil}, true},
+			{fmt.Errorf("some other error"), false},
+		}
 
 	for _, tc := range testCases {
 		result := client.isControllerError(tc.err)

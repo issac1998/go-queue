@@ -12,6 +12,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/issac1998/go-queue/internal/errors"
 	"github.com/issac1998/go-queue/internal/protocol"
 )
 
@@ -138,7 +139,11 @@ func (p *Producer) selectPartition(msg *ProduceMessage) (int32, error) {
 
 	topicMeta, err := p.client.getTopicMetadata(msg.Topic)
 	if err != nil {
-		return 0, fmt.Errorf("failed to get topic metadata: %v", err)
+		return 0, &errors.TypedError{
+			Type:    errors.GeneralError,
+			Message: "failed to get topic metadata",
+			Cause:   err,
+		}
 	}
 
 	numPartitions := int32(len(topicMeta.Partitions))
@@ -215,35 +220,55 @@ func (hp *HashPartitioner) Partition(message *ProduceMessage, numPartitions int3
 }
 
 // sendToPartitionLeader sends messages directly to the partition leader
+// with automatic retry and metadata refresh on leader errors
 func (p *Producer) sendToPartitionLeader(topic string, partition int32, messages []ProduceMessage) (*ProduceResult, error) {
-	metadata, err := p.client.getTopicMetadata(topic)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get topic metadata: %v", err)
-	}
+	const maxRetries = 3
+	
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		metadata, err := p.client.getTopicMetadata(topic)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get topic metadata: %v", err)
+		}
 
-	partitionMeta, exists := metadata.Partitions[partition]
-	if !exists {
-		return nil, fmt.Errorf("partition %d not found for topic %s", partition, topic)
-	}
+		partitionMeta, exists := metadata.Partitions[partition]
+		if !exists {
+			return nil, fmt.Errorf("partition %d not found for topic %s", partition, topic)
+		}
 
-	requestData, err := p.buildProduceRequest(topic, partition, messages)
-	if err != nil {
-		return nil, fmt.Errorf("failed to build request: %v", err)
-	}
+		requestData, err := p.buildProduceRequest(topic, partition, messages)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build request: %v", err)
+		}
 
-	var result *ProduceResult
-	if p.client.config.EnableConnectionPool && p.client.connectionPool != nil {
-		result, err = p.sendWithConnectionPool(partitionMeta.Leader, requestData)
-	} else {
-		result, err = p.sendWithDirectConnection(partitionMeta.Leader, requestData)
-	}
-	if err != nil {
+		var result *ProduceResult
+		if p.client.config.EnableConnectionPool && p.client.connectionPool != nil {
+			result, err = p.sendWithConnectionPool(partitionMeta.Leader, requestData)
+		} else {
+			result, err = p.sendWithDirectConnection(partitionMeta.Leader, requestData)
+		}
+		
+		if err == nil {
+			result.Topic = topic
+			result.Partition = partition
+			return result, nil
+		}
+		
+		if p.client.shouldRetryWithMetadataRefresh(err) {
+			if attempt < maxRetries-1 {
+				if _, refreshErr := p.client.refreshTopicMetadata(topic); refreshErr != nil {
+					return nil, fmt.Errorf("failed to produce after metadata refresh error: %v (original error: %v)", refreshErr, err)
+				}
+				continue
+			}
+		}
+		
 		return nil, err
 	}
-
-	result.Topic = topic
-	result.Partition = partition
-	return result, nil
+	
+	return nil, &errors.TypedError{
+		Type:    errors.PartitionLeaderError,
+		Message: fmt.Sprintf("failed to send to partition leader after %d attempts", maxRetries),
+	}
 }
 
 func (p *Producer) sendWithConnectionPool(brokerAddr string, requestData []byte) (*ProduceResult, error) {
@@ -253,7 +278,11 @@ func (p *Producer) sendWithConnectionPool(brokerAddr string, requestData []byte)
 
 	conn, err := p.client.connectionPool.GetConnection(brokerAddr)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get connection from pool: %v", err)
+		return nil, &errors.TypedError{
+			Type:    errors.ConnectionError,
+			Message: "failed to get connection from pool",
+			Cause:   err,
+		}
 	}
 	defer conn.Return()
 
@@ -282,12 +311,20 @@ func (p *Producer) sendWithAsyncConnection(brokerAddr string, requestData []byte
 
 func (p *Producer) sendWithConnectionPoolFallback(brokerAddr string, requestData []byte) (*ProduceResult, error) {
 	if p.client.connectionPool == nil {
-		return nil, fmt.Errorf("no connection pool available for fallback")
+		return nil, &errors.TypedError{
+			Type:    errors.ConnectionError,
+			Message: "no connection pool available for fallback",
+			Cause:   nil,
+		}
 	}
 
 	conn, err := p.client.connectionPool.GetConnection(brokerAddr)
 	if err != nil {
-		return nil, fmt.Errorf("fallback connection pool failed: %v", err)
+		return nil, &errors.TypedError{
+			Type:    errors.ConnectionError,
+			Message: "fallback connection pool failed",
+			Cause:   err,
+		}
 	}
 	defer conn.Return()
 
@@ -297,7 +334,11 @@ func (p *Producer) sendWithConnectionPoolFallback(brokerAddr string, requestData
 func (p *Producer) sendWithDirectConnection(brokerAddr string, requestData []byte) (*ProduceResult, error) {
 	conn, err := protocol.ConnectToSpecificBroker(brokerAddr, p.client.timeout)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to broker: %v", err)
+		return nil, &errors.TypedError{
+			Type:    errors.ConnectionError,
+			Message: "failed to connect to broker",
+			Cause:   err,
+		}
 	}
 	defer conn.Close()
 
@@ -309,26 +350,46 @@ func (p *Producer) sendSynchronously(conn net.Conn, requestData []byte) (*Produc
 
 	requestType := protocol.ProduceRequestType
 	if err := binary.Write(conn, binary.BigEndian, requestType); err != nil {
-		return nil, fmt.Errorf("failed to send request type: %v", err)
+		return nil, &errors.TypedError{
+			Type:    errors.ConnectionError,
+			Message: "failed to send request type",
+			Cause:   err,
+		}
 	}
 
 	// Send data length first, then the actual data
 	if err := binary.Write(conn, binary.BigEndian, int32(len(requestData))); err != nil {
-		return nil, fmt.Errorf("failed to send data length: %v", err)
+		return nil, &errors.TypedError{
+			Type:    errors.ConnectionError,
+			Message: "failed to send data length",
+			Cause:   err,
+		}
 	}
 
 	if _, err := conn.Write(requestData); err != nil {
-		return nil, fmt.Errorf("failed to send request data: %v", err)
+		return nil, &errors.TypedError{
+			Type:    errors.ConnectionError,
+			Message: "failed to send request data",
+			Cause:   err,
+		}
 	}
 
 	var responseLen int32
 	if err := binary.Read(conn, binary.BigEndian, &responseLen); err != nil {
-		return nil, fmt.Errorf("failed to read response length: %v", err)
+		return nil, &errors.TypedError{
+			Type:    errors.ConnectionError,
+			Message: "failed to read response length",
+			Cause:   err,
+		}
 	}
 
 	responseData := make([]byte, responseLen)
 	if _, err := io.ReadFull(conn, responseData); err != nil {
-		return nil, fmt.Errorf("failed to read response data: %v", err)
+		return nil, &errors.TypedError{
+			Type:    errors.ConnectionError,
+			Message: "failed to read response data",
+			Cause:   err,
+		}
 	}
 
 	return p.parseProduceResponse(responseData)
@@ -443,6 +504,7 @@ func (p *Producer) parseProduceResponse(data []byte) (*ProduceResult, error) {
 		return result, nil
 	}
 
+	// buf way
 	buf := bytes.NewReader(data)
 	result := &ProduceResult{}
 

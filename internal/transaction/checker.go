@@ -3,13 +3,13 @@ package transaction
 import (
 	"encoding/binary"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log"
 	"net"
 	"time"
 
 	"github.com/issac1998/go-queue/internal/protocol"
+	typederrors "github.com/issac1998/go-queue/internal/errors"
 )
 
 // DefaultTransactionChecker  check txn
@@ -87,20 +87,20 @@ func (c *DefaultTransactionChecker) CheckTransactionStateWithBroker(brokerAddr s
 
 func (c *DefaultTransactionChecker) sendCheckRequest(conn io.Writer, request *TransactionCheckRequest) error {
 	if err := binary.Write(conn, binary.BigEndian, protocol.TransactionCheckRequestType); err != nil {
-		return fmt.Errorf("failed to write request type: %v", err)
+		return typederrors.NewTypedError(typederrors.ConnectionError, "failed to write request type", err)
 	}
 
 	data, err := json.Marshal(request)
 	if err != nil {
-		return fmt.Errorf("failed to marshal request: %v", err)
+		return typederrors.NewTypedError(typederrors.GeneralError, "failed to marshal request", err)
 	}
 
 	if err := binary.Write(conn, binary.BigEndian, int32(len(data))); err != nil {
-		return fmt.Errorf("failed to write data length: %v", err)
+		return typederrors.NewTypedError(typederrors.ConnectionError, "failed to write data length", err)
 	}
 
 	if _, err := conn.Write(data); err != nil {
-		return fmt.Errorf("failed to write data: %v", err)
+		return typederrors.NewTypedError(typederrors.ConnectionError, "failed to write data", err)
 	}
 
 	return nil
@@ -109,17 +109,17 @@ func (c *DefaultTransactionChecker) sendCheckRequest(conn io.Writer, request *Tr
 func (c *DefaultTransactionChecker) readCheckResponse(conn io.Reader) (*TransactionCheckResponse, error) {
 	var dataLength int32
 	if err := binary.Read(conn, binary.BigEndian, &dataLength); err != nil {
-		return nil, fmt.Errorf("failed to read data length: %v", err)
+		return nil, typederrors.NewTypedError(typederrors.ConnectionError, "failed to read data length", err)
 	}
 
 	data := make([]byte, dataLength)
 	if _, err := io.ReadFull(conn, data); err != nil {
-		return nil, fmt.Errorf("failed to read data: %v", err)
+		return nil, typederrors.NewTypedError(typederrors.ConnectionError, "failed to read data", err)
 	}
 
 	var response TransactionCheckResponse
 	if err := json.Unmarshal(data, &response); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %v", err)
+		return nil, typederrors.NewTypedError(typederrors.GeneralError, "failed to unmarshal response", err)
 	}
 
 	return &response, nil

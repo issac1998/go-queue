@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/issac1998/go-queue/internal/errors"
 )
 
 func TestNewProducer(t *testing.T) {
@@ -74,7 +76,7 @@ func TestProduceMessage_Validation(t *testing.T) {
 			}
 			if !tt.expectError && err != nil {
 				// For tests that don't expect errors, we expect connection errors since no broker is running
-				if !strings.Contains(err.Error(), "failed to") {
+				if !errors.IsConnectionError(err) && !strings.Contains(err.Error(), "failed to") {
 					t.Errorf("unexpected error: %v", err)
 				}
 			}

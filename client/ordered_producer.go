@@ -7,6 +7,7 @@ import (
 	"hash/fnv"
 	"time"
 
+	"github.com/issac1998/go-queue/internal/errors"
 	"github.com/issac1998/go-queue/internal/protocol"
 )
 
@@ -182,7 +183,11 @@ func (op *OrderedProducer) sendOrderedProduceRequest(request OrderedProduceReque
 func (op *OrderedProducer) sendToPartition(topic string, partition int32, messages []OrderedMessage) (*PartitionProduceResponse, error) {
 	conn, err := op.client.connectForDataOperation(topic, partition, true)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to partition %d leader: %w", partition, err)
+		return nil, &errors.TypedError{
+			Type:    errors.PartitionLeaderError,
+			Message: errors.FailedToConnectToPartitionMsg,
+			Cause:   err,
+		}
 	}
 	defer conn.Close()
 

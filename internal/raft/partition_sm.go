@@ -12,7 +12,7 @@ import (
 
 	"github.com/issac1998/go-queue/internal/compression"
 	"github.com/issac1998/go-queue/internal/deduplicator"
-
+	typederrors "github.com/issac1998/go-queue/internal/errors"
 	"github.com/issac1998/go-queue/internal/ordering"
 	"github.com/issac1998/go-queue/internal/protocol"
 	"github.com/issac1998/go-queue/internal/storage"
@@ -175,7 +175,7 @@ func NewPartitionStateMachine(topicName string, partitionID int32, dataDir strin
 		RetentionSize:  10 * 1024 * 1024 * 1024,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to create partition storage: %w", err)
+		return nil, typederrors.NewTypedError(typederrors.StorageError, "failed to create partition storage", err)
 	}
 
 	psm := &PartitionStateMachine{
@@ -205,7 +205,7 @@ func (psm *PartitionStateMachine) Update(data []byte) (statemachine.Result, erro
 	var cmd PartitionCommand
 	if err := json.Unmarshal(data, &cmd); err != nil {
 		log.Printf("Failed to unmarshal partition command: %v", err)
-		return statemachine.Result{Value: 0}, err
+		return statemachine.Result{Value: 0}, typederrors.NewTypedError(typederrors.GeneralError, "failed to unmarshal partition command", err)
 	}
 
 	switch cmd.Type {
@@ -228,11 +228,11 @@ func (psm *PartitionStateMachine) handleProduceMessage(data map[string]interface
 	var msg ProduceMessage
 	msgBytes, err := json.Marshal(data["message"])
 	if err != nil {
-		return statemachine.Result{Value: 0}, fmt.Errorf("failed to marshal message: %w", err)
+		return statemachine.Result{Value: 0}, typederrors.NewTypedError(typederrors.GeneralError, "failed to marshal message", err)
 	}
 
 	if err := json.Unmarshal(msgBytes, &msg); err != nil {
-		return statemachine.Result{Value: 0}, fmt.Errorf("failed to unmarshal message: %w", err)
+		return statemachine.Result{Value: 0}, typederrors.NewTypedError(typederrors.GeneralError, "failed to unmarshal message", err)
 	}
 
 	// Handle messages with sequence numbers using ordered processing (only for async IO producers)
@@ -345,7 +345,7 @@ func (psm *PartitionStateMachine) handleProduceMessage(data map[string]interface
 	// Store message
 	offset, err := psm.storeMessage(&msg)
 	if err != nil {
-		return statemachine.Result{Value: 0}, fmt.Errorf("failed to store message: %w", err)
+		return statemachine.Result{Value: 0}, typederrors.NewTypedError(typederrors.StorageError, "failed to store message", err)
 	}
 
 	// Update producer state after successful write for deduplicator
@@ -378,12 +378,12 @@ func (psm *PartitionStateMachine) processOrderedMessages(readyMessages []*orderi
 	for _, pendingMsg := range readyMessages {
 		msg, ok := pendingMsg.Data.(*ProduceMessage)
 		if !ok {
-			return statemachine.Result{Value: 0}, fmt.Errorf("invalid message type in ordered processing")
+			return statemachine.Result{Value: 0}, typederrors.NewTypedError(typederrors.GeneralError, "invalid message type in ordered processing", nil)
 		}
 
 		offset, err := psm.storeMessage(msg)
 		if err != nil {
-			return statemachine.Result{Value: 0}, fmt.Errorf("failed to store ordered message: %w", err)
+			return statemachine.Result{Value: 0}, typederrors.NewTypedError(typederrors.StorageError, "failed to store ordered message", err)
 		}
 
 		if psm.deduplicatorEnabled && msg.ProducerID != "" {
@@ -406,7 +406,7 @@ func (psm *PartitionStateMachine) processOrderedMessages(readyMessages []*orderi
 		}, nil
 	}
 
-	return statemachine.Result{Value: 0}, fmt.Errorf("no messages processed")
+	return statemachine.Result{Value: 0}, typederrors.NewTypedError(typederrors.GeneralError, "no messages processed", nil)
 }
 
 func (psm *PartitionStateMachine) storeMessage(msg *ProduceMessage) (int64, error) {
@@ -419,7 +419,7 @@ func (psm *PartitionStateMachine) storeMessage(msg *ProduceMessage) (int64, erro
 
 	serializedMsg, err := json.Marshal(messageData)
 	if err != nil {
-		return 0, fmt.Errorf("failed to serialize message: %w", err)
+		return 0, typederrors.NewTypedError(typederrors.GeneralError, "failed to serialize message", err)
 	}
 
 	var finalMsg []byte
@@ -447,7 +447,7 @@ func (psm *PartitionStateMachine) storeMessage(msg *ProduceMessage) (int64, erro
 
 	offset, err := psm.partition.Append(finalMsg, msg.Timestamp)
 	if err != nil {
-		return 0, fmt.Errorf("failed to append message: %w", err)
+		return 0, typederrors.NewTypedError(typederrors.StorageError, "failed to append message", err)
 	}
 
 	psm.messageCount++
@@ -461,11 +461,11 @@ func (psm *PartitionStateMachine) handleProduceBatch(data map[string]interface{}
 	var batchCmd ProduceBatchCommand
 	batchCmdBytes, err := json.Marshal(data["batch"])
 	if err != nil {
-		return statemachine.Result{Value: protocol.ErrorInvalidRequest}, fmt.Errorf("failed to marshal batch command: %w", err)
+		return statemachine.Result{Value: protocol.ErrorInvalidRequest}, typederrors.NewTypedError(typederrors.GeneralError, "failed to marshal batch command", err)
 	}
 
 	if err := json.Unmarshal(batchCmdBytes, &batchCmd); err != nil {
-		return statemachine.Result{Value: protocol.ErrorInvalidRequest}, fmt.Errorf("failed to unmarshal batch command: %w", err)
+		return statemachine.Result{Value: protocol.ErrorInvalidRequest}, typederrors.NewTypedError(typederrors.GeneralError, "failed to unmarshal batch command", err)
 	}
 
 	results := make([]WriteResult, len(batchCmd.Messages))
@@ -609,7 +609,7 @@ func (psm *PartitionStateMachine) Lookup(query interface{}) (interface{}, error)
 
 	var req FetchRequest
 	if err := json.Unmarshal(queryBytes, &req); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal fetch request: %w", err)
+		return nil, typederrors.NewTypedError(typederrors.GeneralError, "failed to unmarshal fetch request", err)
 	}
 
 	return psm.handleFetchMessages(&req)
@@ -854,11 +854,11 @@ func (psm *PartitionStateMachine) SaveSnapshot(w io.Writer, fc statemachine.ISna
 	// Write snapshot metadata
 	snapshotBytes, err := json.Marshal(snapshot)
 	if err != nil {
-		return fmt.Errorf("failed to marshal snapshot: %w", err)
+		return typederrors.NewTypedError(typederrors.GeneralError, "failed to marshal snapshot", err)
 	}
 
 	if _, err := w.Write(snapshotBytes); err != nil {
-		return fmt.Errorf("failed to write snapshot: %w", err)
+		return typederrors.NewTypedError(typederrors.GeneralError, "failed to write snapshot", err)
 	}
 
 	log.Printf("Saved snapshot for %s-%d with %d producer states", psm.TopicName, psm.PartitionID, len(deduplicators))
@@ -873,12 +873,12 @@ func (psm *PartitionStateMachine) RecoverFromSnapshot(r io.Reader, files []state
 	// Read snapshot data
 	snapshotBytes, err := io.ReadAll(r)
 	if err != nil {
-		return fmt.Errorf("failed to read snapshot: %w", err)
+		return typederrors.NewTypedError(typederrors.GeneralError, "failed to read snapshot", err)
 	}
 
 	var snapshot map[string]interface{}
 	if err := json.Unmarshal(snapshotBytes, &snapshot); err != nil {
-		return fmt.Errorf("failed to unmarshal snapshot: %w", err)
+		return typederrors.NewTypedError(typederrors.GeneralError, "failed to unmarshal snapshot", err)
 	}
 
 	// Restore state
@@ -902,7 +902,7 @@ func (psm *PartitionStateMachine) RecoverFromSnapshot(r io.Reader, files []state
 func (psm *PartitionStateMachine) restorededuplicators(data interface{}) error {
 	statesMap, ok := data.(map[string]interface{})
 	if !ok {
-		return fmt.Errorf("invalid producer states data type")
+		return typederrors.NewTypedError(typederrors.GeneralError, "invalid producer states data type", nil)
 	}
 
 	restoredCount := 0

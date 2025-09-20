@@ -105,7 +105,13 @@ type MessageRetryState struct {
 
 // ShouldRetry determines if a message should be retried
 func (mrs *MessageRetryState) ShouldRetry() bool {
-	return mrs.RetryCount < mrs.MaxRetries && time.Now().After(mrs.NextRetryTime)
+	if mrs.RetryCount >= mrs.MaxRetries {
+		return false
+	}
+	
+	// Always allow retry if we haven't exceeded max retries
+	// The timing check should be done separately when actually scheduling the retry
+	return true
 }
 
 // CalculateNextRetryTime calculates when the next retry should happen

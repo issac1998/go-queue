@@ -10,6 +10,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	typederrors "github.com/issac1998/go-queue/internal/errors"
 )
 
 var (
@@ -43,7 +45,11 @@ type Partition struct {
 // NewPartition creates a new partition
 func NewPartition(dataDir string, config *PartitionConfig) (*Partition, error) {
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create partition directory: %w", err)
+		return nil, &typederrors.TypedError{
+			Type:    typederrors.StorageError,
+			Message: "failed to create partition directory",
+			Cause:   err,
+		}
 	}
 
 	p := &Partition{
@@ -54,12 +60,20 @@ func NewPartition(dataDir string, config *PartitionConfig) (*Partition, error) {
 
 	// Load existing segments
 	if err := p.loadSegments(); err != nil {
-		return nil, fmt.Errorf("failed to load segments: %w", err)
+		return nil, &typederrors.TypedError{
+			Type:    typederrors.StorageError,
+			Message: "failed to load segments",
+			Cause:   err,
+		}
 	}
 
 	if len(p.segments) == 0 {
 		if err := p.createNewSegment(0); err != nil {
-			return nil, fmt.Errorf("failed to create initial segment: %w", err)
+			return nil, &typederrors.TypedError{
+				Type:    typederrors.StorageError,
+				Message: "failed to create initial segment",
+				Cause:   err,
+			}
 		}
 	}
 
@@ -141,7 +155,11 @@ func (p *Partition) Append(data []byte, timestamp time.Time) (int64, error) {
 	if p.active.CurrentSize+int64(len(data)+4) > p.Config.MaxSegmentSize {
 		nextBaseOffset := p.active.BaseOffset + p.active.WriteCount
 		if err := p.createNewSegment(nextBaseOffset); err != nil {
-			return 0, fmt.Errorf("failed to create new segment: %w", err)
+			return 0, &typederrors.TypedError{
+				Type:    typederrors.StorageError,
+				Message: "failed to create new segment",
+				Cause:   err,
+			}
 		}
 	}
 
@@ -177,7 +195,11 @@ func (p *Partition) ReadAt(offset int64) ([]byte, error) {
 
 	lengthBuf := make([]byte, 4)
 	if _, err := segment.ReadAt(position, lengthBuf); err != nil {
-		return nil, fmt.Errorf("failed to read message length: %w", err)
+		return nil, &typederrors.TypedError{
+			Type:    typederrors.StorageError,
+			Message: "failed to read message length",
+			Cause:   err,
+		}
 	}
 
 	messageLength := binary.BigEndian.Uint32(lengthBuf)
@@ -187,7 +209,11 @@ func (p *Partition) ReadAt(offset int64) ([]byte, error) {
 
 	messageBuf := make([]byte, messageLength)
 	if _, err := segment.ReadAt(position+4, messageBuf); err != nil {
-		return nil, fmt.Errorf("failed to read message data: %w", err)
+		return nil, &typederrors.TypedError{
+			Type:    typederrors.StorageError,
+			Message: "failed to read message data",
+			Cause:   err,
+		}
 	}
 
 	return messageBuf, nil
@@ -296,7 +322,11 @@ func (p *Partition) Close() error {
 	p.active = nil
 
 	if len(errs) > 0 {
-		return fmt.Errorf("failed to close some segments: %v", errs)
+		return &typederrors.TypedError{
+			Type:    typederrors.StorageError,
+			Message: "failed to close some segments",
+			Cause:   fmt.Errorf("%v", errs),
+		}
 	}
 
 	log.Printf("Closed partition at %s", p.DataDir)

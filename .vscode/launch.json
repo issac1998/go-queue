@@ -2,6 +2,7 @@
     "version": "0.2.0",
     "configurations": [
 
+
          {
             "name": "dlq test",
             "type": "go",
@@ -28,7 +29,8 @@
                 "-raft-addr=127.0.0.1:7001",
                 "-discovery-type=etcd",
                 "-discovery-endpoints=127.0.0.1:2379",
-                "-enable-follower-read=true"
+                "-enable-follower-read=true",
+                "-log-dir=/Users/a/go-queue/test-data/broker0/logs"
             ],
                  "env": {
                 "GO_ENV": "development"
@@ -48,6 +50,7 @@
                 "-bind-port=9096",
                 "-data-dir=/Users/a/go-queue/test-data/broker1",
                 "-raft-addr=127.0.0.1:7002",
+                "-log-dir=/Users/a/go-queue/test-data/broker1/logs",
                 "-discovery-type=etcd",
                 "-discovery-endpoints=127.0.0.1:2379",
                 "-enable-follower-read=true"
@@ -74,7 +77,8 @@
                 "-raft-addr=127.0.0.1:7003",
                 "-discovery-type=etcd",
                 "-discovery-endpoints=127.0.0.1:2379",
-                "-enable-follower-read=true"
+                "-enable-follower-read=true",
+                "-log-dir=/Users/a/go-queue/test-data/broker2/logs"
             ],
             "env": {
                 "GO_ENV": "development"

@@ -6,9 +6,11 @@ import (
 	"hash/fnv"
 	"io"
 	"log"
+	"strconv"
 	"sync"
 	"time"
 
+	typederrors "github.com/issac1998/go-queue/internal/errors"
 	"github.com/issac1998/go-queue/internal/protocol"
 	"github.com/lni/dragonboat/v3/statemachine"
 )
@@ -20,6 +22,9 @@ type ControllerStateMachine struct {
 	metadata          *ClusterMetadata
 	partitionAssigner *PartitionAssigner
 	mu                sync.RWMutex
+
+	leaderWatchers map[string]func()
+	watcherMu      sync.RWMutex
 }
 
 // ClusterMetadata stores all cluster-wide metadata
@@ -45,9 +50,9 @@ type BrokerInfo struct {
 	Port    int    `json:"port"`
 	Status  string `json:"status"`
 
-	LoadMetrics *LoadMetrics `json:"load_metrics"`
-	LastSeen    time.Time    `json:"last_seen"`
-	RegisteredAt time.Time   `json:"registered_at"`
+	LoadMetrics  *LoadMetrics `json:"load_metrics"`
+	LastSeen     time.Time    `json:"last_seen"`
+	RegisteredAt time.Time    `json:"registered_at"`
 
 	RaftAddress string `json:"raft_address"`
 }
@@ -59,6 +64,24 @@ type TopicMetadata struct {
 	ReplicationFactor int32             `json:"replication_factor"`
 	CreatedAt         time.Time         `json:"created_at"`
 	Config            map[string]string `json:"config"`
+}
+
+// PartitionInfo contains detailed information about a partition
+type PartitionInfo struct {
+	PartitionID int32    `json:"partition_id"`
+	Leader      string   `json:"leader"`
+	Replicas    []string `json:"replicas"`
+	RaftGroupID uint64   `json:"raft_group_id"`
+}
+
+// TopicMetadataResponse contains topic metadata with partition details
+type TopicMetadataResponse struct {
+	Name              string            `json:"name"`
+	Partitions        int32             `json:"partitions"`
+	ReplicationFactor int32             `json:"replication_factor"`
+	CreatedAt         time.Time         `json:"created_at"`
+	Config            map[string]string `json:"config"`
+	PartitionInfos    []PartitionInfo   `json:"partition_infos"`
 }
 
 // PartitionAssignment defines how partitions are assigned to brokers
@@ -135,6 +158,7 @@ func NewControllerStateMachine(manager ControllerManager, raftManager *RaftManag
 		manager:           manager,
 		metadata:          metadata,
 		partitionAssigner: NewPartitionAssigner(metadata, raftManager),
+		leaderWatchers:    make(map[string]func()),
 	}
 }
 
@@ -240,7 +264,7 @@ func (csm *ControllerStateMachine) registerBroker(data map[string]interface{}) (
 
 func (csm *ControllerStateMachine) unregisterBroker(data map[string]interface{}) (interface{}, error) {
 	brokerID := data["broker_id"].(string)
-	
+
 	var affectedAssignments []*PartitionAssignment
 	for _, assignment := range csm.metadata.PartitionAssignments {
 		for _, replica := range assignment.Replicas {
@@ -250,17 +274,17 @@ func (csm *ControllerStateMachine) unregisterBroker(data map[string]interface{})
 			}
 		}
 	}
-	
+
 	for _, assignment := range affectedAssignments {
 		partitionKey := fmt.Sprintf("%s-%d", assignment.TopicName, assignment.PartitionID)
 		delete(csm.metadata.PartitionAssignments, partitionKey)
 		log.Printf("Removed partition assignment %s due to broker %s unregistration", partitionKey, brokerID)
 	}
-	
+
 	delete(csm.metadata.Brokers, brokerID)
 	log.Printf("Unregistered broker %s and cleaned up %d partition assignments", brokerID, len(affectedAssignments))
 	return map[string]interface{}{
-		"status": "success",
+		"status":             "success",
 		"cleaned_partitions": len(affectedAssignments),
 	}, nil
 }
@@ -275,7 +299,7 @@ func (csm *ControllerStateMachine) createTopic(data map[string]interface{}) (int
 	// Check if topic already exists
 	if existingTopic, exists := csm.metadata.Topics[topicName]; exists {
 		log.Printf("Topic %s already exists in state machine, checking partition assignments", topicName)
-		
+
 		// Check if partition assignments exist for this topic
 		missingAssignments := false
 		for i := int32(0); i < existingTopic.Partitions; i++ {
@@ -285,7 +309,7 @@ func (csm *ControllerStateMachine) createTopic(data map[string]interface{}) (int
 				break
 			}
 		}
-		
+
 		// If assignments are missing, recreate them from the provided data
 		if missingAssignments {
 			log.Printf("Topic %s exists but partition assignments are missing, recreating assignments", topicName)
@@ -310,7 +334,7 @@ func (csm *ControllerStateMachine) createTopic(data map[string]interface{}) (int
 				}
 			}
 		}
-		
+
 		// Topic exists and assignments are complete
 		return map[string]interface{}{
 			"success":                  true,
@@ -330,7 +354,7 @@ func (csm *ControllerStateMachine) createTopic(data map[string]interface{}) (int
 	// Convert assignments data to PartitionAssignment slice
 	assignments, err := csm.parseAssignments(assignmentsData)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse assignments: %w", err)
+		return nil, typederrors.NewTypedError(typederrors.GeneralError, "failed to parse assignments", err)
 	}
 
 	// Validate assignments
@@ -341,6 +365,7 @@ func (csm *ControllerStateMachine) createTopic(data map[string]interface{}) (int
 	}
 
 	// Create topic metadata
+
 	topic := &TopicMetadata{
 		Name:              topicName,
 		Partitions:        partitions,
@@ -358,6 +383,11 @@ func (csm *ControllerStateMachine) createTopic(data map[string]interface{}) (int
 	}
 
 	log.Printf("Topic %s created with %d partitions (metadata updated in StateMachine)", topicName, len(assignments))
+
+	for _, assignment := range assignments {
+		partitionKey := fmt.Sprintf("%s-%d", topicName, assignment.PartitionID)
+		csm.startLeaderWatcher(partitionKey, assignment)
+	}
 
 	return map[string]interface{}{
 		"success":                  true,
@@ -401,11 +431,29 @@ func (csm *ControllerStateMachine) mapToPartitionAssignment(data map[string]inte
 	}
 
 	if v, ok := data["partition_id"]; ok {
-		assignment.PartitionID = int32(v.(float64))
+		switch val := v.(type) {
+		case int32:
+			assignment.PartitionID = val
+		case float64:
+			assignment.PartitionID = int32(val)
+		default:
+			return nil, fmt.Errorf("invalid partition_id type: %T", v)
+		}
 	}
 
 	if v, ok := data["raft_group_id"]; ok {
-		assignment.RaftGroupID = uint64(v.(float64))
+		switch val := v.(type) {
+		case string:
+			raftGroupID, err := strconv.ParseUint(val, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse raft_group_id: %w", err)
+			}
+			assignment.RaftGroupID = raftGroupID
+		case float64:
+			assignment.RaftGroupID = uint64(val)
+		default:
+			return nil, fmt.Errorf("invalid raft_group_id type: %T", v)
+		}
 	}
 
 	if v, ok := data["replicas"]; ok {
@@ -453,9 +501,10 @@ func (csm *ControllerStateMachine) deleteTopic(data map[string]interface{}) (int
 			}
 		}
 
-		// Remove partition assignments
+		// Remove partition assignments and stop watchers
 		deletedPartitions := 0
 		for _, partitionKey := range partitionKeysToDelete {
+			csm.stopLeaderWatcher(partitionKey)
 			delete(csm.metadata.PartitionAssignments, partitionKey)
 			delete(csm.metadata.LeaderAssignments, partitionKey)
 			deletedPartitions++
@@ -474,13 +523,14 @@ func (csm *ControllerStateMachine) deleteTopic(data map[string]interface{}) (int
 	// Use pre-computed assignments from Controller Leader
 	assignments, err := csm.parseAssignments(assignmentsData)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse assignments: %w", err)
+		return nil, typederrors.NewTypedError(typederrors.GeneralError, "failed to parse assignments", err)
 	}
 
-	// Remove partition assignments (metadata update only)
+	// Remove partition assignments (metadata update only) and stop watchers
 	deletedPartitions := 0
 	for _, assignment := range assignments {
 		partitionKey := fmt.Sprintf("%s-%d", assignment.TopicName, assignment.PartitionID)
+		csm.stopLeaderWatcher(partitionKey)
 		delete(csm.metadata.PartitionAssignments, partitionKey)
 		delete(csm.metadata.LeaderAssignments, partitionKey)
 		deletedPartitions++
@@ -573,7 +623,7 @@ func (csm *ControllerStateMachine) migrateLeader(data map[string]interface{}) (i
 
 	// Validate that target broker is in replica list
 	if !csm.isValidReplica(assignment, newLeader) {
-		return nil, fmt.Errorf("broker %s is not a replica of partition %s", newLeader, partitionKey)
+		return nil, typederrors.NewTypedError(typederrors.PartitionLeaderError, fmt.Sprintf("broker %s is not a replica of partition %s", newLeader, partitionKey), nil)
 	}
 
 	// In Multi-Raft architecture, always use Raft leader transfer
@@ -601,7 +651,7 @@ func (csm *ControllerStateMachine) executeRaftLeaderTransfer(assignment *Partiti
 	// Transfer leadership using dragonboat through the assigner
 	err := multiRaftAssigner.raftManager.TransferLeadership(assignment.RaftGroupID, targetNodeID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to transfer leadership: %w", err)
+		return nil, typederrors.NewTypedError(typederrors.LeadershipError, "failed to transfer leadership", err)
 	}
 
 	log.Printf("Initiated leader transfer for partition %s (group %d) to broker %s (node %d)",
@@ -664,7 +714,7 @@ func (csm *ControllerStateMachine) rebalancePartitions(data map[string]interface
 	availableBrokers := csm.getAvailableBrokers()
 	newAssignments, err := csm.partitionAssigner.RebalancePartitions(csm.metadata.PartitionAssignments, availableBrokers)
 	if err != nil {
-		return nil, fmt.Errorf("failed to rebalance partitions: %w", err)
+		return nil, typederrors.NewTypedError(typederrors.GeneralError, "failed to rebalance partitions", err)
 	}
 
 	// Update metadata with new assignments
@@ -794,7 +844,7 @@ func (csm *ControllerStateMachine) RecoverFromSnapshot(r io.Reader, files []stat
 	csm.partitionAssigner = NewPartitionAssigner(csm.metadata, raftManager)
 	csm.mu.Unlock()
 
-	log.Printf("Recovered controller state machine from snapshot, version: %d, partitions: %d", 
+	log.Printf("Recovered controller state machine from snapshot, version: %d, partitions: %d",
 		metadata.Version, len(metadata.PartitionAssignments))
 	return nil
 }
@@ -802,6 +852,8 @@ func (csm *ControllerStateMachine) RecoverFromSnapshot(r io.Reader, files []stat
 // Close implements the statemachine.IStateMachine interface
 func (csm *ControllerStateMachine) Close() error {
 	log.Printf("Closing controller state machine")
+	// Stop all leader watchers
+	csm.stopAllLeaderWatchers()
 	return nil
 }
 
@@ -875,6 +927,117 @@ func (csm *ControllerStateMachine) GetHash() uint64 {
 func (csm *ControllerStateMachine) GetPartitionAssigner() *PartitionAssigner {
 	csm.mu.RLock()
 	defer csm.mu.RUnlock()
-
 	return csm.partitionAssigner
+}
+
+func (csm *ControllerStateMachine) startLeaderWatcher(partitionKey string, assignment *PartitionAssignment) {
+	csm.watcherMu.Lock()
+	defer csm.watcherMu.Unlock()
+
+	if cancelFunc, exists := csm.leaderWatchers[partitionKey]; exists {
+		cancelFunc()
+		delete(csm.leaderWatchers, partitionKey)
+	}
+
+	cancelFunc, err := csm.partitionAssigner.raftManager.WatchLeadershipChanges(assignment.RaftGroupID, func(newLeaderNodeID uint64, exists bool) {
+		if !exists {
+			return
+		}
+		newLeaderBrokerID := csm.nodeIDToBrokerID(newLeaderNodeID)
+		if newLeaderBrokerID != "" && newLeaderBrokerID != assignment.Leader {
+			log.Printf("Leader change detected for partition %s: %s -> %s", partitionKey, assignment.Leader, newLeaderBrokerID)
+			csm.mu.Lock()
+			if currentAssignment, exists := csm.metadata.PartitionAssignments[partitionKey]; exists {
+				currentAssignment.Leader = newLeaderBrokerID
+				csm.metadata.LeaderAssignments[partitionKey] = newLeaderBrokerID
+				csm.metadata.Version++
+				csm.metadata.UpdateTime = time.Now()
+			}
+			csm.mu.Unlock()
+		}
+	})
+
+	if err != nil {
+		log.Printf("Failed to start leader watcher for partition %s: %v", partitionKey, err)
+		return
+	}
+
+	csm.leaderWatchers[partitionKey] = cancelFunc
+	log.Printf("Started leader watcher for partition %s (group %d)", partitionKey, assignment.RaftGroupID)
+}
+
+// stopLeaderWatcher stops watching for leader changes on a partition
+func (csm *ControllerStateMachine) stopLeaderWatcher(partitionKey string) {
+	csm.watcherMu.Lock()
+	defer csm.watcherMu.Unlock()
+
+	if cancelFunc, exists := csm.leaderWatchers[partitionKey]; exists {
+		cancelFunc()
+		delete(csm.leaderWatchers, partitionKey)
+		log.Printf("Stopped leader watcher for partition %s", partitionKey)
+	}
+}
+
+// stopAllLeaderWatchers stops all leader watchers
+func (csm *ControllerStateMachine) stopAllLeaderWatchers() {
+	csm.watcherMu.Lock()
+	defer csm.watcherMu.Unlock()
+
+	for partitionKey, cancelFunc := range csm.leaderWatchers {
+		cancelFunc()
+		log.Printf("Stopped leader watcher for partition %s", partitionKey)
+	}
+	csm.leaderWatchers = make(map[string]func())
+}
+
+// nodeIDToBrokerID converts node ID back to broker ID
+func (csm *ControllerStateMachine) nodeIDToBrokerID(nodeID uint64) string {
+	// Find broker by matching node ID
+	for brokerID := range csm.metadata.Brokers {
+		if csm.brokerIDToNodeID(brokerID) == nodeID {
+			return brokerID
+		}
+	}
+	return ""
+}
+
+// GetTopicMetadataWithPartitions returns topic metadata with partition details in one query
+func (csm *ControllerStateMachine) GetTopicMetadataWithPartitions(topicName string) (*TopicMetadataResponse, error) {
+	csm.mu.RLock()
+	defer csm.mu.RUnlock()
+
+	topicMetadata, exists := csm.metadata.Topics[topicName]
+	if !exists {
+		return nil, fmt.Errorf("topic %s not found", topicName)
+	}
+
+	response := &TopicMetadataResponse{
+		Name:              topicMetadata.Name,
+		Partitions:        topicMetadata.Partitions,
+		ReplicationFactor: topicMetadata.ReplicationFactor,
+		CreatedAt:         topicMetadata.CreatedAt,
+		Config:            topicMetadata.Config,
+		PartitionInfos:    make([]PartitionInfo, 0, topicMetadata.Partitions),
+	}
+
+	for i := int32(0); i < topicMetadata.Partitions; i++ {
+		partitionKey := fmt.Sprintf("%s-%d", topicName, i)
+		partitionInfo := PartitionInfo{
+			PartitionID: i,
+			Leader:      "",
+			Replicas:    []string{},
+			RaftGroupID: 0,
+		}
+
+		// Get partition assignment if exists
+		if assignment, exists := csm.metadata.PartitionAssignments[partitionKey]; exists {
+			partitionInfo.Leader = assignment.Leader
+			partitionInfo.Replicas = assignment.Replicas
+			partitionInfo.RaftGroupID = assignment.RaftGroupID
+		}
+
+		response.PartitionInfos = append(response.PartitionInfos, partitionInfo)
+	}
+
+	return response, nil
 }

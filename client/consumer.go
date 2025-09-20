@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/issac1998/go-queue/internal/errors"
 	"github.com/issac1998/go-queue/internal/protocol"
 )
 
@@ -259,105 +260,142 @@ func (c *Consumer) parseFetchResponse(topic string, partition int32, requestOffs
 	return result, nil
 }
 
-// fetchFromPartition fetches messages directly from the partition leader or follower
 func (c *Consumer) fetchFromPartition(req FetchRequest) (*FetchResult, error) {
-	// Always use synchronous mode
-	conn, err := c.client.connectForDataOperation(req.Topic, req.Partition, false)
-	if err != nil {
-		// TODO: only do refresh if it's a follower error
-		c.client.refreshTopicMetadata(req.Topic)
-		return nil, fmt.Errorf("failed to connect to partition leader or follower: %v", err)
+	const maxRetries = 3
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		conn, err := c.client.connectForDataOperation(req.Topic, req.Partition, false)
+		if err != nil {
+			if c.client.shouldRetryWithMetadataRefresh(err) && attempt < maxRetries-1 {
+				if _, refreshErr := c.client.refreshTopicMetadata(req.Topic); refreshErr != nil {
+					return nil, fmt.Errorf("failed to fetch after metadata refresh error: %v (original error: %v)", refreshErr, err)
+				}
+				time.Sleep(time.Second)
+				continue
+			}
+			return nil, &errors.TypedError{
+				Type:    errors.PartitionLeaderError,
+				Message: errors.FailedToConnectToPartitionMsg,
+				Cause:   err,
+			}
+		}
+		defer conn.Close()
+
+		conn.SetDeadline(time.Now().Add(c.client.timeout))
+
+		requestData, err := c.buildFetchRequest(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build request: %v", err)
+		}
+
+		requestType := protocol.FetchRequestType
+		if err := binary.Write(conn, binary.BigEndian, requestType); err != nil {
+			return nil, fmt.Errorf("failed to send request type: %v", err)
+		}
+
+		if err := binary.Write(conn, binary.BigEndian, int32(len(requestData))); err != nil {
+			return nil, fmt.Errorf("failed to send data length: %v", err)
+		}
+
+		if _, err := conn.Write(requestData); err != nil {
+			return nil, fmt.Errorf("failed to send request data: %v", err)
+		}
+
+		var responseLen int32
+		if err := binary.Read(conn, binary.BigEndian, &responseLen); err != nil {
+			return nil, fmt.Errorf("failed to read response length: %v", err)
+		}
+
+		responseData := make([]byte, responseLen)
+		if _, err := io.ReadFull(conn, responseData); err != nil {
+			return nil, fmt.Errorf("failed to read response data: %v", err)
+		}
+
+		result, err := c.parseFetchResponse(req.Topic, req.Partition, req.Offset, responseData)
+		if err != nil {
+			if c.client.shouldRetryWithMetadataRefresh(err) && attempt < maxRetries-1 {
+				if _, refreshErr := c.client.refreshTopicMetadata(req.Topic); refreshErr != nil {
+					return nil, fmt.Errorf("failed to fetch after metadata refresh error: %v (original error: %v)", refreshErr, err)
+				}
+				time.Sleep(time.Second)
+				continue
+			}
+			return nil, fmt.Errorf("failed to parse response: %v", err)
+		}
+
+		return result, nil
 	}
-	defer conn.Close()
 
-	conn.SetDeadline(time.Now().Add(c.client.timeout))
-
-	requestData, err := c.buildFetchRequest(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to build request: %v", err)
-	}
-
-	requestType := protocol.FetchRequestType
-	if err := binary.Write(conn, binary.BigEndian, requestType); err != nil {
-		return nil, fmt.Errorf("failed to send request type: %v", err)
-	}
-
-	if err := binary.Write(conn, binary.BigEndian, int32(len(requestData))); err != nil {
-		return nil, fmt.Errorf("failed to send data length: %v", err)
-	}
-
-	if _, err := conn.Write(requestData); err != nil {
-		return nil, fmt.Errorf("failed to send request data: %v", err)
-	}
-
-	var responseLen int32
-	if err := binary.Read(conn, binary.BigEndian, &responseLen); err != nil {
-		return nil, fmt.Errorf("failed to read response length: %v", err)
-	}
-
-	responseData := make([]byte, responseLen)
-	if _, err := io.ReadFull(conn, responseData); err != nil {
-		return nil, fmt.Errorf("failed to read response data: %v", err)
-	}
-	// TODO: refreshMetadata if it's a follower error
-
-	result, err := c.parseFetchResponse(req.Topic, req.Partition, req.Offset, responseData)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse response: %v", err)
-	}
-
-	return result, nil
+	return nil, fmt.Errorf("failed to fetch from partition after %d attempts", maxRetries)
 }
 
-// batchFetchFromPartition fetches messages for multiple ranges from a single partition
 func (c *Consumer) batchFetchFromPartition(req BatchFetchRequest) (*BatchFetchResult, error) {
-	conn, err := c.client.connectForDataOperation(req.Topic, req.Partition, false)
-	if err != nil {
-		c.client.refreshTopicMetadata(req.Topic)
-		return nil, fmt.Errorf("failed to connect to partition leader or follower: %v", err)
+	const maxRetries = 3
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		conn, err := c.client.connectForDataOperation(req.Topic, req.Partition, false)
+		if err != nil {
+			if c.client.shouldRetryWithMetadataRefresh(err) && attempt < maxRetries-1 {
+				if _, refreshErr := c.client.refreshTopicMetadata(req.Topic); refreshErr != nil {
+					return nil, fmt.Errorf("failed to batch fetch after metadata refresh error: %v (original error: %v)", refreshErr, err)
+				}
+				continue
+			}
+			return nil, &errors.TypedError{
+				Type:    errors.PartitionLeaderError,
+				Message: errors.FailedToConnectToPartitionMsg,
+				Cause:   err,
+			}
+		}
+		defer conn.Close()
+
+		conn.SetDeadline(time.Now().Add(c.client.timeout))
+
+		requestData, err := c.buildBatchFetchRequest(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build batch request: %v", err)
+		}
+
+		requestType := protocol.BatchFetchRequestType
+		if err := binary.Write(conn, binary.BigEndian, requestType); err != nil {
+			return nil, fmt.Errorf("failed to send request type: %v", err)
+		}
+
+		if err := binary.Write(conn, binary.BigEndian, int32(len(requestData))); err != nil {
+			return nil, fmt.Errorf("failed to send data length: %v", err)
+		}
+
+		if _, err := conn.Write(requestData); err != nil {
+			return nil, fmt.Errorf("failed to send request data: %v", err)
+		}
+
+		var responseLen int32
+		if err := binary.Read(conn, binary.BigEndian, &responseLen); err != nil {
+			return nil, fmt.Errorf("failed to read response length: %v", err)
+		}
+
+		responseData := make([]byte, responseLen)
+		if _, err := io.ReadFull(conn, responseData); err != nil {
+			return nil, fmt.Errorf("failed to read response data: %v", err)
+		}
+
+		result, err := c.parseBatchFetchResponse(req.Topic, req.Partition, responseData)
+		if err != nil {
+			if c.client.shouldRetryWithMetadataRefresh(err) && attempt < maxRetries-1 {
+				if _, refreshErr := c.client.refreshTopicMetadata(req.Topic); refreshErr != nil {
+					return nil, fmt.Errorf("failed to batch fetch after metadata refresh error: %v (original error: %v)", refreshErr, err)
+				}
+				continue
+			}
+			return nil, fmt.Errorf("failed to parse batch response: %v", err)
+		}
+
+		return result, nil
 	}
-	defer conn.Close()
 
-	conn.SetDeadline(time.Now().Add(c.client.timeout))
-
-	requestData, err := c.buildBatchFetchRequest(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to build batch request: %v", err)
-	}
-
-	requestType := protocol.BatchFetchRequestType
-	if err := binary.Write(conn, binary.BigEndian, requestType); err != nil {
-		return nil, fmt.Errorf("failed to send request type: %v", err)
-	}
-
-	// Send data length first, then the actual data
-	if err := binary.Write(conn, binary.BigEndian, int32(len(requestData))); err != nil {
-		return nil, fmt.Errorf("failed to send data length: %v", err)
-	}
-
-	if _, err := conn.Write(requestData); err != nil {
-		return nil, fmt.Errorf("failed to send request data: %v", err)
-	}
-
-	var responseLen int32
-	if err := binary.Read(conn, binary.BigEndian, &responseLen); err != nil {
-		return nil, fmt.Errorf("failed to read response length: %v", err)
-	}
-
-	responseData := make([]byte, responseLen)
-	if _, err := io.ReadFull(conn, responseData); err != nil {
-		return nil, fmt.Errorf("failed to read response data: %v", err)
-	}
-
-	result, err := c.parseBatchFetchResponse(req.Topic, req.Partition, responseData)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse batch response: %v", err)
-	}
-
-	return result, nil
+	return nil, fmt.Errorf("failed to batch fetch from partition after %d attempts", maxRetries)
 }
 
-// buildBatchFetchRequest builds a batch fetch request
 func (c *Consumer) buildBatchFetchRequest(req BatchFetchRequest) ([]byte, error) {
 	buf := new(bytes.Buffer)
 
@@ -395,7 +433,6 @@ func (c *Consumer) buildBatchFetchRequest(req BatchFetchRequest) ([]byte, error)
 	return buf.Bytes(), nil
 }
 
-// parseBatchFetchResponse parses a batch fetch response
 func (c *Consumer) parseBatchFetchResponse(topic string, partition int32, data []byte) (*BatchFetchResult, error) {
 	buf := bytes.NewReader(data)
 
@@ -569,7 +606,6 @@ func (c *Consumer) Poll(timeout time.Duration) ([]*Message, error) {
 	return allMessages, nil
 }
 
-// pollTopic polls messages from a specific topic
 func (c *Consumer) pollTopic(topic string, timeout time.Duration) ([]*Message, error) {
 	admin := NewAdmin(c.client)
 	topicInfo, err := admin.GetTopicInfo(topic)

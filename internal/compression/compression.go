@@ -9,6 +9,7 @@ import (
 
 	"github.com/klauspost/compress/snappy"
 	"github.com/klauspost/compress/zstd"
+	typederrors "github.com/issac1998/go-queue/internal/errors"
 )
 
 type CompressionType int8
@@ -65,11 +66,11 @@ func (g *GzipCompression) Compress(data []byte) ([]byte, error) {
 	writer := gzip.NewWriter(&buf)
 
 	if _, err := writer.Write(data); err != nil {
-		return nil, fmt.Errorf("gzip compress failed: %v", err)
+		return nil, typederrors.NewTypedError(typederrors.GeneralError, "gzip compress failed", err)
 	}
 
 	if err := writer.Close(); err != nil {
-		return nil, fmt.Errorf("gzip writer close failed: %v", err)
+		return nil, typederrors.NewTypedError(typederrors.GeneralError, "gzip writer close failed", err)
 	}
 
 	return buf.Bytes(), nil
@@ -78,13 +79,13 @@ func (g *GzipCompression) Compress(data []byte) ([]byte, error) {
 func (g *GzipCompression) Decompress(data []byte) ([]byte, error) {
 	reader, err := gzip.NewReader(bytes.NewReader(data))
 	if err != nil {
-		return nil, fmt.Errorf("gzip reader create failed: %v", err)
+		return nil, typederrors.NewTypedError(typederrors.GeneralError, "gzip reader create failed", err)
 	}
 	defer reader.Close()
 
 	result, err := io.ReadAll(reader)
 	if err != nil {
-		return nil, fmt.Errorf("gzip decompress failed: %v", err)
+		return nil, typederrors.NewTypedError(typederrors.GeneralError, "gzip decompress failed", err)
 	}
 
 	return result, nil
@@ -101,11 +102,11 @@ func (z *ZlibCompression) Compress(data []byte) ([]byte, error) {
 	writer := zlib.NewWriter(&buf)
 
 	if _, err := writer.Write(data); err != nil {
-		return nil, fmt.Errorf("zlib compress failed: %v", err)
+		return nil, typederrors.NewTypedError(typederrors.GeneralError, "zlib compress failed", err)
 	}
 
 	if err := writer.Close(); err != nil {
-		return nil, fmt.Errorf("zlib writer close failed: %v", err)
+		return nil, typederrors.NewTypedError(typederrors.GeneralError, "zlib writer close failed", err)
 	}
 
 	return buf.Bytes(), nil
@@ -114,13 +115,13 @@ func (z *ZlibCompression) Compress(data []byte) ([]byte, error) {
 func (z *ZlibCompression) Decompress(data []byte) ([]byte, error) {
 	reader, err := zlib.NewReader(bytes.NewReader(data))
 	if err != nil {
-		return nil, fmt.Errorf("zlib reader create failed: %v", err)
+		return nil, typederrors.NewTypedError(typederrors.GeneralError, "zlib reader create failed", err)
 	}
 	defer reader.Close()
 
 	result, err := io.ReadAll(reader)
 	if err != nil {
-		return nil, fmt.Errorf("zlib decompress failed: %v", err)
+		return nil, typederrors.NewTypedError(typederrors.GeneralError, "zlib decompress failed", err)
 	}
 
 	return result, nil
@@ -139,7 +140,7 @@ func (s *SnappyCompression) Compress(data []byte) ([]byte, error) {
 func (s *SnappyCompression) Decompress(data []byte) ([]byte, error) {
 	result, err := snappy.Decode(nil, data)
 	if err != nil {
-		return nil, fmt.Errorf("snappy decompress failed: %v", err)
+		return nil, typederrors.NewTypedError(typederrors.GeneralError, "snappy decompress failed", err)
 	}
 	return result, nil
 }
@@ -156,12 +157,12 @@ type ZstdCompression struct {
 func NewZstdCompression() (*ZstdCompression, error) {
 	encoder, err := zstd.NewWriter(nil)
 	if err != nil {
-		return nil, fmt.Errorf("create zstd encoder failed: %v", err)
+		return nil, typederrors.NewTypedError(typederrors.GeneralError, "create zstd encoder failed", err)
 	}
 
 	decoder, err := zstd.NewReader(nil)
 	if err != nil {
-		return nil, fmt.Errorf("create zstd decoder failed: %v", err)
+		return nil, typederrors.NewTypedError(typederrors.GeneralError, "create zstd decoder failed", err)
 	}
 
 	return &ZstdCompression{
@@ -177,7 +178,7 @@ func (z *ZstdCompression) Compress(data []byte) ([]byte, error) {
 func (z *ZstdCompression) Decompress(data []byte) ([]byte, error) {
 	result, err := z.decoder.DecodeAll(data, nil)
 	if err != nil {
-		return nil, fmt.Errorf("zstd decompress failed: %v", err)
+		return nil, typederrors.NewTypedError(typederrors.GeneralError, "zstd decompress failed", err)
 	}
 	return result, nil
 }

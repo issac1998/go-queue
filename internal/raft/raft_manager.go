@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	typederrors "github.com/issac1998/go-queue/internal/errors"
 	"github.com/lni/dragonboat/v3"
 	"github.com/lni/dragonboat/v3/config"
 	"github.com/lni/dragonboat/v3/statemachine"
@@ -44,15 +45,26 @@ type RaftManager struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	// Unified leadership watching
+	leadershipWatchers map[uint64][]func(uint64, bool) // groupID -> callbacks
+	lastLeaderStates   map[uint64]leaderState          // groupID -> last known state
+	watcherMutex       sync.RWMutex
+	watcherCancel      context.CancelFunc
 }
 
 // RaftGroup represents an active Raft group
 type RaftGroup struct {
-	// Groups或许需要获取Leader接口，用作后续从Leader读Partition
+	// Configuration
 	GroupID      uint64
 	Members      map[uint64]string // NodeID -> Address
 	StateMachine statemachine.IStateMachine
 	IsController bool
+}
+
+type leaderState struct {
+	leaderID uint64
+	exists   bool
 }
 
 // NewRaftManager creates a new RaftManager instance with real Dragonboat integration
@@ -76,17 +88,22 @@ func NewRaftManager(raftConfig *RaftConfig, dataDir string) (*RaftManager, error
 	ctx, cancel := context.WithCancel(context.Background())
 
 	rm := &RaftManager{
-		config:  raftConfig,
-		dataDir: dataDir,
-		groups:  make(map[uint64]*RaftGroup),
-		ctx:     ctx,
-		cancel:  cancel,
+		config:             raftConfig,
+		dataDir:            dataDir,
+		groups:             make(map[uint64]*RaftGroup),
+		ctx:                ctx,
+		cancel:             cancel,
+		leadershipWatchers: make(map[uint64][]func(uint64, bool)),
+		lastLeaderStates:   make(map[uint64]leaderState),
 	}
+
+	// Start unified leadership watcher
+	rm.startUnifiedLeadershipWatcher()
 
 	// Initialize Dragonboat NodeHost
 	if err := rm.initNodeHost(); err != nil {
 		cancel()
-		return nil, fmt.Errorf("failed to initialize NodeHost: %v", err)
+		return nil, typederrors.NewTypedError(typederrors.GeneralError, "failed to initialize NodeHost", err)
 	}
 
 	return rm, nil
@@ -106,7 +123,11 @@ func (rm *RaftManager) initNodeHost() error {
 
 	nodeHost, err := dragonboat.NewNodeHost(nhConfig)
 	if err != nil {
-		return fmt.Errorf("failed to create NodeHost: %v", err)
+		return &typederrors.TypedError{
+			Type:    typederrors.LeadershipError,
+			Message: "failed to create NodeHost",
+			Cause:   err,
+		}
 	}
 
 	rm.nodeHost = nodeHost
@@ -124,7 +145,11 @@ func (rm *RaftManager) StartRaftGroup(groupID uint64, members map[uint64]string,
 	defer rm.mu.Unlock()
 
 	if _, exists := rm.groups[groupID]; exists {
-		return fmt.Errorf("raft group %d already exists", groupID)
+		return &typederrors.TypedError{
+			Type:    typederrors.LeadershipError,
+			Message: fmt.Sprintf("raft group %d already exists", groupID),
+			Cause:   nil,
+		}
 	}
 
 	raftConfig := config.Config{
@@ -158,7 +183,11 @@ func (rm *RaftManager) StartRaftGroup(groupID uint64, members map[uint64]string,
 	}, raftConfig)
 
 	if err != nil {
-		return fmt.Errorf("failed to start raft group %d: %v", groupID, err)
+		return &typederrors.TypedError{
+			Type:    typederrors.LeadershipError,
+			Message: fmt.Sprintf("failed to start raft group %d", groupID),
+			Cause:   err,
+		}
 	}
 
 	rm.groups[groupID] = &RaftGroup{
@@ -191,7 +220,7 @@ func (rm *RaftManager) StopRaftGroup(groupID uint64) error {
 	}
 
 	if err := rm.nodeHost.StopCluster(groupID); err != nil {
-		return fmt.Errorf("failed to stop raft group %d: %v", groupID, err)
+		return typederrors.NewTypedError(typederrors.GeneralError, fmt.Sprintf("failed to stop raft group %d", groupID), err)
 	}
 
 	delete(rm.groups, groupID)
@@ -205,7 +234,7 @@ func (rm *RaftManager) SyncPropose(ctx context.Context, groupID uint64, data []b
 
 	result, err := rm.nodeHost.SyncPropose(ctx, session, data)
 	if err != nil {
-		return statemachine.Result{}, fmt.Errorf("sync propose failed for group %d: %v", groupID, err)
+		return statemachine.Result{}, typederrors.NewTypedError(typederrors.GeneralError, fmt.Sprintf("sync propose failed for group %d", groupID), err)
 	}
 
 	return result, nil
@@ -276,7 +305,11 @@ func (rm *RaftManager) GetStateMachine(groupID uint64) (statemachine.IStateMachi
 
 	group, exists := rm.groups[groupID]
 	if !exists {
-		return nil, fmt.Errorf("raft group %d not found", groupID)
+		return nil, &typederrors.TypedError{
+			Type:    typederrors.LeadershipError,
+			Message: fmt.Sprintf("raft group %d not found", groupID),
+			Cause:   nil,
+		}
 	}
 
 	return group.StateMachine, nil
@@ -285,20 +318,26 @@ func (rm *RaftManager) GetStateMachine(groupID uint64) (statemachine.IStateMachi
 // WaitForLeadershipReady waits for the raft group to have a leader within the timeout
 func (rm *RaftManager) WaitForLeadershipReady(groupID uint64, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	checkInterval := 1 * time.Second // Check every 100ms instead of busy waiting
 
 	for time.Now().Before(deadline) {
 		if leaderID, exists, err := rm.GetLeaderID(groupID); err == nil && exists && leaderID != 0 {
 			log.Printf("Raft group %d has leader: %d", groupID, leaderID)
 			return nil
 		}
-		time.Sleep(100 * time.Millisecond) // Short sleep for responsiveness
+
+		// Sleep to avoid busy waiting and reduce CPU usage
+		time.Sleep(checkInterval)
 	}
 
-	return fmt.Errorf("timeout waiting for raft group %d to establish leadership", groupID)
+	return &typederrors.TypedError{
+		Type:    typederrors.LeadershipError,
+		Message: fmt.Sprintf("timeout waiting for raft group %d to establish leadership", groupID),
+	}
 }
 
-// WatchLeadershipChanges provides real-time leadership change notifications
-// This is more efficient than polling for applications that need immediate notifications
+// WatchLeadershipChanges monitors leadership changes for a specific group using unified watcher
+// Returns a cancel function to stop watching
 func (rm *RaftManager) WatchLeadershipChanges(groupID uint64, callback func(leaderID uint64, exists bool)) (func(), error) {
 	rm.mu.RLock()
 	if _, exists := rm.groups[groupID]; !exists {
@@ -307,53 +346,24 @@ func (rm *RaftManager) WatchLeadershipChanges(groupID uint64, callback func(lead
 	}
 	rm.mu.RUnlock()
 
-	ctx, cancel := context.WithCancel(rm.ctx)
+	// Register callback with unified watcher
+	rm.watcherMutex.Lock()
+	rm.leadershipWatchers[groupID] = append(rm.leadershipWatchers[groupID], callback)
+	callbackIndex := len(rm.leadershipWatchers[groupID]) - 1
+	rm.watcherMutex.Unlock()
 
+	// Trigger initial callback with current state
 	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("Leadership watcher for group %d recovered from panic: %v", groupID, r)
-			}
-		}()
-
-		ticker := time.NewTicker(200 * time.Millisecond) // Even faster polling
-		defer ticker.Stop()
-
-		var lastLeader uint64
-		var lastExists bool
-
-		// Get initial state
-		if leader, exists, err := rm.GetLeaderID(groupID); err == nil {
-			lastLeader = leader
-			lastExists = exists
-			if callback != nil {
-				callback(leader, exists)
-			}
-		}
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				if leader, exists, err := rm.GetLeaderID(groupID); err == nil {
-					if leader != lastLeader || exists != lastExists {
-						log.Printf("Leadership change detected for group %d: leader %d->%d, exists %v->%v",
-							groupID, lastLeader, leader, lastExists, exists)
-						lastLeader = leader
-						lastExists = exists
-						if callback != nil {
-							callback(leader, exists)
-						}
-					}
-				} else {
-					log.Printf("Error watching leadership for group %d: %v", groupID, err)
-				}
-			}
+		currentLeader, exists, err := rm.GetLeaderID(groupID)
+		if err == nil {
+			callback(currentLeader, exists)
 		}
 	}()
 
-	return cancel, nil
+	// Return cancel function that removes this specific callback
+	return func() {
+		rm.removeWatcher(groupID, callbackIndex)
+	}, nil
 }
 
 // Close gracefully shuts down the RaftManager
@@ -362,6 +372,11 @@ func (rm *RaftManager) Close() error {
 	defer rm.mu.Unlock()
 
 	log.Printf("Shutting down RaftManager...")
+
+	// Stop unified leadership watcher first
+	if rm.watcherCancel != nil {
+		rm.watcherCancel()
+	}
 
 	rm.cancel()
 
@@ -394,7 +409,7 @@ func (rm *RaftManager) EnsureReadIndexConsistency(ctx context.Context, groupID u
 
 	result, err := rm.nodeHost.ReadIndex(groupID, 5*time.Second)
 	if err != nil {
-		return 0, fmt.Errorf("ReadIndex operation failed for group %d: %v", groupID, err)
+		return 0, typederrors.NewTypedError(typederrors.GeneralError, fmt.Sprintf("ReadIndex operation failed for group %d", groupID), err)
 	}
 
 	select {
@@ -409,4 +424,91 @@ func (rm *RaftManager) EnsureReadIndexConsistency(ctx context.Context, groupID u
 // GetGroupCount returns the number of active Raft groups
 func (rm *RaftManager) GetGroupCount() int {
 	return len(rm.groups)
+}
+
+// removeWatcher removes a specific callback from the leadership watchers
+func (rm *RaftManager) removeWatcher(groupID uint64, callbackIndex int) {
+	rm.watcherMutex.Lock()
+	defer rm.watcherMutex.Unlock()
+
+	if callbacks, exists := rm.leadershipWatchers[groupID]; exists && callbackIndex < len(callbacks) {
+		// Set callback to nil instead of removing to maintain indices
+		callbacks[callbackIndex] = nil
+
+		// Clean up if all callbacks are nil
+		allNil := true
+		for _, cb := range callbacks {
+			if cb != nil {
+				allNil = false
+				break
+			}
+		}
+
+		if allNil {
+			delete(rm.leadershipWatchers, groupID)
+			delete(rm.lastLeaderStates, groupID)
+		}
+	}
+}
+
+// startUnifiedLeadershipWatcher starts a single goroutine to monitor all groups
+func (rm *RaftManager) startUnifiedLeadershipWatcher() {
+	watcherCtx, cancel := context.WithCancel(rm.ctx)
+	rm.watcherCancel = cancel
+
+	go func() {
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-watcherCtx.Done():
+				return
+			case <-ticker.C:
+				rm.checkAllGroupsLeadership()
+			}
+		}
+	}()
+}
+
+// checkAllGroupsLeadership checks leadership changes for all registered groups
+func (rm *RaftManager) checkAllGroupsLeadership() {
+	rm.watcherMutex.RLock()
+	groupsToCheck := make([]uint64, 0, len(rm.leadershipWatchers))
+	for groupID := range rm.leadershipWatchers {
+		groupsToCheck = append(groupsToCheck, groupID)
+	}
+	rm.watcherMutex.RUnlock()
+
+	for _, groupID := range groupsToCheck {
+		rm.checkGroupLeadership(groupID)
+	}
+}
+
+// checkGroupLeadership checks leadership change for a specific group
+func (rm *RaftManager) checkGroupLeadership(groupID uint64) {
+	currentLeaderID, exists, err := rm.GetLeaderID(groupID)
+	if err != nil {
+		return
+	}
+
+	rm.watcherMutex.Lock()
+	lastState, hasLastState := rm.lastLeaderStates[groupID]
+	callbacks := rm.leadershipWatchers[groupID]
+	rm.watcherMutex.Unlock()
+
+	if !hasLastState || lastState.leaderID != currentLeaderID || lastState.exists != exists {
+		rm.watcherMutex.Lock()
+		rm.lastLeaderStates[groupID] = leaderState{
+			leaderID: currentLeaderID,
+			exists:   exists,
+		}
+		rm.watcherMutex.Unlock()
+
+		for _, callback := range callbacks {
+			if callback != nil {
+				callback(currentLeaderID, exists)
+			}
+		}
+	}
 }

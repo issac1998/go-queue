@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/issac1998/go-queue/client"
+	typederrors "github.com/issac1998/go-queue/internal/errors"
 )
 
 // DLQClient provides high-level API for dead letter queue operations
@@ -19,7 +20,7 @@ type DLQClient struct {
 func NewDLQClient(clientInstance *client.Client, config *DLQConfig) (*DLQClient, error) {
 	manager, err := NewManager(clientInstance, config)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create DLQ manager: %w", err)
+		return nil, typederrors.NewTypedError(typederrors.GeneralError, "failed to create DLQ manager", err)
 	}
 
 	return &DLQClient{
@@ -91,7 +92,7 @@ func (d *DLQClient) ReprocessDLQMessage(dlqMsg *DeadLetterMessage) error {
 
 	_, err := d.producer.Send(produceMsg)
 	if err != nil {
-		return fmt.Errorf("failed to reprocess DLQ message: %w", err)
+		return typederrors.NewTypedError(typederrors.GeneralError, "failed to reprocess DLQ message", err)
 	}
 
 	return nil
@@ -103,8 +104,9 @@ func (d *DLQClient) ReprocessDLQMessages(dlqMessages []*DeadLetterMessage) []err
 
 	for _, dlqMsg := range dlqMessages {
 		if err := d.ReprocessDLQMessage(dlqMsg); err != nil {
-			errors = append(errors, fmt.Errorf("failed to reprocess message from topic %s partition %d offset %d: %w",
-				dlqMsg.OriginalTopic, dlqMsg.OriginalPartition, dlqMsg.OriginalOffset, err))
+			errors = append(errors, typederrors.NewTypedError(typederrors.GeneralError, 
+			fmt.Sprintf("failed to reprocess message from topic %s partition %d offset %d", 
+				dlqMsg.OriginalTopic, dlqMsg.OriginalPartition, dlqMsg.OriginalOffset), err))
 		}
 	}
 

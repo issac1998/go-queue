@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/issac1998/go-queue/internal/discovery"
+	"github.com/issac1998/go-queue/internal/errors"
 	"github.com/issac1998/go-queue/internal/protocol"
 	"github.com/issac1998/go-queue/internal/raft"
 )
@@ -194,7 +195,7 @@ func (cm *ControllerManager) initControllerRaftGroup() error {
 		return fmt.Errorf("controller raft group start failed: %v", err)
 	}
 
-	if err := cm.waitForControllerReady(30 * time.Second); err != nil {
+	if err := cm.waitForControllerReady(300 * time.Second); err != nil {
 		return fmt.Errorf("controller raft group not ready: %v", err)
 	}
 
@@ -341,41 +342,6 @@ func (cm *ControllerManager) getAllPartitionAssignments() ([]*raft.PartitionAssi
 	return allAssignments, nil
 }
 
-// mapToPartitionAssignment converts a map to PartitionAssignment
-func (cm *ControllerManager) mapToPartitionAssignment(data map[string]interface{}) (*raft.PartitionAssignment, error) {
-	assignment := &raft.PartitionAssignment{}
-
-	if v, ok := data["topic_name"]; ok {
-		assignment.TopicName = v.(string)
-	}
-
-	if v, ok := data["partition_id"]; ok {
-		assignment.PartitionID = int32(v.(float64))
-	}
-
-	if v, ok := data["raft_group_id"]; ok {
-		assignment.RaftGroupID = uint64(v.(float64))
-	}
-
-	if v, ok := data["replicas"]; ok {
-		if replicas, ok := v.([]interface{}); ok {
-			for _, replica := range replicas {
-				assignment.Replicas = append(assignment.Replicas, replica.(string))
-			}
-		}
-	}
-
-	if v, ok := data["leader"]; ok {
-		assignment.Leader = v.(string)
-	}
-
-	if v, ok := data["preferred_leader"]; ok {
-		assignment.PreferredLeader = v.(string)
-	}
-
-	return assignment, nil
-}
-
 // IsLeader returns whether this broker is the Controller leader
 func (cm *ControllerManager) isLeader() bool {
 	leaderID, exists, _ := cm.broker.raftManager.GetLeaderID(raft.ControllerGroupID)
@@ -396,10 +362,10 @@ func (cm *ControllerManager) ExecuteRaftCommandWithRetry(cmd *raft.ControllerCom
 		if err == nil {
 			return nil
 		}
-		
+
 		lastErr = err
 		log.Printf("Raft command execution failed (attempt %d/%d): %v", attempt+1, maxRetries, err)
-		
+
 		if attempt < maxRetries-1 {
 			time.Sleep(time.Millisecond * 100)
 		}
@@ -415,7 +381,6 @@ func (cm *ControllerManager) executeRaftCommand(cmd *raft.ControllerCommand) err
 		return fmt.Errorf("failed to marshal command: %v", err)
 	}
 
-	// Use longer timeout for Raft operations to avoid premature timeouts
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -428,7 +393,6 @@ func (cm *ControllerManager) executeRaftCommand(cmd *raft.ControllerCommand) err
 		return err
 	}
 
-	// Check if the result indicates a logical error (like topic already exists)
 	if result.Data != nil {
 		var resultMap map[string]interface{}
 		if err := json.Unmarshal(result.Data, &resultMap); err == nil {
@@ -507,14 +471,14 @@ func (cm *ControllerManager) RegisterBroker() error {
 // CreateTopic creates a new topic
 func (cm *ControllerManager) CreateTopic(topicName string, partitions int32, replicationFactor int32) error {
 	if !cm.isLeader() {
-		return fmt.Errorf("only controller leader can create topics")
+		return &errors.TypedError{
+			Type:    errors.ControllerError,
+			Message: "only controller leader can create topics",
+		}
 	}
 
 	log.Printf("Controller Leader creating topic %s with %d partitions (replication factor: %d)",
 		topicName, partitions, replicationFactor)
-
-	// Note: Topic existence check is now handled by the state machine
-	// which will restore missing partition assignments if needed
 
 	availableBrokers, err := cm.getAvailableBrokers()
 	if err != nil {
@@ -542,7 +506,17 @@ func (cm *ControllerManager) CreateTopic(topicName string, partitions int32, rep
 
 	log.Printf("Allocated %d partitions for topic %s", len(assignments), topicName)
 
-	// First, update metadata via Raft command
+	log.Printf("starting Raft groups", topicName)
+
+	err = partitionAssigner.StartPartitionRaftGroups(assignments)
+	if err != nil {
+		log.Printf("Failed to start Raft groups for topic %s, attempting cleanup: %v", topicName, err)
+		return fmt.Errorf("failed to start partition Raft groups: %w", err)
+	}
+
+	log.Printf("update topic to statemachine %s", topicName)
+	log.Println("send:%v", assignments)
+
 	cmd := &raft.ControllerCommand{
 		Type:      protocol.RaftCmdCreateTopic,
 		ID:        uuid.New().String(),
@@ -551,24 +525,13 @@ func (cm *ControllerManager) CreateTopic(topicName string, partitions int32, rep
 			"topic_name":         topicName,
 			"partitions":         float64(partitions),
 			"replication_factor": float64(replicationFactor),
-			"assignments":        cm.assignmentsToMap(assignments), // Pre-allocated assignments
+			"assignments":        cm.assignmentsToMap(assignments),
 		},
 	}
 
 	err = cm.ExecuteCommand(cmd)
 	if err != nil {
 		return fmt.Errorf("failed to update topic metadata: %w", err)
-	}
-
-	log.Printf("Topic metadata updated for %s, now starting Raft groups", topicName)
-
-	// Then, start Raft groups after metadata is committed
-	err = partitionAssigner.StartPartitionRaftGroups(assignments)
-	if err != nil {
-		// If Raft groups fail to start, we should clean up the metadata
-		log.Printf("Failed to start Raft groups for topic %s, attempting cleanup: %v", topicName, err)
-		// Note: In production, we might want to implement a cleanup mechanism
-		return fmt.Errorf("failed to start partition Raft groups: %w", err)
 	}
 
 	log.Printf("Topic %s created successfully with %d partitions", topicName, len(assignments))
@@ -578,7 +541,10 @@ func (cm *ControllerManager) CreateTopic(topicName string, partitions int32, rep
 // DeleteTopic deletes an existing topic (ONLY for Controller Leader)
 func (cm *ControllerManager) DeleteTopic(topicName string) error {
 	if !cm.isLeader() {
-		return fmt.Errorf("only controller leader can delete topics")
+		return &errors.TypedError{
+			Type:    errors.ControllerError,
+			Message: "only controller leader can delete topics",
+		}
 	}
 
 	log.Printf("Controller Leader deleting topic %s", topicName)
@@ -652,10 +618,28 @@ func (cm *ControllerManager) GetTopicMetadata(topicName string) (*raft.TopicMeta
 	return cm.GetTopic(topicName)
 }
 
+// GetMetadata gets the complete cluster metadata
+func (cm *ControllerManager) GetMetadata() (*raft.ClusterMetadata, error) {
+	result, err := cm.QueryMetadata(protocol.RaftQueryGetClusterMetadata, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get cluster metadata: %v", err)
+	}
+
+	var metadata raft.ClusterMetadata
+	if err := json.Unmarshal(result, &metadata); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal cluster metadata: %v", err)
+	}
+
+	return &metadata, nil
+}
+
 // JoinGroup handles a member joining a consumer group
 func (cm *ControllerManager) JoinGroup(groupID, memberID string) error {
 	if !cm.isLeader() {
-		return fmt.Errorf("not controller leader")
+		return &errors.TypedError{
+			Type:    errors.ControllerError,
+			Message: errors.ControllerNotAvailableMsg,
+		}
 	}
 
 	cmd := &raft.ControllerCommand{
@@ -674,7 +658,10 @@ func (cm *ControllerManager) JoinGroup(groupID, memberID string) error {
 // LeaveGroup handles a member leaving a consumer group
 func (cm *ControllerManager) LeaveGroup(groupID, memberID string) error {
 	if !cm.isLeader() {
-		return fmt.Errorf("not controller leader")
+		return &errors.TypedError{
+			Type:    errors.ControllerError,
+			Message: errors.ControllerNotAvailableMsg,
+		}
 	}
 
 	cmd := &raft.ControllerCommand{
@@ -716,13 +703,19 @@ func (cm *ControllerManager) GetPartitionLeader(topic string, partition int32) (
 		return leader, nil
 	}
 
-	return "", fmt.Errorf("partition leader not found")
+	return "", &errors.TypedError{
+		Type:    errors.PartitionLeaderError,
+		Message: "partition leader not found",
+	}
 }
 
 // MigrateLeader migrates partition leader
 func (cm *ControllerManager) MigrateLeader(partitionKey, newLeader string) error {
 	if !cm.isLeader() {
-		return fmt.Errorf("not controller leader")
+		return &errors.TypedError{
+			Type:    errors.ControllerError,
+			Message: errors.ControllerNotAvailableMsg,
+		}
 	}
 
 	assignment, err := cm.getPartitionAssignment(partitionKey)
@@ -731,7 +724,10 @@ func (cm *ControllerManager) MigrateLeader(partitionKey, newLeader string) error
 	}
 
 	if !cm.isValidReplica(assignment, newLeader) {
-		return fmt.Errorf("broker %s is not a replica of partition %s", newLeader, partitionKey)
+		return &errors.TypedError{
+			Type:    errors.PartitionLeaderError,
+			Message: fmt.Sprintf("broker %s is not a replica of partition %s", newLeader, partitionKey),
+		}
 	}
 
 	if cm.broker.raftManager == nil {
@@ -748,7 +744,11 @@ func (cm *ControllerManager) executeDirectLeaderTransfer(assignment *raft.Partit
 
 	err := cm.broker.raftManager.TransferLeadership(assignment.RaftGroupID, targetNodeID)
 	if err != nil {
-		return fmt.Errorf("failed to transfer leadership: %w", err)
+		return &errors.TypedError{
+			Type:    errors.LeadershipError,
+			Message: fmt.Sprintf("failed to transfer leadership: %v", err),
+			Cause:   err,
+		}
 	}
 
 	log.Printf("Successfully initiated leader transfer for partition %s (group %d) to broker %s",
@@ -871,7 +871,7 @@ func (hc *HealthChecker) performHealthCheck() {
 		if !broker.RegisteredAt.IsZero() && time.Since(broker.RegisteredAt) < 300*time.Second {
 			graceTime = 300 * time.Second
 		}
-		
+
 		// Check if broker hasn't sent heartbeat in too long
 		if time.Since(broker.LastSeen) > graceTime {
 			log.Printf("Broker %s appears to be unhealthy, last seen: %v", brokerID, broker.LastSeen)
@@ -997,8 +997,8 @@ func (cm *ControllerManager) assignmentsToMap(assignments []*raft.PartitionAssig
 	for _, assignment := range assignments {
 		assignmentMap := map[string]interface{}{
 			"topic_name":       assignment.TopicName,
-			"partition_id":     float64(assignment.PartitionID),
-			"raft_group_id":    float64(assignment.RaftGroupID),
+			"partition_id":     assignment.PartitionID,
+			"raft_group_id":    fmt.Sprintf("%d", assignment.RaftGroupID), 
 			"replicas":         assignment.Replicas,
 			"leader":           assignment.Leader,
 			"preferred_leader": assignment.PreferredLeader,

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net"
 	"time"
+
+	typederrors "github.com/issac1998/go-queue/internal/errors"
 )
 
 // ProtocolVersion defines the current version of the communication protocol
@@ -49,12 +51,12 @@ const (
 const (
 	ErrorNone = 0
 
-	ErrorInvalidRequest       = 1
-	ErrorInvalidTopic         = 2
-	ErrorUnknownPartition     = 3
-	ErrorInvalidMessage       = 4
-	ErrorMessageTooLarge      = 5
-	ErrorOffsetOutOfRange     = 6
+	ErrorInvalidRequest        = 1
+	ErrorInvalidTopic          = 2
+	ErrorUnknownPartition      = 3
+	ErrorInvalidMessage        = 4
+	ErrorMessageTooLarge       = 5
+	ErrorOffsetOutOfRange      = 6
 	ErrorInvalidSequenceNumber = 7
 
 	// Broker and network errors
@@ -192,12 +194,12 @@ const (
 // This replicates the simple and effective logic from client/client_connect.go
 func ConnectToSpecificBroker(brokerAddr string, timeout time.Duration) (net.Conn, error) {
 	if brokerAddr == "" {
-		return nil, fmt.Errorf("failed to connect to broker: missing address")
+		return nil, typederrors.NewTypedError(typederrors.GeneralError, "failed to connect to broker: missing address", nil)
 	}
 
 	conn, err := net.DialTimeout("tcp", brokerAddr, timeout)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to broker %s: %v", brokerAddr, err)
+		return nil, typederrors.NewTypedError(typederrors.GeneralError, fmt.Sprintf("failed to connect to broker %s", brokerAddr), err)
 	}
 
 	return conn, nil

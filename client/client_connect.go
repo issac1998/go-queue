@@ -8,6 +8,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/issac1998/go-queue/internal/errors"
 	"github.com/issac1998/go-queue/internal/protocol"
 )
 
@@ -33,12 +34,19 @@ func (c *Client) connectToController() (net.Conn, error) {
 	}
 
 	if err := c.DiscoverController(); err != nil {
-		return nil, fmt.Errorf("failed to discover controller: %v", err)
+		return nil, &errors.TypedError{
+			Type:    errors.ControllerError,
+			Message: "failed to discover controller",
+			Cause:   err,
+		}
 	}
 
 	controllerAddr = c.GetControllerAddr()
 	if controllerAddr == "" {
-		return nil, fmt.Errorf("no controller address available after discovery")
+		return nil, &errors.TypedError{
+			Type:    errors.ControllerError,
+			Message: errors.ControllerNotAvailableMsg,
+		}
 	}
 
 	return c.connectAndVerifyController(controllerAddr)
@@ -51,19 +59,31 @@ func (c *Client) connectAndVerifyController(brokerAddr string) (net.Conn, error)
 	// First verify with a separate connection
 	verifyConn, err := net.DialTimeout("tcp", brokerAddr, c.timeout)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to %s for verification: %v", brokerAddr, err)
+		return nil, &errors.TypedError{
+			Type:    errors.ConnectionError,
+			Message: fmt.Sprintf("failed to connect to %s for verification", brokerAddr),
+			Cause:   err,
+		}
 	}
 
 	if err := c.verifyControllerLeader(verifyConn); err != nil {
 		verifyConn.Close()
-		return nil, fmt.Errorf("broker %s is not controller leader: %v", brokerAddr, err)
+		return nil, &errors.TypedError{
+			Type:    errors.ControllerError,
+			Message: fmt.Sprintf("broker %s is not controller leader", brokerAddr),
+			Cause:   err,
+		}
 	}
 	verifyConn.Close()
 
 	// Now create a fresh connection for actual requests
 	conn, err := net.DialTimeout("tcp", brokerAddr, c.timeout)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to %s: %v", brokerAddr, err)
+		return nil, &errors.TypedError{
+			Type:    errors.ConnectionError,
+			Message: fmt.Sprintf("failed to connect to %s", brokerAddr),
+			Cause:   err,
+		}
 	}
 
 	return conn, nil
@@ -96,7 +116,10 @@ func (c *Client) verifyControllerLeader(conn net.Conn) error {
 
 	isController := string(responseData) == "true"
 	if !isController {
-		return fmt.Errorf("broker is not controller leader")
+		return &errors.TypedError{
+			Type:    errors.ControllerError,
+			Message: errors.ControllerNotAvailableMsg,
+		}
 	}
 
 	return nil
