@@ -1,8 +1,0 @@
-2025/08/18 01:21:15 Client log output to file: logs/client-create.log
-2025/08/18 01:21:15 Go Queue client starting - Broker: localhost:9092, Command: create-topic
-2025/08/18 01:21:15 Starting to create topic: test-topic-from-config
-2025/08/18 01:21:15 Topic 'test-topic-from-config' created successfully
-2025/08/18 01:29:56 Client log output to file: logs/client-create.log
-2025/08/18 01:29:56 Go Queue client starting - Broker: localhost:9092, Command: create-topic
-2025/08/18 01:29:56 Starting to create topic: test-topic-from-config
-2025/08/18 01:29:56 Topic 'test-topic-from-config' created successfully

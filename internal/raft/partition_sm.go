@@ -5,19 +5,26 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"path/filepath"
-	"strconv"
 	"sync"
 	"time"
 
 	"github.com/issac1998/go-queue/internal/compression"
 	"github.com/issac1998/go-queue/internal/deduplicator"
+	"github.com/issac1998/go-queue/internal/delayed"
 	typederrors "github.com/issac1998/go-queue/internal/errors"
 	"github.com/issac1998/go-queue/internal/ordering"
-	"github.com/issac1998/go-queue/internal/protocol"
 	"github.com/issac1998/go-queue/internal/storage"
+	"github.com/issac1998/go-queue/internal/transaction"
 	"github.com/lni/dragonboat/v3/statemachine"
 )
+
+// RaftManagerInterface defines the interface for Raft manager operations
+type RaftManagerInterface interface {
+	IsLeader(groupID uint64) bool
+	GetLeaderID(groupID uint64) (uint64, bool, error)
+}
 
 // ProduceMessage represents a message to be produced
 type ProduceMessage struct {
@@ -103,9 +110,16 @@ type PartitionCommand struct {
 
 // Command types for partition operations
 const (
-	CmdProduceMessage = "produce_message"
-	CmdProduceBatch   = "produce_batch"
-	CmdCleanup        = "cleanup"
+	CmdProduceMessage             = "produce_message"
+	CmdProduceBatch               = "produce_batch"
+	CmdCleanup                    = "cleanup"
+	CmdStoreDelayedMessage        = "store_delayed_message"
+	CmdUpdateDelayedMessage       = "update_delayed_message"
+	CmdDeleteDelayedMessage       = "delete_delayed_message"
+	CmdBatchUpdateDelayedMessages = "batch_update_delayed_messages"
+	CmdStoreHalfMessage           = "store_half_message"
+	CmdCommitHalfMessage          = "commit_half_message"
+	CmdRollbackHalfMessage        = "rollback_half_message"
 )
 
 // ProduceBatchCommand represents a batch of messages to be produced
@@ -139,19 +153,35 @@ type PartitionStateMachine struct {
 	PartitionID int32
 	DataDir     string
 
-	// Storage components
+	// Storage
 	partition *storage.Partition
 	mu        sync.RWMutex
 
-	// Message processing components
+	// Compression
 	compressor compression.Compressor
 
-	// Deduplicator components
+	// Deduplication
 	DeduplicatorManager *deduplicator.DeduplicatorManager
 	deduplicatorEnabled bool
 
-	// Ordering components
+	// Ordering
 	orderedMessageManager *ordering.OrderedMessageManager
+
+	// Delayed messages
+	delayedMessageStorage delayed.DelayedMessageStorage
+
+	// Transaction support
+	halfMessageStorage HalfMessageStorage             // 新增：存储 halfMessage
+	transactionChecker transaction.TransactionChecker // 新增：事务回查器
+
+	// Raft integration for leader checking
+	raftManager RaftManagerInterface // 新增：Raft管理器接口
+	raftGroupID uint64               // 新增：当前分区对应的Raft组ID
+
+	// Cleanup task management
+	cleanupTicker   *time.Ticker  // 新增：定时清理任务
+	cleanupStopChan chan struct{} // 新增：停止清理任务的通道
+	cleanupInterval time.Duration // 新增：清理间隔
 
 	// Metrics
 	messageCount int64
@@ -161,6 +191,28 @@ type PartitionStateMachine struct {
 
 	// State
 	isReady bool
+
+	// Logging
+	logger *log.Logger
+}
+
+// HalfMessageRecord 表示存储在 state machine 中的 halfMessage 记录
+type HalfMessageRecord struct {
+	TransactionID string            `json:"transaction_id"`
+	Topic         string            `json:"topic"`
+	Partition     int32             `json:"partition"`
+	Key           []byte            `json:"key,omitempty"`
+	Value         []byte            `json:"value"`
+	Headers       map[string]string `json:"headers,omitempty"`
+	CreatedAt     time.Time         `json:"created_at"`
+	Timeout       time.Duration     `json:"timeout"`
+	State         string            `json:"state"` // "prepared", "committed", "rolled_back"
+	ExpiresAt     time.Time         `json:"expires_at"`
+	// 新增：回查机制所需字段
+	ProducerGroup   string    `json:"producer_group"`   // 生产者组，用于找到对应的回查处理器
+	CallbackAddress string    `json:"callback_address"` // 回调地址，用于回查本地事务状态
+	CheckCount      int       `json:"check_count"`      // 回查次数计数
+	LastCheck       time.Time `json:"last_check"`       // 最后一次回查时间
 }
 
 // NewPartitionStateMachine creates a state machine for a partition
@@ -178,6 +230,20 @@ func NewPartitionStateMachine(topicName string, partitionID int32, dataDir strin
 		return nil, typederrors.NewTypedError(typederrors.StorageError, "failed to create partition storage", err)
 	}
 
+	// Create half message storage
+	halfMessageStorage, err := NewPebbleHalfMessageStorage(partitionDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create half message storage: %w", err)
+	}
+
+	// Create transaction checker
+	transactionChecker := transaction.NewDefaultTransactionChecker()
+
+	file, err := os.OpenFile(fmt.Sprintf("partition-%d", partitionID), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open log file: %v", err)
+	}
+
 	psm := &PartitionStateMachine{
 		TopicName:             topicName,
 		PartitionID:           partitionID,
@@ -187,779 +253,473 @@ func NewPartitionStateMachine(topicName string, partitionID int32, dataDir strin
 		DeduplicatorManager:   deduplicator.NewDeduplicatorManager(),
 		deduplicatorEnabled:   true,
 		orderedMessageManager: ordering.NewOrderedMessageManager(100, 30*time.Second), // 100 message window, 30s timeout
+		halfMessageStorage:    halfMessageStorage,                                     // 使用 PebbleDB 存储
+		transactionChecker:    transactionChecker,                                     // 事务回查器
+		cleanupInterval:       30 * time.Second,                                       // 默认30秒清理间隔
+		cleanupStopChan:       make(chan struct{}),
 		isReady:               true,
 		lastWrite:             time.Now(),
 		lastRead:              time.Now(),
+
+		logger: log.New(file, fmt.Sprintf("[partition-%d] ", partitionID), log.LstdFlags),
 	}
 
-	log.Printf("Created PartitionStateMachine for %s-%d", topicName, partitionID)
+	psm.logger.Printf("Created PartitionStateMachine for %s-%d", topicName, partitionID)
 	return psm, nil
 }
 
-// Update implements statemachine.IStateMachine interface
-// This is called when Raft log entries are applied
+// startHalfMessageCleanup 启动定时清理任务
+func (psm *PartitionStateMachine) startHalfMessageCleanup() {
+	psm.cleanupTicker = time.NewTicker(psm.cleanupInterval)
+
+	go func() {
+		defer psm.cleanupTicker.Stop()
+
+		for {
+			select {
+			case <-psm.cleanupTicker.C:
+				// 只有Leader才执行清理任务
+				if psm.raftManager != nil && psm.raftManager.IsLeader(psm.raftGroupID) {
+					psm.cleanupExpiredHalfMessages()
+				}
+			case <-psm.cleanupStopChan:
+				psm.logger.Printf("Half message cleanup task stopped for partition %s-%d",
+					psm.TopicName, psm.PartitionID)
+				return
+			}
+		}
+	}()
+
+	psm.logger.Printf("Started half message cleanup task for partition %s-%d with interval %v",
+		psm.TopicName, psm.PartitionID, psm.cleanupInterval)
+}
+
+// GetHalfMessage 获取半消息记录（用于测试）
+func (psm *PartitionStateMachine) GetHalfMessage(transactionID string) (*HalfMessageRecord, bool) {
+	psm.mu.RLock()
+	defer psm.mu.RUnlock()
+
+	record, exists, err := psm.halfMessageStorage.Get(transactionID)
+	if err != nil || !exists {
+		return nil, false
+	}
+	return record, true
+}
+
+// CleanupExpiredHalfMessages 清理过期的半消息（公共方法，用于测试）
+func (psm *PartitionStateMachine) CleanupExpiredHalfMessages() int {
+	psm.mu.Lock()
+	defer psm.mu.Unlock()
+
+	// 获取过期的半消息
+	expiredMessages, err := psm.halfMessageStorage.GetExpired()
+	if err != nil {
+		psm.logger.Printf("Failed to get expired half messages: %v", err)
+		return 0
+	}
+
+	cleanedCount := 0
+	for _, record := range expiredMessages {
+		// 删除过期的半消息
+		err := psm.halfMessageStorage.Delete(record.TransactionID)
+		if err != nil {
+			psm.logger.Printf("Failed to delete expired half message %s: %v",
+				record.TransactionID, err)
+			continue
+		}
+		cleanedCount++
+	}
+
+	return cleanedCount
+}
+
+// commitHalfMessage 提交半消息为正式消息
+func (psm *PartitionStateMachine) commitHalfMessage(record *HalfMessageRecord) error {
+	// 构造消息数据（将key和value合并为一个数据包）
+	messageData := record.Value
+
+	// 将消息写入分区存储
+	if psm.partition != nil {
+		offset, err := psm.partition.Append(messageData, time.Now())
+		if err != nil {
+			return fmt.Errorf("failed to append message to partition: %w", err)
+		}
+
+		psm.logger.Printf("Successfully committed half message %s to partition at offset %d",
+			record.TransactionID, offset)
+
+		// 更新统计信息
+		psm.messageCount++
+		psm.bytesStored += int64(len(messageData))
+		psm.lastWrite = time.Now()
+	} else {
+		return fmt.Errorf("partition storage not available")
+	}
+
+	return nil
+}
+
+// cleanupExpiredHalfMessages 清理过期的半消息（私有方法，只由定时任务调用）
+func (psm *PartitionStateMachine) cleanupExpiredHalfMessages() {
+	psm.mu.Lock()
+	defer psm.mu.Unlock()
+
+	// 检查当前节点是否为Leader
+	if psm.raftManager != nil && psm.raftGroupID != 0 {
+		isLeader := psm.raftManager.IsLeader(psm.raftGroupID)
+		if !isLeader {
+			psm.logger.Printf("Skipping half message cleanup: current node is not leader for group %d",
+				psm.raftGroupID)
+			return
+		}
+		psm.logger.Printf("Performing half message cleanup as leader for group %d", psm.raftGroupID)
+	} else {
+		psm.logger.Printf("Warning: Raft manager or group ID not set, proceeding with cleanup")
+	}
+
+	// 获取过期的半消息
+	expiredMessages, err := psm.halfMessageStorage.GetExpired()
+	if err != nil {
+		psm.logger.Printf("Failed to get expired half messages: %v", err)
+		return
+	}
+
+	if len(expiredMessages) == 0 {
+		return
+	}
+
+	psm.logger.Printf("Found %d expired half messages to process", len(expiredMessages))
+
+	for _, record := range expiredMessages {
+		// 检查是否超过最大回查次数
+		maxCheckCount := 3 // 可以配置化
+		if record.CheckCount >= maxCheckCount {
+			psm.logger.Printf("Half message %s exceeded max check count (%d), deleting",
+				record.TransactionID, maxCheckCount)
+
+			if err := psm.halfMessageStorage.Delete(record.TransactionID); err != nil {
+				psm.logger.Printf("Failed to delete expired half message %s: %v",
+					record.TransactionID, err)
+			}
+			continue
+		}
+
+		// 使用现有的TransactionChecker进行回查
+		if psm.transactionChecker != nil {
+			// 更新回查计数和时间
+			record.CheckCount++
+			record.LastCheck = time.Now()
+
+			// 构造HalfMessage用于回查
+			halfMessage := transaction.HalfMessage{
+				TransactionID: transaction.TransactionID(record.TransactionID),
+				Topic:         record.Topic,
+				Partition:     record.Partition,
+				Key:           record.Key,
+				Value:         record.Value,
+				Headers:       record.Headers,
+				ProducerGroup: record.ProducerGroup,
+				CreatedAt:     record.CreatedAt,
+				Timeout:       record.Timeout,
+				CheckCount:    record.CheckCount,
+				LastCheck:     record.LastCheck,
+			}
+
+			// 执行事务状态回查
+			state := psm.transactionChecker.CheckTransactionState(
+				transaction.TransactionID(record.TransactionID),
+				halfMessage,
+			)
+
+			psm.logger.Printf("Transaction check result for %s: %v",
+				record.TransactionID, state)
+
+			// 根据回查结果处理事务
+			switch state {
+			case transaction.StateCommit:
+				// 提交事务：将半消息转换为正式消息
+				psm.logger.Printf("Committing transaction %s", record.TransactionID)
+				if err := psm.commitHalfMessage(record); err != nil {
+					psm.logger.Printf("Failed to commit half message %s: %v",
+						record.TransactionID, err)
+				} else {
+					// 提交成功，删除半消息记录
+					if err := psm.halfMessageStorage.Delete(record.TransactionID); err != nil {
+						psm.logger.Printf("Failed to delete committed half message %s: %v",
+							record.TransactionID, err)
+					}
+				}
+
+			case transaction.StateRollback:
+				// 回滚事务：直接删除半消息
+				psm.logger.Printf("Rolling back transaction %s", record.TransactionID)
+				if err := psm.halfMessageStorage.Delete(record.TransactionID); err != nil {
+					psm.logger.Printf("Failed to delete rolled back half message %s: %v",
+						record.TransactionID, err)
+				}
+
+			case transaction.StateUnknown:
+				// 状态未知：更新回查计数，等待下次检查
+				psm.logger.Printf("Transaction %s state unknown, will retry later", record.TransactionID)
+				if updateErr := psm.halfMessageStorage.Update(record.TransactionID, record); updateErr != nil {
+					psm.logger.Printf("Failed to update half message record %s: %v",
+						record.TransactionID, updateErr)
+				}
+
+			default:
+				psm.logger.Printf("Unknown transaction state %v for %s", state, record.TransactionID)
+				// 对于未知状态，也更新记录等待下次检查
+				if updateErr := psm.halfMessageStorage.Update(record.TransactionID, record); updateErr != nil {
+					psm.logger.Printf("Failed to update half message record %s: %v",
+						record.TransactionID, updateErr)
+				}
+			}
+		}
+	}
+}
+
+// Stop 停止PartitionStateMachine
+func (psm *PartitionStateMachine) Stop() {
+	if psm.cleanupStopChan != nil {
+		close(psm.cleanupStopChan)
+	}
+
+	if psm.cleanupTicker != nil {
+		psm.cleanupTicker.Stop()
+	}
+
+	psm.logger.Printf("PartitionStateMachine stopped for %s-%d", psm.TopicName, psm.PartitionID)
+}
+
+// Update implements the statemachine.IStateMachine interface
 func (psm *PartitionStateMachine) Update(data []byte) (statemachine.Result, error) {
 	psm.mu.Lock()
 	defer psm.mu.Unlock()
 
 	var cmd PartitionCommand
 	if err := json.Unmarshal(data, &cmd); err != nil {
-		log.Printf("Failed to unmarshal partition command: %v", err)
-		return statemachine.Result{Value: 0}, typederrors.NewTypedError(typederrors.GeneralError, "failed to unmarshal partition command", err)
+		return statemachine.Result{}, fmt.Errorf("failed to unmarshal command: %w", err)
 	}
 
 	switch cmd.Type {
-	case CmdProduceMessage:
-		return psm.handleProduceMessage(cmd.Data)
-	case CmdProduceBatch:
-		return psm.handleProduceBatch(cmd.Data)
-	case CmdCleanup:
-		return psm.handleCleanup(cmd.Data)
+	case CmdStoreHalfMessage:
+		return psm.handleStoreHalfMessage(cmd.Data)
+	case CmdCommitHalfMessage:
+		return psm.handleCommitHalfMessage(cmd.Data)
+	case CmdRollbackHalfMessage:
+		return psm.handleRollbackHalfMessage(cmd.Data)
 	default:
-		err := fmt.Errorf("unknown command type: %s", cmd.Type)
-		log.Printf("PartitionStateMachine error: %v", err)
-		return statemachine.Result{Value: 0}, err
+		return statemachine.Result{}, fmt.Errorf("unknown command type: %s", cmd.Type)
 	}
 }
 
-// handleProduceMessage handles message production with ordering support
-func (psm *PartitionStateMachine) handleProduceMessage(data map[string]interface{}) (statemachine.Result, error) {
-	// Parse message data
-	var msg ProduceMessage
-	msgBytes, err := json.Marshal(data["message"])
-	if err != nil {
-		return statemachine.Result{Value: 0}, typederrors.NewTypedError(typederrors.GeneralError, "failed to marshal message", err)
-	}
-
-	if err := json.Unmarshal(msgBytes, &msg); err != nil {
-		return statemachine.Result{Value: 0}, typederrors.NewTypedError(typederrors.GeneralError, "failed to unmarshal message", err)
-	}
-
-	// Handle messages with sequence numbers using ordered processing (only for async IO producers)
-	if psm.deduplicatorEnabled && msg.ProducerID != "" && msg.SequenceNumber > 0 && msg.AsyncIO {
-		deduplicator := psm.DeduplicatorManager.GetOrCreatededuplicator(msg.ProducerID)
-
-		// Check for duplicate messages first
-		if deduplicator.IsDuplicateSequenceNumber(psm.PartitionID, msg.SequenceNumber, msg.AsyncIO) {
-			log.Printf("Duplicate sequence number %d for producer %s on partition %d",
-				msg.SequenceNumber, msg.ProducerID, psm.PartitionID)
-
-			lastOffset := deduplicator.GetLastSequenceNumber(psm.PartitionID)
-			result := WriteResult{
-				Offset:    lastOffset,
-				Timestamp: msg.Timestamp,
-			}
-			resultBytes, _ := json.Marshal(result)
-			return statemachine.Result{
-				Value: uint64(lastOffset),
-				Data:  resultBytes,
-			}, nil
-		}
-
-		// Validate sequence number
-		if !deduplicator.IsValidSequenceNumber(psm.PartitionID, msg.SequenceNumber, msg.AsyncIO) {
-
-			result := WriteResult{
-				Error: fmt.Sprintf("Invalid sequence number %d for AsyncIO producer %s",
-					msg.SequenceNumber, msg.ProducerID),
-			}
-			resultBytes, _ := json.Marshal(result)
-			return statemachine.Result{
-				Value: 0,
-				Data:  resultBytes,
-			}, nil
-		}
-
-		if msg.AsyncIO {
-			readyMessages, err := psm.orderedMessageManager.ProcessMessage(
-				psm.PartitionID, msg.ProducerID, msg.SequenceNumber, &msg)
-			if err != nil {
-				// Message is outside window or other ordering error,nor a really error
-				result := WriteResult{
-					Error: fmt.Sprintf("Ordering error for producer %s seq %d: %v",
-						msg.ProducerID, msg.SequenceNumber, err),
-				}
-				resultBytes, _ := json.Marshal(result)
-				return statemachine.Result{
-					Value: 0,
-					Data:  resultBytes,
-				}, nil
-			}
-
-			if len(readyMessages) > 0 {
-				return psm.processOrderedMessages(readyMessages)
-			} else {
-				// this is not a error
-				result := WriteResult{
-					Offset:    -1,
-					Timestamp: msg.Timestamp,
-				}
-				resultBytes, _ := json.Marshal(result)
-				return statemachine.Result{
-					Value: 0,
-					Data:  resultBytes,
-				}, nil
-			}
-		}
-	}
-
-	// non-AsyncIO messages
-	if psm.deduplicatorEnabled && msg.ProducerID != "" && msg.SequenceNumber > 0 && !msg.AsyncIO {
-		deduplicator := psm.DeduplicatorManager.GetOrCreatededuplicator(msg.ProducerID)
-
-		// Check for duplicate messages first
-		if deduplicator.IsDuplicateSequenceNumber(psm.PartitionID, msg.SequenceNumber, msg.AsyncIO) {
-			log.Printf("Duplicate sequence number %d for producer %s on partition %d",
-				msg.SequenceNumber, msg.ProducerID, psm.PartitionID)
-
-			lastOffset := deduplicator.GetLastSequenceNumber(psm.PartitionID)
-			result := WriteResult{
-				Offset:    lastOffset,
-				Timestamp: msg.Timestamp,
-			}
-			resultBytes, _ := json.Marshal(result)
-			return statemachine.Result{
-				Value: uint64(lastOffset),
-				Data:  resultBytes,
-			}, nil
-		}
-
-		// Validate sequence number for non-AsyncIO (must be strictly sequential)
-		if !deduplicator.IsValidSequenceNumber(psm.PartitionID, msg.SequenceNumber, msg.AsyncIO) {
-			log.Printf("Invalid sequence number %d for producer %s on partition %d, expected %d",
-				msg.SequenceNumber, msg.ProducerID, psm.PartitionID,
-				deduplicator.GetLastSequenceNumber(psm.PartitionID)+1)
-
-			result := WriteResult{
-				Error: fmt.Sprintf("Invalid sequence number %d, expected %d",
-					msg.SequenceNumber, deduplicator.GetLastSequenceNumber(psm.PartitionID)+1),
-			}
-			resultBytes, _ := json.Marshal(result)
-			return statemachine.Result{
-				Value: 0,
-				Data:  resultBytes,
-			}, nil
-		}
-	}
-
-	// Store message
-	offset, err := psm.storeMessage(&msg)
-	if err != nil {
-		return statemachine.Result{Value: 0}, typederrors.NewTypedError(typederrors.StorageError, "failed to store message", err)
-	}
-
-	// Update producer state after successful write for deduplicator
-	if psm.deduplicatorEnabled && msg.ProducerID != "" && msg.SequenceNumber > 0 {
-		deduplicator := psm.DeduplicatorManager.GetOrCreatededuplicator(msg.ProducerID)
-		deduplicator.UpdateSequenceNumber(psm.PartitionID, msg.SequenceNumber)
-	}
-
-	result := WriteResult{
-		Offset:    offset,
-		Timestamp: msg.Timestamp,
-	}
-
-	resultBytes, err := json.Marshal(result)
-	if err != nil {
-		log.Printf("Failed to marshal write result: %v", err)
-		resultBytes = []byte(fmt.Sprintf(`{"offset":%d,"timestamp":"%s"}`, offset, msg.Timestamp.Format(time.RFC3339)))
-	}
-
-	return statemachine.Result{
-		Value: uint64(offset),
-		Data:  resultBytes,
-	}, nil
-}
-
-func (psm *PartitionStateMachine) processOrderedMessages(readyMessages []*ordering.PendingMessage) (statemachine.Result, error) {
-	var results []WriteResult
-	lastOffset := int64(-1)
-
-	for _, pendingMsg := range readyMessages {
-		msg, ok := pendingMsg.Data.(*ProduceMessage)
-		if !ok {
-			return statemachine.Result{Value: 0}, typederrors.NewTypedError(typederrors.GeneralError, "invalid message type in ordered processing", nil)
-		}
-
-		offset, err := psm.storeMessage(msg)
-		if err != nil {
-			return statemachine.Result{Value: 0}, typederrors.NewTypedError(typederrors.StorageError, "failed to store ordered message", err)
-		}
-
-		if psm.deduplicatorEnabled && msg.ProducerID != "" {
-			deduplicator := psm.DeduplicatorManager.GetOrCreatededuplicator(msg.ProducerID)
-			deduplicator.UpdateSequenceNumber(psm.PartitionID, msg.SequenceNumber)
-		}
-
-		results = append(results, WriteResult{
-			Offset:    offset,
-			Timestamp: msg.Timestamp,
-		})
-		lastOffset = offset
-	}
-
-	if len(results) > 0 {
-		resultBytes, _ := json.Marshal(results[len(results)-1])
-		return statemachine.Result{
-			Value: uint64(lastOffset),
-			Data:  resultBytes,
-		}, nil
-	}
-
-	return statemachine.Result{Value: 0}, typederrors.NewTypedError(typederrors.GeneralError, "no messages processed", nil)
-}
-
-func (psm *PartitionStateMachine) storeMessage(msg *ProduceMessage) (int64, error) {
-	messageData := StoredMessage{
-		Key:       msg.Key,
-		Value:     msg.Value,
-		Headers:   msg.Headers,
-		Timestamp: msg.Timestamp,
-	}
-
-	serializedMsg, err := json.Marshal(messageData)
-	if err != nil {
-		return 0, typederrors.NewTypedError(typederrors.GeneralError, "failed to serialize message", err)
-	}
-
-	var finalMsg []byte
-	if psm.compressor != nil && psm.compressor.Type() != compression.None {
-		if len(serializedMsg) >= 1024 {
-			compressedMsg, err := psm.compressor.Compress(serializedMsg)
-			if err != nil {
-				log.Printf("Compression failed, storing uncompressed: %v", err)
-				finalMsg = serializedMsg
-			} else {
-				finalMsg = make([]byte, 1+len(compressedMsg))
-				finalMsg[0] = byte(psm.compressor.Type())
-				copy(finalMsg[1:], compressedMsg)
-			}
-		} else {
-			finalMsg = make([]byte, 1+len(serializedMsg))
-			finalMsg[0] = byte(compression.None)
-			copy(finalMsg[1:], serializedMsg)
-		}
-	} else {
-		finalMsg = make([]byte, 1+len(serializedMsg))
-		finalMsg[0] = byte(compression.None)
-		copy(finalMsg[1:], serializedMsg)
-	}
-
-	offset, err := psm.partition.Append(finalMsg, msg.Timestamp)
-	if err != nil {
-		return 0, typederrors.NewTypedError(typederrors.StorageError, "failed to append message", err)
-	}
-
-	psm.messageCount++
-	psm.bytesStored += int64(len(serializedMsg))
-	psm.lastWrite = time.Now()
-
-	return offset, nil
-}
-
-func (psm *PartitionStateMachine) handleProduceBatch(data map[string]interface{}) (statemachine.Result, error) {
-	var batchCmd ProduceBatchCommand
-	batchCmdBytes, err := json.Marshal(data["batch"])
-	if err != nil {
-		return statemachine.Result{Value: protocol.ErrorInvalidRequest}, typederrors.NewTypedError(typederrors.GeneralError, "failed to marshal batch command", err)
-	}
-
-	if err := json.Unmarshal(batchCmdBytes, &batchCmd); err != nil {
-		return statemachine.Result{Value: protocol.ErrorInvalidRequest}, typederrors.NewTypedError(typederrors.GeneralError, "failed to unmarshal batch command", err)
-	}
-
-	results := make([]WriteResult, len(batchCmd.Messages))
-	for i, msg := range batchCmd.Messages {
-		if psm.deduplicatorEnabled && msg.ProducerID != "" && msg.SequenceNumber > 0 {
-			deduplicator := psm.DeduplicatorManager.GetOrCreatededuplicator(msg.ProducerID)
-			if deduplicator.IsDuplicateSequenceNumber(psm.PartitionID, msg.SequenceNumber, msg.AsyncIO) {
-				lastOffset := deduplicator.GetLastSequenceNumber(psm.PartitionID)
-				results[i] = WriteResult{
-					Offset:    lastOffset,
-					Timestamp: msg.Timestamp,
-				}
-				log.Printf("Duplicate sequence number %d detected for producer %s in batch message %d", msg.SequenceNumber, msg.ProducerID, i)
-				continue
-			}
-
-			if !deduplicator.IsValidSequenceNumber(psm.PartitionID, msg.SequenceNumber, msg.AsyncIO) {
-				results[i] = WriteResult{Error: fmt.Sprintf("invalid sequence number %d for producer %s in message %d", msg.SequenceNumber, msg.ProducerID, i)}
-				continue
-			}
-		}
-
-		messageData := StoredMessage{
-			Key:       msg.Key,
-			Value:     msg.Value,
-			Headers:   msg.Headers,
-			Timestamp: msg.Timestamp,
-		}
-
-		serializedMsg, err := json.Marshal(messageData)
-		if err != nil {
-			results[i] = WriteResult{Error: fmt.Sprintf("failed to serialize message %d: %v", i, err)}
-			continue
-		}
-
-		var finalMsg []byte
-		if psm.compressor != nil && psm.compressor.Type() != compression.None {
-			if len(serializedMsg) >= 1024 {
-				compressedMsg, err := psm.compressor.Compress(serializedMsg)
-				if err != nil {
-					results[i] = WriteResult{Error: fmt.Sprintf("compression failed for message %d: %v", i, err)}
-					log.Printf("Compression failed for message %d, storing uncompressed: %v", i, err)
-					finalMsg = serializedMsg
-				} else {
-					finalMsg = make([]byte, 1+len(compressedMsg))
-					finalMsg[0] = byte(psm.compressor.Type())
-					copy(finalMsg[1:], compressedMsg)
-
-					compressionRatio := float64(len(compressedMsg)) / float64(len(serializedMsg))
-					log.Printf("Message %d compressed: %d -> %d bytes (ratio: %.2f)",
-						i, len(serializedMsg), len(compressedMsg), compressionRatio)
-				}
-			} else {
-				finalMsg = make([]byte, 1+len(serializedMsg))
-				finalMsg[0] = byte(compression.None)
-				copy(finalMsg[1:], serializedMsg)
-			}
-		} else {
-			finalMsg = make([]byte, 1+len(serializedMsg))
-			finalMsg[0] = byte(compression.None)
-			copy(finalMsg[1:], serializedMsg)
-		}
-
-		offset, err := psm.partition.Append(finalMsg, msg.Timestamp)
-		if err != nil {
-			results[i] = WriteResult{Error: fmt.Sprintf("failed to append message %d: %v", i, err)}
-			log.Printf("Failed to append message %d: %v", i, err)
-			continue
-		}
-
-		if psm.deduplicatorEnabled && msg.ProducerID != "" {
-			deduplicator := psm.DeduplicatorManager.GetOrCreatededuplicator(msg.ProducerID)
-			deduplicator.UpdateSequenceNumber(psm.PartitionID, msg.SequenceNumber)
-		}
-
-		psm.messageCount++
-		psm.bytesStored += int64(len(serializedMsg))
-		psm.lastWrite = time.Now()
-
-		results[i] = WriteResult{
-			Offset:    offset,
-			Timestamp: msg.Timestamp,
-		}
-		log.Printf("Produced message %d to %s-%d at offset %d", i, psm.TopicName, psm.PartitionID, offset)
-	}
-
-	batchResult := BatchWriteResult{Results: results}
-	batchResultBytes, err := json.Marshal(batchResult)
-	if err != nil {
-		log.Printf("Failed to marshal batch write result: %v", err)
-		batchResultBytes = []byte(`{"results":[],"error":"failed to marshal results"}`)
-	}
-
-	log.Printf("Produced batch of %d messages to %s-%d", len(batchCmd.Messages), psm.TopicName, psm.PartitionID)
-
-	return statemachine.Result{
-		Value: 0,
-		Data:  batchResultBytes,
-	}, nil
-}
-
-// handleCleanup handles partition cleanup operations
-func (psm *PartitionStateMachine) handleCleanup(data map[string]interface{}) (statemachine.Result, error) {
-	// This would handle cleanup operations like log compaction
-	log.Printf("Performed cleanup on %s-%d", psm.TopicName, psm.PartitionID)
-
-	result := map[string]interface{}{
-		"status": "success",
-		"type":   "cleanup",
-	}
-
-	resultBytes, _ := json.Marshal(result)
-	return statemachine.Result{
-		Value: 1,
-		Data:  resultBytes,
-	}, nil
-}
-
-// Lookup implements statemachine.IStateMachine interface
-// This is used for read operations (queries)
-func (psm *PartitionStateMachine) Lookup(query interface{}) (interface{}, error) {
-	psm.mu.RLock()
-	defer psm.mu.RUnlock()
-
-	// Convert query to bytes if needed
-	var queryBytes []byte
-	switch q := query.(type) {
-	case []byte:
-		queryBytes = q
-	case string:
-		queryBytes = []byte(q)
-	default:
-		return nil, fmt.Errorf("invalid query type: %T", query)
-	}
-
-	// Try to parse as BatchFetchRequest first
-	var batchReq BatchFetchRequest
-	if err := json.Unmarshal(queryBytes, &batchReq); err == nil && len(batchReq.Requests) > 0 {
-		return psm.handleBatchFetchMessages(&batchReq)
-	}
-
-	var req FetchRequest
-	if err := json.Unmarshal(queryBytes, &req); err != nil {
-		return nil, typederrors.NewTypedError(typederrors.GeneralError, "failed to unmarshal fetch request", err)
-	}
-
-	return psm.handleFetchMessages(&req)
-}
-
-// handleBatchFetchMessages handles batch message fetching
-func (psm *PartitionStateMachine) handleBatchFetchMessages(req *BatchFetchRequest) (*BatchFetchResponse, error) {
-	if req.Topic != psm.TopicName || req.Partition != psm.PartitionID {
-		return &BatchFetchResponse{
-			Topic:     req.Topic,
-			Partition: req.Partition,
-			Results:   []FetchResult{},
-			ErrorCode: protocol.ErrorInvalidTopic,
-			Error:     "topic or partition mismatch",
-		}, nil
-	}
-
-	if len(req.Requests) == 0 {
-		return &BatchFetchResponse{
-			Topic:     req.Topic,
-			Partition: req.Partition,
-			Results:   []FetchResult{},
-			ErrorCode: 2, // Invalid request
-			Error:     "empty batch request",
-		}, nil
-	}
-
-	results := make([]FetchResult, len(req.Requests))
-	for i, fetchRange := range req.Requests {
-		messages, nextOffset, err := psm.readMessagesFromStorageWithCount(
-			fetchRange.Offset,
-			fetchRange.MaxBytes,
-			fetchRange.MaxCount,
-		)
-
-		if err != nil {
-			results[i] = FetchResult{
-				Messages:   []StoredMessage{},
-				NextOffset: fetchRange.Offset,
-				Error:      fmt.Sprintf("failed to read range %d: %v", i, err),
-			}
-			log.Printf("Failed to read messages for range %d: %v", i, err)
-		} else {
-			results[i] = FetchResult{
-				Messages:   messages,
-				NextOffset: nextOffset,
-			}
-		}
-	}
-
-	psm.lastRead = time.Now()
-
-	log.Printf("✅ Batch fetched %d ranges from %s-%d",
-		len(req.Requests), psm.TopicName, psm.PartitionID)
-
-	return &BatchFetchResponse{
-		Topic:     req.Topic,
-		Partition: req.Partition,
-		Results:   results,
-		ErrorCode: protocol.ErrorNone,
-	}, nil
-}
-
-// handleFetchMessages handles message fetching
-func (psm *PartitionStateMachine) handleFetchMessages(req *FetchRequest) (*FetchResponse, error) {
-	if req.Topic != psm.TopicName || req.Partition != psm.PartitionID {
-		return &FetchResponse{
-			Topic:     req.Topic,
-			Partition: req.Partition,
-			Messages:  []StoredMessage{},
-			ErrorCode: protocol.ErrorInvalidTopic,
-		}, nil
-	}
-
-	messages, nextOffset, err := psm.readMessagesFromStorage(req.Offset, req.MaxBytes)
-	if err != nil {
-		log.Printf("Failed to read messages: %v", err)
-		return &FetchResponse{
-			Topic:     req.Topic,
-			Partition: req.Partition,
-			Messages:  []StoredMessage{},
-			ErrorCode: protocol.ErrorFetchFailed,
-		}, nil
-	}
-
-	psm.lastRead = time.Now()
-
-	log.Printf("Fetched %d messages from %s-%d starting at offset %d",
-		len(messages), psm.TopicName, psm.PartitionID, req.Offset)
-
-	return &FetchResponse{
-		Topic:      req.Topic,
-		Partition:  req.Partition,
-		Messages:   messages,
-		NextOffset: nextOffset,
-		ErrorCode:  protocol.ErrorNone,
-	}, nil
-}
-
-// readMessagesFromStorage reads messages from the storage layer
-func (psm *PartitionStateMachine) readMessagesFromStorage(startOffset int64, maxBytes int32) ([]StoredMessage, int64, error) {
-	messages := []StoredMessage{}
-	currentOffset := startOffset
-	totalBytes := int32(0)
-
-	// Read messages until we hit the limit or run out of data
-	for totalBytes < maxBytes && len(messages) < 1000 { // Max 1000 messages per fetch
-		messageData, err := psm.partition.ReadAt(currentOffset)
-		if err != nil {
-			if err == storage.ErrOffsetOutOfRange {
-				break // No more messages
-			}
-			return nil, currentOffset, err
-		}
-
-		var actualMessageData []byte
-		if len(messageData) > 0 {
-			compressionType := compression.CompressionType(messageData[0])
-			if compressionType != compression.None {
-				// Message is compressed, decompress it
-				compressor, err := compression.GetCompressor(compressionType)
-				if err != nil {
-					log.Printf("Failed to get decompressor for type %d at offset %d: %v", compressionType, currentOffset, err)
-					currentOffset++
-					continue
-				}
-
-				decompressedData, err := compressor.Decompress(messageData[1:])
-				if err != nil {
-					log.Printf("Failed to decompress message at offset %d: %v", currentOffset, err)
-					currentOffset++
-					continue
-				}
-				actualMessageData = decompressedData
-			} else {
-				// Message is not compressed, skip the compression marker
-				actualMessageData = messageData[1:]
-			}
-		} else {
-			actualMessageData = messageData
-		}
-
-		// Deserialize message
-		var msg StoredMessage
-		if err := json.Unmarshal(actualMessageData, &msg); err != nil {
-			log.Printf("Failed to unmarshal stored message at offset %d: %v", currentOffset, err)
-			currentOffset++
-			continue
-		}
-
-		// Set the offset
-		msg.Offset = currentOffset
-
-		messages = append(messages, msg)
-		totalBytes += int32(len(messageData))
-		currentOffset++
-	}
-
-	return messages, currentOffset, nil
-}
-
-// readMessagesFromStorageWithCount reads messages from the storage layer with both bytes and count limits
-func (psm *PartitionStateMachine) readMessagesFromStorageWithCount(startOffset int64, maxBytes int32, maxCount int32) ([]StoredMessage, int64, error) {
-	messages := []StoredMessage{}
-	currentOffset := startOffset
-	totalBytes := int32(0)
-
-	if maxCount <= 0 {
-		maxCount = 1000
-	}
-
-	for totalBytes < maxBytes && int32(len(messages)) < maxCount {
-		messageData, err := psm.partition.ReadAt(currentOffset)
-		if err != nil {
-			if err == storage.ErrOffsetOutOfRange {
-				break
-			}
-			return nil, currentOffset, err
-		}
-
-		var actualMessageData []byte
-		if len(messageData) > 0 {
-			compressionType := compression.CompressionType(messageData[0])
-			if compressionType != compression.None {
-				compressor, err := compression.GetCompressor(compressionType)
-				if err != nil {
-					log.Printf("Failed to get decompressor for type %d at offset %d: %v", compressionType, currentOffset, err)
-					currentOffset++
-					continue
-				}
-
-				decompressedData, err := compressor.Decompress(messageData[1:])
-				if err != nil {
-					log.Printf("Failed to decompress message at offset %d: %v", currentOffset, err)
-					currentOffset++
-					continue
-				}
-				actualMessageData = decompressedData
-			} else {
-				actualMessageData = messageData[1:]
-			}
-		} else {
-			actualMessageData = messageData
-		}
-
-		var msg StoredMessage
-		if err := json.Unmarshal(actualMessageData, &msg); err != nil {
-			log.Printf("Failed to unmarshal stored message at offset %d: %v", currentOffset, err)
-			currentOffset++
-			continue
-		}
-
-		msg.Offset = currentOffset
-
-		messages = append(messages, msg)
-		totalBytes += int32(len(messageData))
-		currentOffset++
-	}
-
-	return messages, currentOffset, nil
-}
-
-// SaveSnapshot implements statemachine.IStateMachine interface
-func (psm *PartitionStateMachine) SaveSnapshot(w io.Writer, fc statemachine.ISnapshotFileCollection, done <-chan struct{}) error {
-	psm.mu.RLock()
-	defer psm.mu.RUnlock()
-
-	// Get producer states for persistence
-	deduplicators := psm.DeduplicatorManager.GetAlldeduplicators()
-
-	// Create snapshot metadata
-	snapshot := map[string]interface{}{
-		"topic_name":      psm.TopicName,
-		"partition_id":    psm.PartitionID,
-		"message_count":   psm.messageCount,
-		"bytes_stored":    psm.bytesStored,
-		"last_write":      psm.lastWrite,
-		"last_read":       psm.lastRead,
-		"producer_states": deduplicators,
-	}
-
-	// Write snapshot metadata
-	snapshotBytes, err := json.Marshal(snapshot)
-	if err != nil {
-		return typederrors.NewTypedError(typederrors.GeneralError, "failed to marshal snapshot", err)
-	}
-
-	if _, err := w.Write(snapshotBytes); err != nil {
-		return typederrors.NewTypedError(typederrors.GeneralError, "failed to write snapshot", err)
-	}
-
-	log.Printf("Saved snapshot for %s-%d with %d producer states", psm.TopicName, psm.PartitionID, len(deduplicators))
-	return nil
-}
-
-// RecoverFromSnapshot implements statemachine.IStateMachine interface
-func (psm *PartitionStateMachine) RecoverFromSnapshot(r io.Reader, files []statemachine.SnapshotFile, done <-chan struct{}) error {
-	psm.mu.Lock()
-	defer psm.mu.Unlock()
-
-	// Read snapshot data
-	snapshotBytes, err := io.ReadAll(r)
-	if err != nil {
-		return typederrors.NewTypedError(typederrors.GeneralError, "failed to read snapshot", err)
-	}
-
-	var snapshot map[string]interface{}
-	if err := json.Unmarshal(snapshotBytes, &snapshot); err != nil {
-		return typederrors.NewTypedError(typederrors.GeneralError, "failed to unmarshal snapshot", err)
-	}
-
-	// Restore state
-	if mc, ok := snapshot["message_count"].(float64); ok {
-		psm.messageCount = int64(mc)
-	}
-	if bs, ok := snapshot["bytes_stored"].(float64); ok {
-		psm.bytesStored = int64(bs)
-	}
-
-	if deduplicatorsData, ok := snapshot["producer_states"]; ok {
-		if err := psm.restorededuplicators(deduplicatorsData); err != nil {
-			log.Printf("Failed to restore producer states: %v", err)
-		}
-	}
-
-	log.Printf("Recovered from snapshot for %s-%d", psm.TopicName, psm.PartitionID)
-	return nil
-}
-
-func (psm *PartitionStateMachine) restorededuplicators(data interface{}) error {
-	statesMap, ok := data.(map[string]interface{})
+// handleStoreHalfMessage 处理存储半消息命令
+func (psm *PartitionStateMachine) handleStoreHalfMessage(data map[string]interface{}) (statemachine.Result, error) {
+	// 解析数据
+	transactionID, ok := data["transaction_id"].(string)
 	if !ok {
-		return typederrors.NewTypedError(typederrors.GeneralError, "invalid producer states data type", nil)
+		return statemachine.Result{}, fmt.Errorf("missing or invalid transaction_id")
 	}
 
-	restoredCount := 0
-	for producerID, stateData := range statesMap {
-		stateMap, ok := stateData.(map[string]interface{})
-		if !ok {
-			continue
+	topic, ok := data["topic"].(string)
+	if !ok {
+		return statemachine.Result{}, fmt.Errorf("missing or invalid topic")
+	}
+
+	partition, ok := data["partition"].(float64) // JSON numbers are float64
+	if !ok {
+		return statemachine.Result{}, fmt.Errorf("missing or invalid partition")
+	}
+
+	// 处理key和value，可能是字符串或字节数组
+	var key, value []byte
+	if keyData, exists := data["key"]; exists {
+		switch k := keyData.(type) {
+		case string:
+			key = []byte(k)
+		case []byte:
+			key = k
 		}
+	}
 
-		deduplicator := deduplicator.NewDeduplicator(producerID)
+	if valueData, exists := data["value"]; exists {
+		switch v := valueData.(type) {
+		case string:
+			value = []byte(v)
+		case []byte:
+			value = v
+		default:
+			return statemachine.Result{}, fmt.Errorf("invalid value type")
+		}
+	}
 
-		if lastSeqData, exists := stateMap["last_sequence_num"]; exists {
-			if lastSeqMap, ok := lastSeqData.(map[string]interface{}); ok {
-				for partStr, seqVal := range lastSeqMap {
-					if partition, err := strconv.ParseInt(partStr, 10, 32); err == nil {
-						if seqNum, ok := seqVal.(float64); ok {
-							deduplicator.UpdateSequenceNumber(int32(partition), int64(seqNum))
-						}
-					}
+	// 解析headers
+	var headers map[string]string
+	if headersData, exists := data["headers"]; exists {
+		if h, ok := headersData.(map[string]interface{}); ok {
+			headers = make(map[string]string)
+			for k, v := range h {
+				if str, ok := v.(string); ok {
+					headers[k] = str
 				}
 			}
 		}
-
-		psm.DeduplicatorManager.Setdeduplicator(producerID, deduplicator)
-		restoredCount++
 	}
 
-	log.Printf("Restored %d producer states for partition %s-%d", restoredCount, psm.TopicName, psm.PartitionID)
+	// 解析timeout
+	var timeout time.Duration = 30 * time.Second // 默认值
+	if timeoutStr, exists := data["timeout"].(string); exists {
+		if t, err := time.ParseDuration(timeoutStr); err == nil {
+			timeout = t
+		}
+	}
+
+	state, _ := data["state"].(string)
+	if state == "" {
+		state = "prepared"
+	}
+
+	producerGroup, _ := data["producer_group"].(string)
+	callbackAddress, _ := data["callback_address"].(string)
+
+	// 创建半消息记录
+	now := time.Now()
+	record := &HalfMessageRecord{
+		TransactionID:   transactionID,
+		Topic:           topic,
+		Partition:       int32(partition),
+		Key:             key,
+		Value:           value,
+		Headers:         headers,
+		CreatedAt:       now,
+		Timeout:         timeout,
+		State:           state,
+		ExpiresAt:       now.Add(timeout),
+		ProducerGroup:   producerGroup,
+		CallbackAddress: callbackAddress,
+		CheckCount:      0,
+		LastCheck:       time.Time{},
+	}
+
+	// 存储半消息
+	if err := psm.halfMessageStorage.Store(transactionID, record); err != nil {
+		return statemachine.Result{}, fmt.Errorf("failed to store half message: %w", err)
+	}
+
+	psm.logger.Printf("Stored half message for transaction %s", transactionID)
+	return statemachine.Result{Value: 1}, nil
+}
+
+// handleCommitHalfMessage 处理提交半消息命令
+func (psm *PartitionStateMachine) handleCommitHalfMessage(data map[string]interface{}) (statemachine.Result, error) {
+	transactionID, ok := data["transaction_id"].(string)
+	if !ok {
+		return statemachine.Result{}, fmt.Errorf("missing or invalid transaction_id")
+	}
+
+	// 获取半消息记录
+	record, exists, err := psm.halfMessageStorage.Get(transactionID)
+	if err != nil {
+		return statemachine.Result{}, fmt.Errorf("failed to get half message: %w", err)
+	}
+	if !exists {
+		return statemachine.Result{}, fmt.Errorf("half message not found: %s", transactionID)
+	}
+
+	// 提交半消息
+	if err := psm.commitHalfMessage(record); err != nil {
+		return statemachine.Result{}, fmt.Errorf("failed to commit half message: %w", err)
+	}
+
+	// 删除半消息记录
+	if err := psm.halfMessageStorage.Delete(transactionID); err != nil {
+		return statemachine.Result{}, fmt.Errorf("failed to delete half message: %w", err)
+	}
+
+	psm.logger.Printf("Committed half message for transaction %s", transactionID)
+	return statemachine.Result{Value: 1}, nil
+}
+
+// handleRollbackHalfMessage 处理回滚半消息命令
+func (psm *PartitionStateMachine) handleRollbackHalfMessage(data map[string]interface{}) (statemachine.Result, error) {
+	transactionID, ok := data["transaction_id"].(string)
+	if !ok {
+		return statemachine.Result{}, fmt.Errorf("missing or invalid transaction_id")
+	}
+
+	// 删除半消息记录
+	if err := psm.halfMessageStorage.Delete(transactionID); err != nil {
+		return statemachine.Result{}, fmt.Errorf("failed to delete half message: %w", err)
+	}
+
+	psm.logger.Printf("Rolled back half message for transaction %s", transactionID)
+	return statemachine.Result{Value: 1}, nil
+}
+
+// Lookup implements the statemachine.IStateMachine interface
+func (psm *PartitionStateMachine) Lookup(query interface{}) (interface{}, error) {
+	// TODO: Implement partition state machine lookup logic
+	return nil, nil
+}
+
+// SaveSnapshot implements the statemachine.IStateMachine interface
+func (psm *PartitionStateMachine) SaveSnapshot(w io.Writer, fc statemachine.ISnapshotFileCollection, done <-chan struct{}) error {
+	// TODO: Implement partition state machine snapshot save logic
 	return nil
 }
 
+// RecoverFromSnapshot implements the statemachine.IStateMachine interface
+func (psm *PartitionStateMachine) RecoverFromSnapshot(r io.Reader, files []statemachine.SnapshotFile, done <-chan struct{}) error {
+	// TODO: Implement partition state machine snapshot recovery logic
+	return nil
+}
+
+// GetHash implements the statemachine.IStateMachine interface
+func (psm *PartitionStateMachine) GetHash() uint64 {
+	psm.mu.RLock()
+	defer psm.mu.RUnlock()
+	return uint64(psm.messageCount)
+}
+
+// Close implements the statemachine.IStateMachine interface
 func (psm *PartitionStateMachine) Close() error {
-	psm.mu.Lock()
-	defer psm.mu.Unlock()
+	psm.logger.Printf("Closing partition state machine for %s-%d", psm.TopicName, psm.PartitionID)
 
-	// Close ordered message manager
-	if psm.orderedMessageManager != nil {
-		psm.orderedMessageManager.Close()
-	}
+	// Stop cleanup task
+	psm.Stop()
 
+	// Close storage components
 	if psm.partition != nil {
 		if err := psm.partition.Close(); err != nil {
-			log.Printf("Failed to close partition storage: %v", err)
-			return err
+			psm.logger.Printf("Error closing partition storage: %v", err)
 		}
 	}
 
-	psm.isReady = false
-	log.Printf("Closed PartitionStateMachine for %s-%d", psm.TopicName, psm.PartitionID)
+	if psm.halfMessageStorage != nil {
+		if err := psm.halfMessageStorage.Close(); err != nil {
+			psm.logger.Printf("Error closing half message storage: %v", err)
+		}
+	}
+
+	if psm.delayedMessageStorage != nil {
+		if err := psm.delayedMessageStorage.Close(); err != nil {
+			psm.logger.Printf("Error closing delayed message storage: %v", err)
+		}
+	}
+
 	return nil
 }
 
-// IsReady returns whether the partition is ready for operations
-func (psm *PartitionStateMachine) IsReady() bool {
-	psm.mu.RLock()
-	defer psm.mu.RUnlock()
-	return psm.isReady
+// SetRaftManager 设置Raft管理器和组ID，并启动清理任务
+func (psm *PartitionStateMachine) SetRaftManager(raftManager RaftManagerInterface, raftGroupID uint64) {
+	psm.mu.Lock()
+	defer psm.mu.Unlock()
+
+	psm.raftManager = raftManager
+	psm.raftGroupID = raftGroupID
+
+	// 启动半消息清理任务
+	go psm.startHalfMessageCleanup()
 }
 
 // GetMetrics returns partition metrics
@@ -974,4 +734,203 @@ func (psm *PartitionStateMachine) GetMetrics() map[string]interface{} {
 		"last_read":     psm.lastRead,
 		"is_ready":      psm.isReady,
 	}
+}
+
+// handleStoreDelayedMessage handles storing a delayed message
+func (psm *PartitionStateMachine) handleStoreDelayedMessage(data map[string]interface{}) (statemachine.Result, error) {
+	if psm.delayedMessageStorage == nil {
+		return statemachine.Result{Value: 0}, fmt.Errorf("delayed message storage not initialized")
+	}
+
+	// Parse delayed message data
+	messageID, ok := data["message_id"].(string)
+	if !ok {
+		return statemachine.Result{Value: 0}, fmt.Errorf("invalid message_id")
+	}
+
+	messageBytes, err := json.Marshal(data["message"])
+	if err != nil {
+		return statemachine.Result{Value: 0}, fmt.Errorf("failed to marshal delayed message: %w", err)
+	}
+
+	var message delayed.DelayedMessage
+	if err := json.Unmarshal(messageBytes, &message); err != nil {
+		return statemachine.Result{Value: 0}, fmt.Errorf("failed to unmarshal delayed message: %w", err)
+	}
+
+	// Store the delayed message
+	if err := psm.delayedMessageStorage.Store(messageID, &message); err != nil {
+		return statemachine.Result{Value: 0}, fmt.Errorf("failed to store delayed message: %w", err)
+	}
+
+	result := map[string]interface{}{
+		"success":    true,
+		"message_id": messageID,
+		"timestamp":  time.Now(),
+	}
+
+	resultData, _ := json.Marshal(result)
+	return statemachine.Result{
+		Value: uint64(len(resultData)),
+		Data:  resultData,
+	}, nil
+}
+
+// handleUpdateDelayedMessage handles updating a delayed message
+func (psm *PartitionStateMachine) handleUpdateDelayedMessage(data map[string]interface{}) (statemachine.Result, error) {
+	if psm.delayedMessageStorage == nil {
+		return statemachine.Result{Value: 0}, fmt.Errorf("delayed message storage not initialized")
+	}
+
+	// Parse delayed message data
+	messageID, ok := data["message_id"].(string)
+	if !ok {
+		return statemachine.Result{Value: 0}, fmt.Errorf("invalid message_id")
+	}
+
+	messageBytes, err := json.Marshal(data["message"])
+	if err != nil {
+		return statemachine.Result{Value: 0}, fmt.Errorf("failed to marshal delayed message: %w", err)
+	}
+
+	var message delayed.DelayedMessage
+	if err := json.Unmarshal(messageBytes, &message); err != nil {
+		return statemachine.Result{Value: 0}, fmt.Errorf("failed to unmarshal delayed message: %w", err)
+	}
+
+	// 如果消息已正常处理（Delivered），则删除消息而不是更新
+	if message.Status == delayed.StatusDelivered {
+		if err := psm.delayedMessageStorage.Delete(messageID); err != nil {
+			return statemachine.Result{Value: 0}, fmt.Errorf("failed to delete delivered delayed message: %w", err)
+		}
+		result := map[string]interface{}{
+			"success":    true,
+			"message_id": messageID,
+			"deleted":    true,
+			"timestamp":  time.Now(),
+		}
+		resultData, _ := json.Marshal(result)
+		return statemachine.Result{
+			Value: uint64(len(resultData)),
+			Data:  resultData,
+		}, nil
+	}
+
+	// Update the delayed message
+	if err := psm.delayedMessageStorage.Update(messageID, &message); err != nil {
+		return statemachine.Result{Value: 0}, fmt.Errorf("failed to update delayed message: %w", err)
+	}
+
+	result := map[string]interface{}{
+		"success":    true,
+		"message_id": messageID,
+		"timestamp":  time.Now(),
+	}
+
+	resultData, _ := json.Marshal(result)
+	return statemachine.Result{
+		Value: uint64(len(resultData)),
+		Data:  resultData,
+	}, nil
+}
+
+// handleDeleteDelayedMessage handles deleting a delayed message
+func (psm *PartitionStateMachine) handleDeleteDelayedMessage(data map[string]interface{}) (statemachine.Result, error) {
+	if psm.delayedMessageStorage == nil {
+		return statemachine.Result{Value: 0}, fmt.Errorf("delayed message storage not initialized")
+	}
+
+	// Parse message ID
+	messageID, ok := data["message_id"].(string)
+	if !ok {
+		return statemachine.Result{Value: 0}, fmt.Errorf("invalid message_id")
+	}
+
+	// Delete the delayed message
+	if err := psm.delayedMessageStorage.Delete(messageID); err != nil {
+		return statemachine.Result{Value: 0}, fmt.Errorf("failed to delete delayed message: %w", err)
+	}
+
+	result := map[string]interface{}{
+		"success":    true,
+		"message_id": messageID,
+		"timestamp":  time.Now(),
+	}
+
+	resultData, _ := json.Marshal(result)
+	return statemachine.Result{
+		Value: uint64(len(resultData)),
+		Data:  resultData,
+	}, nil
+}
+
+func (psm *PartitionStateMachine) handleBatchUpdateDelayedMessages(data map[string]interface{}) (statemachine.Result, error) {
+	if psm.delayedMessageStorage == nil {
+		return statemachine.Result{Value: 0}, fmt.Errorf("delayed message storage not initialized")
+	}
+
+	updatesRaw, ok := data["updates"]
+	if !ok {
+		return statemachine.Result{Value: 0}, fmt.Errorf("missing updates field")
+	}
+
+	updatesBytes, err := json.Marshal(updatesRaw)
+	if err != nil {
+		return statemachine.Result{Value: 0}, fmt.Errorf("failed to marshal updates: %w", err)
+	}
+
+	type updateItem struct {
+		MessageID string                 `json:"message_id"`
+		Message   delayed.DelayedMessage `json:"message"`
+	}
+	var updates []updateItem
+	if err := json.Unmarshal(updatesBytes, &updates); err != nil {
+		return statemachine.Result{Value: 0}, fmt.Errorf("failed to unmarshal updates: %w", err)
+	}
+
+	toDelete := make([]string, 0, len(updates))
+	toUpdate := make(map[string]*delayed.DelayedMessage, len(updates))
+	for _, upd := range updates {
+		if upd.Message.Status == delayed.StatusDelivered {
+			toDelete = append(toDelete, upd.MessageID)
+		} else {
+			msg := upd.Message // create copy to take address
+			toUpdate[upd.MessageID] = &msg
+		}
+	}
+
+	// 批量删除
+	if len(toDelete) > 0 {
+		if err := psm.delayedMessageStorage.DeleteBatch(toDelete); err != nil {
+			return statemachine.Result{Value: 0}, fmt.Errorf("batch delete failed: %w", err)
+		}
+	}
+	// 批量更新
+	if len(toUpdate) > 0 {
+		if err := psm.delayedMessageStorage.UpdateBatch(toUpdate); err != nil {
+			return statemachine.Result{Value: 0}, fmt.Errorf("batch update failed: %w", err)
+		}
+	}
+
+	// 构造逐条结果（全部成功）
+	results := make([]map[string]interface{}, len(updates))
+	deletedSet := make(map[string]struct{}, len(toDelete))
+	for _, id := range toDelete {
+		deletedSet[id] = struct{}{}
+	}
+	for i, upd := range updates {
+		res := map[string]interface{}{"success": true, "message_id": upd.MessageID}
+		if _, ok := deletedSet[upd.MessageID]; ok {
+			res["deleted"] = true
+		}
+		results[i] = res
+	}
+
+	resp := map[string]interface{}{
+		"success":   true,
+		"results":   results,
+		"timestamp": time.Now(),
+	}
+	respBytes, _ := json.Marshal(resp)
+	return statemachine.Result{Value: uint64(len(respBytes)), Data: respBytes}, nil
 }

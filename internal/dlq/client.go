@@ -115,19 +115,48 @@ func (d *DLQClient) ReprocessDLQMessages(dlqMessages []*DeadLetterMessage) []err
 
 // ListDLQTopics returns all DLQ topics
 func (d *DLQClient) ListDLQTopics() ([]string, error) {
-	// This would require metadata API to list all topics and filter DLQ topics
-	// For now, return empty slice as this requires broker metadata support
-	return []string{}, nil
+	// Use admin client to list all topics
+	admin := client.NewAdmin(d.client)
+	allTopics, err := admin.ListTopics()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list topics: %w", err)
+	}
+
+	// Filter DLQ topics (topics that end with DLQ suffix)
+	var dlqTopics []string
+	dlqSuffix := d.manager.config.TopicSuffix
+	
+	for _, topic := range allTopics {
+		if len(topic.Name) > len(dlqSuffix) && 
+		   topic.Name[len(topic.Name)-len(dlqSuffix):] == dlqSuffix {
+			dlqTopics = append(dlqTopics, topic.Name)
+		}
+	}
+
+	return dlqTopics, nil
 }
 
 // DeleteDLQMessage marks a DLQ message as processed (logical deletion)
-// In a real implementation, this might involve updating message status or moving to processed topic
 func (d *DLQClient) DeleteDLQMessage(dlqMsg *DeadLetterMessage) error {
-	// For now, this is a no-op as we don't have a deletion mechanism
-	// In production, you might:
-	// 1. Move message to a "processed" topic
-	// 2. Update message status in a separate metadata store
-	// 3. Use compaction with null values
+	// Create a tombstone message to mark this message as deleted
+	// This follows Kafka's compaction pattern where null values indicate deletion
+	tombstoneMsg := client.ProduceMessage{
+		Topic:     dlqMsg.DLQTopic,
+		Partition: dlqMsg.DLQPartition,
+		Key:       dlqMsg.OriginalKey, // Use same key for compaction
+		Value:     nil,                // Null value indicates deletion
+	}
+
+	// Send the tombstone message
+	result, err := d.producer.Send(tombstoneMsg)
+	if err != nil {
+		return fmt.Errorf("failed to send tombstone message: %w", err)
+	}
+	
+	if result.Error != nil {
+		return fmt.Errorf("tombstone message failed: %w", result.Error)
+	}
+
 	return nil
 }
 

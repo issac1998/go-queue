@@ -1,6 +1,8 @@
 package raft
 
 import (
+	"log"
+	"os"
 	"testing"
 	"time"
 )
@@ -16,6 +18,7 @@ func TestLeaderWatcherDataStructures(t *testing.T) {
 			UpdateTime:           time.Now(),
 		},
 		leaderWatchers: make(map[string]func()),
+		logger:         log.New(os.Stdout, "[TEST] ", log.LstdFlags),
 	}
 
 	// Test partition key

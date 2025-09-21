@@ -31,9 +31,13 @@ type Partitioner interface {
 type PartitionStrategy int
 
 const (
+	// PartitionStrategyManual lets caller explicitly set the partition on each message.
 	PartitionStrategyManual PartitionStrategy = iota
+	// PartitionStrategyRoundRobin cycles through partitions sequentially.
 	PartitionStrategyRoundRobin
+	// PartitionStrategyRandom picks a random partition.
 	PartitionStrategyRandom
+	// PartitionStrategyHash chooses a partition based on a hash of the key.
 	PartitionStrategyHash
 )
 
@@ -64,6 +68,70 @@ func NewProducerWithStrategy(client *Client, strategy PartitionStrategy) *Produc
 		client:      client,
 		partitioner: partitioner,
 	}
+}
+
+// ProducerID returns the underlying client's ProducerID (mainly for testing / diagnostics)
+func (p *Producer) ProducerID() string {
+	return p.client.GetProducerID()
+}
+
+// SendBatchWithOptions sends messages allowing the caller to preserve pre-assigned sequence numbers.
+// preserveSequence=true will prevent the client from overwriting SequenceNumber/ProducerID so tests can
+// intentionally resend older sequence numbers to trigger broker-side deduplication logic.
+// NOTE: This API is primarily intended for integration tests (Exactly-Once verification) and should be
+// used cautiously in production code.
+func (p *Producer) SendBatchWithOptions(messages []ProduceMessage, preserveSequence bool) (*ProduceResult, error) {
+	if len(messages) == 0 {
+		return nil, fmt.Errorf("message list cannot be empty")
+	}
+
+	topic := messages[0].Topic
+	partition := messages[0].Partition
+
+	for _, msg := range messages {
+		if msg.Topic != topic {
+			return nil, fmt.Errorf("batch messages must belong to the same topic")
+		}
+		if msg.Partition != partition {
+			return nil, fmt.Errorf("batch messages must belong to the same topic and partition")
+		}
+	}
+
+	// If partition not specified (negative) we still need to pick one
+	if partition < 0 {
+		var err error
+		partition, err = p.selectPartition(&messages[0])
+		if err != nil {
+			return nil, fmt.Errorf("failed to select partition: %v", err)
+		}
+		for i := range messages {
+			messages[i].Partition = partition
+		}
+	}
+
+	// Only assign new sequence numbers if we are not preserving them
+	if !preserveSequence {
+		// Reuse existing logic from SendBatch: ensure sequence numbers & producerID populated
+		producerID := p.client.GetProducerID()
+		stateManager := p.client.GetDeduplicatorManager()
+		for i := range messages {
+			// If deduplicator enabled and sequence number not already assigned
+			if p.client.IsdeduplicatorEnabled() && messages[i].SequenceNumber == 0 {
+				messages[i].ProducerID = producerID
+				messages[i].SequenceNumber = stateManager.GetNextSequenceNumber(producerID, partition)
+			} else if p.client.IsdeduplicatorEnabled() && messages[i].ProducerID == "" {
+				// Fill missing producer ID if caller only set sequence
+				messages[i].ProducerID = producerID
+			}
+			messages[i].AsyncIO = p.client.config.EnableAsyncIO
+		}
+	} else {
+		for i := range messages {
+			messages[i].AsyncIO = p.client.config.EnableAsyncIO
+		}
+	}
+
+	return p.sendToPartitionLeader(topic, partition, messages)
 }
 
 // ProduceMessage single message structure
@@ -153,6 +221,7 @@ func (p *Producer) selectPartition(msg *ProduceMessage) (int32, error) {
 // ManualPartitioner uses manually specified partitions
 type ManualPartitioner struct{}
 
+// Partition returns the partition already set on the message (ManualPartitioner).
 func (mp *ManualPartitioner) Partition(message *ProduceMessage, numPartitions int32) (int32, error) {
 	if message.Partition < 0 {
 		return 0, fmt.Errorf("partition must be specified for manual partitioning")
@@ -168,6 +237,7 @@ type RoundRobinPartitioner struct {
 	counter int32
 }
 
+// Partition selects partitions in a round-robin manner across available partitions.
 func (rrp *RoundRobinPartitioner) Partition(message *ProduceMessage, numPartitions int32) (int32, error) {
 	if numPartitions <= 0 {
 		return 0, fmt.Errorf("invalid number of partitions: %d", numPartitions)
@@ -181,6 +251,7 @@ func (rrp *RoundRobinPartitioner) Partition(message *ProduceMessage, numPartitio
 // RandomPartitioner randomly selects a partition
 type RandomPartitioner struct{}
 
+// Partition returns a random partition for the message.
 func (rp *RandomPartitioner) Partition(message *ProduceMessage, numPartitions int32) (int32, error) {
 	if numPartitions <= 0 {
 		return 0, fmt.Errorf("invalid number of partitions: %d", numPartitions)
@@ -197,6 +268,7 @@ func (rp *RandomPartitioner) Partition(message *ProduceMessage, numPartitions in
 // HashPartitioner uses hash of message key to determine partition
 type HashPartitioner struct{}
 
+// Partition uses a stable hash of the message key to select a partition.
 func (hp *HashPartitioner) Partition(message *ProduceMessage, numPartitions int32) (int32, error) {
 	if numPartitions <= 0 {
 		return 0, fmt.Errorf("invalid number of partitions: %d", numPartitions)
@@ -223,7 +295,7 @@ func (hp *HashPartitioner) Partition(message *ProduceMessage, numPartitions int3
 // with automatic retry and metadata refresh on leader errors
 func (p *Producer) sendToPartitionLeader(topic string, partition int32, messages []ProduceMessage) (*ProduceResult, error) {
 	const maxRetries = 3
-	
+
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		metadata, err := p.client.getTopicMetadata(topic)
 		if err != nil {
@@ -246,13 +318,13 @@ func (p *Producer) sendToPartitionLeader(topic string, partition int32, messages
 		} else {
 			result, err = p.sendWithDirectConnection(partitionMeta.Leader, requestData)
 		}
-		
+
 		if err == nil {
 			result.Topic = topic
 			result.Partition = partition
 			return result, nil
 		}
-		
+
 		if p.client.shouldRetryWithMetadataRefresh(err) {
 			if attempt < maxRetries-1 {
 				if _, refreshErr := p.client.refreshTopicMetadata(topic); refreshErr != nil {
@@ -261,10 +333,10 @@ func (p *Producer) sendToPartitionLeader(topic string, partition int32, messages
 				continue
 			}
 		}
-		
+
 		return nil, err
 	}
-	
+
 	return nil, &errors.TypedError{
 		Type:    errors.PartitionLeaderError,
 		Message: fmt.Sprintf("failed to send to partition leader after %d attempts", maxRetries),

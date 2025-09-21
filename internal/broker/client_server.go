@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strconv"
 	"time"
 
 	"github.com/issac1998/go-queue/internal/errors"
@@ -47,30 +48,34 @@ type RequestConfig struct {
 
 // requestConfigs maps request types to their configurations
 var requestConfigs = map[int32]RequestConfig{
-	protocol.ControllerDiscoverRequestType:      {Type: ControllerRequest, Handler: &ControllerDiscoveryHandler{}},
-	protocol.ControllerVerifyRequestType:        {Type: ControllerRequest, Handler: &ControllerVerifyHandler{}},
-	protocol.CreateTopicRequestType:             {Type: MetadataWriteRequest, Handler: &CreateTopicHandler{}},
-	protocol.DeleteTopicRequestType:             {Type: MetadataWriteRequest, Handler: &DeleteTopicHandler{}},
-	protocol.ListTopicsRequestType:              {Type: MetadataReadRequest, Handler: &ListTopicsHandler{}},
-	protocol.GetTopicInfoRequestType:            {Type: MetadataReadRequest, Handler: &GetTopicInfoHandler{}},
-	protocol.JoinGroupRequestType:               {Type: MetadataWriteRequest, Handler: &JoinGroupHandler{}},
-	protocol.LeaveGroupRequestType:              {Type: MetadataWriteRequest, Handler: &LeaveGroupHandler{}},
-	protocol.ProduceRequestType:                 {Type: DataRequest, Handler: &ProduceHandler{}},
-	protocol.FetchRequestType:                   {Type: DataRequest, Handler: &FetchHandler{}},
-	protocol.GetTopicMetadataRequestType:        {Type: MetadataReadRequest, Handler: &GetTopicMetadataHandler{}},
-	protocol.StartPartitionRaftGroupRequestType: {Type: InterBrokerRequest, Handler: &StartPartitionRaftGroupHandler{}},
-	protocol.StopPartitionRaftGroupRequestType:  {Type: InterBrokerRequest, Handler: &StopPartitionRaftGroupHandler{}},
-	protocol.HeartbeatRequestType:               {Type: MetadataWriteRequest, Handler: &HeartbeatHandler{}},
-	protocol.CommitOffsetRequestType:            {Type: MetadataWriteRequest, Handler: &CommitOffsetHandler{}},
-	protocol.FetchOffsetRequestType:             {Type: MetadataReadRequest, Handler: &FetchOffsetHandler{}},
-	protocol.FetchAssignmentRequestType:         {Type: MetadataReadRequest, Handler: &FetchAssignmentHandler{}},
-	protocol.TransactionPrepareRequestType:      {Type: DataRequest, Handler: &TransactionPrepareHandler{}},
-	protocol.TransactionCommitRequestType:       {Type: DataRequest, Handler: &TransactionCommitHandler{}},
-	protocol.TransactionRollbackRequestType:     {Type: DataRequest, Handler: &TransactionRollbackHandler{}},
-	protocol.OrderedProduceRequestType:          {Type: DataRequest, Handler: &OrderedProduceHandler{}},
-	protocol.ConsumerBeginTransactionRequestType: {Type: MetadataWriteRequest, Handler: &ConsumerBeginTransactionHandler{}},
+	protocol.ControllerDiscoverRequestType:        {Type: ControllerRequest, Handler: &ControllerDiscoveryHandler{}},
+	protocol.ControllerVerifyRequestType:          {Type: ControllerRequest, Handler: &ControllerVerifyHandler{}},
+	protocol.CreateTopicRequestType:               {Type: MetadataWriteRequest, Handler: &CreateTopicHandler{}},
+	protocol.DeleteTopicRequestType:               {Type: MetadataWriteRequest, Handler: &DeleteTopicHandler{}},
+	protocol.ListTopicsRequestType:                {Type: MetadataReadRequest, Handler: &ListTopicsHandler{}},
+	protocol.GetTopicInfoRequestType:              {Type: MetadataReadRequest, Handler: &GetTopicInfoHandler{}},
+	protocol.JoinGroupRequestType:                 {Type: MetadataWriteRequest, Handler: &JoinGroupHandler{}},
+	protocol.LeaveGroupRequestType:                {Type: MetadataWriteRequest, Handler: &LeaveGroupHandler{}},
+	protocol.ProduceRequestType:                   {Type: DataRequest, Handler: &ProduceHandler{}},
+	protocol.FetchRequestType:                     {Type: DataRequest, Handler: &FetchHandler{}},
+	protocol.GetTopicMetadataRequestType:          {Type: MetadataReadRequest, Handler: &GetTopicMetadataHandler{}},
+	protocol.StartPartitionRaftGroupRequestType:   {Type: InterBrokerRequest, Handler: &StartPartitionRaftGroupHandler{}},
+	protocol.StopPartitionRaftGroupRequestType:    {Type: InterBrokerRequest, Handler: &StopPartitionRaftGroupHandler{}},
+	protocol.HeartbeatRequestType:                 {Type: MetadataWriteRequest, Handler: &HeartbeatHandler{}},
+	protocol.CommitOffsetRequestType:              {Type: MetadataWriteRequest, Handler: &CommitOffsetHandler{}},
+	protocol.FetchOffsetRequestType:               {Type: MetadataReadRequest, Handler: &FetchOffsetHandler{}},
+	protocol.FetchAssignmentRequestType:           {Type: MetadataReadRequest, Handler: &FetchAssignmentHandler{}},
+	protocol.TransactionPrepareRequestType:        {Type: DataRequest, Handler: &TransactionPrepareHandler{}},
+	protocol.TransactionCommitRequestType:         {Type: DataRequest, Handler: &TransactionCommitHandler{}},
+	protocol.TransactionRollbackRequestType:       {Type: DataRequest, Handler: &TransactionRollbackHandler{}},
+	protocol.OrderedProduceRequestType:            {Type: DataRequest, Handler: &OrderedProduceHandler{}},
+	protocol.ConsumerBeginTransactionRequestType:  {Type: MetadataWriteRequest, Handler: &ConsumerBeginTransactionHandler{}},
 	protocol.ConsumerCommitTransactionRequestType: {Type: MetadataWriteRequest, Handler: &ConsumerCommitTransactionHandler{}},
-	protocol.ConsumerAbortTransactionRequestType: {Type: MetadataWriteRequest, Handler: &ConsumerAbortTransactionHandler{}},
+	protocol.ConsumerAbortTransactionRequestType:  {Type: MetadataWriteRequest, Handler: &ConsumerAbortTransactionHandler{}},
+	protocol.DelayedProduceRequestType:            {Type: DataRequest, Handler: &DelayedProduceHandler{}},
+	protocol.DelayedMessageQueryRequestType:       {Type: DataRequest, Handler: &DelayedMessageQueryHandler{}},
+	protocol.DelayedMessageCancelRequestType:      {Type: DataRequest, Handler: &DelayedMessageCancelHandler{}},
+	protocol.RegisterProducerGroupRequestType:     {Type: DataRequest, Handler: &RegisterProducerGroupHandler{}},
 }
 
 // NewClientServer creates a new ClientServer
@@ -476,6 +481,76 @@ func (h *CreateTopicHandler) parseCreateTopicRequest(data []byte) (string, int32
 	return string(nameBytes), partitions, replicas, nil
 }
 
+// RegisterProducerGroupHandler handles producer group registration requests
+type RegisterProducerGroupHandler struct{}
+
+// Request format:
+// int16 version
+// int16 groupNameLen + bytes
+// int16 callbackAddrLen + bytes
+func (h *RegisterProducerGroupHandler) Handle(conn net.Conn, cs *ClientServer) error {
+	requestData, err := cs.readRequestData(conn)
+	if err != nil {
+		return fmt.Errorf("failed to read request data: %v", err)
+	}
+
+	buf := bytes.NewReader(requestData)
+	var version int16
+	if err := binary.Read(buf, binary.BigEndian, &version); err != nil {
+		return fmt.Errorf("failed to read version: %v", err)
+	}
+	var groupLen int16
+	if err := binary.Read(buf, binary.BigEndian, &groupLen); err != nil {
+		return fmt.Errorf("failed to read group length: %v", err)
+	}
+	if groupLen <= 0 || groupLen > 1024 { // simple validation
+		return fmt.Errorf("invalid group length: %d", groupLen)
+	}
+	groupBytes := make([]byte, groupLen)
+	if _, err := io.ReadFull(buf, groupBytes); err != nil {
+		return fmt.Errorf("failed to read group bytes: %v", err)
+	}
+	var cbLen int16
+	if err := binary.Read(buf, binary.BigEndian, &cbLen); err != nil {
+		return fmt.Errorf("failed to read callback length: %v", err)
+	}
+	if cbLen < 0 || cbLen > 4096 {
+		return fmt.Errorf("invalid callback length: %d", cbLen)
+	}
+	cbBytes := make([]byte, cbLen)
+	if cbLen > 0 {
+		if _, err := io.ReadFull(buf, cbBytes); err != nil {
+			return fmt.Errorf("failed to read callback bytes: %v", err)
+		}
+	}
+
+	group := string(groupBytes)
+	callback := string(cbBytes)
+
+	if group == "" {
+		return fmt.Errorf("producer group name cannot be empty")
+	}
+
+	if cs.broker.TransactionManager == nil {
+		return fmt.Errorf("transaction manager not initialized")
+	}
+	if err := cs.broker.TransactionManager.RegisterProducerGroup(group, callback); err != nil {
+		return fmt.Errorf("failed to register producer group: %v", err)
+	}
+
+	// success response: error code + empty error message length placeholder
+	respBuf := new(bytes.Buffer)
+	if err := binary.Write(respBuf, binary.BigEndian, int16(protocol.ErrorNone)); err != nil {
+		return fmt.Errorf("failed to write success code: %v", err)
+	}
+	if err := binary.Write(respBuf, binary.BigEndian, int16(protocol.ErrorNone)); err != nil { // second field used similarly as create topic handler
+		return fmt.Errorf("failed to write empty err msg len: %v", err)
+	}
+	cs.sendSuccessResponse(conn, respBuf.Bytes())
+	log.Printf("Registered producer group via request: %s callback=%s", group, callback)
+	return nil
+}
+
 // ListTopicsHandler handles list topics requests
 type ListTopicsHandler struct{}
 
@@ -640,13 +715,13 @@ func (h *ConsumerCommitTransactionHandler) Handle(conn net.Conn, cs *ClientServe
 		return fmt.Errorf("failed to read request data: %v", err)
 	}
 
-	transactionID, consumerID, groupID, err := h.parseCommitTransactionRequest(requestData)
+	transactionID, consumerID, groupID, offsetCommits, err := h.parseCommitTransactionRequest(requestData)
 	if err != nil {
 		return fmt.Errorf("failed to parse request: %v", err)
 	}
 
 	// 提交消费者事务
-	err = cs.broker.Controller.CommitConsumerTransaction(transactionID, consumerID, groupID)
+	err = cs.broker.Controller.CommitConsumerTransaction(transactionID, consumerID, groupID, offsetCommits)
 	if err != nil {
 		errorResponse, buildErr := h.buildErrorResponse(err.Error())
 		if buildErr != nil {
@@ -667,28 +742,48 @@ func (h *ConsumerCommitTransactionHandler) Handle(conn net.Conn, cs *ClientServe
 	return nil
 }
 
-func (h *ConsumerCommitTransactionHandler) parseCommitTransactionRequest(data []byte) (string, string, string, error) {
+func (h *ConsumerCommitTransactionHandler) parseCommitTransactionRequest(data []byte) (string, string, string, map[string]map[int32]int64, error) {
 	var request map[string]interface{}
 	if err := json.Unmarshal(data, &request); err != nil {
-		return "", "", "", fmt.Errorf("failed to unmarshal request: %v", err)
+		return "", "", "", nil, fmt.Errorf("failed to unmarshal request: %v", err)
 	}
 
 	transactionID, ok := request["transaction_id"].(string)
 	if !ok {
-		return "", "", "", fmt.Errorf("missing or invalid transaction_id")
+		return "", "", "", nil, fmt.Errorf("missing or invalid transaction_id")
 	}
 
 	consumerID, ok := request["consumer_id"].(string)
 	if !ok {
-		return "", "", "", fmt.Errorf("missing or invalid consumer_id")
+		return "", "", "", nil, fmt.Errorf("missing or invalid consumer_id")
 	}
 
 	groupID, ok := request["group_id"].(string)
 	if !ok {
-		return "", "", "", fmt.Errorf("missing or invalid group_id")
+		return "", "", "", nil, fmt.Errorf("missing or invalid group_id")
 	}
 
-	return transactionID, consumerID, groupID, nil
+	// Parse offset commits if present
+	var offsetCommits map[string]map[int32]int64
+	if offsetCommitsData, exists := request["offset_commits"]; exists {
+		if offsetCommitsMap, ok := offsetCommitsData.(map[string]interface{}); ok {
+			offsetCommits = make(map[string]map[int32]int64)
+			for topic, partitionsData := range offsetCommitsMap {
+				if partitions, ok := partitionsData.(map[string]interface{}); ok {
+					offsetCommits[topic] = make(map[int32]int64)
+					for partitionStr, offsetData := range partitions {
+						if partition, err := strconv.ParseInt(partitionStr, 10, 32); err == nil {
+							if offset, ok := offsetData.(float64); ok {
+								offsetCommits[topic][int32(partition)] = int64(offset)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return transactionID, consumerID, groupID, offsetCommits, nil
 }
 
 func (h *ConsumerCommitTransactionHandler) buildSuccessResponse() ([]byte, error) {

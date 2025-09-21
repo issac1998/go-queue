@@ -18,6 +18,7 @@ import (
 type TransactionProducer struct {
 	client   *Client
 	listener transaction.TransactionListener
+	group    string
 }
 
 // TransactionMessage massage
@@ -50,10 +51,12 @@ type TransactionResult struct {
 
 // NewTransactionProducer create producer
 func NewTransactionProducer(client *Client, listener transaction.TransactionListener) *TransactionProducer {
-	return &TransactionProducer{
-		client:   client,
-		listener: listener,
-	}
+	return NewTransactionProducerWithGroup(client, listener, "default-txn-group")
+}
+
+// NewTransactionProducerWithGroup creates producer with explicit producer group
+func NewTransactionProducerWithGroup(client *Client, listener transaction.TransactionListener, group string) *TransactionProducer {
+	return &TransactionProducer{client: client, listener: listener, group: group}
 }
 
 // BeginTransaction start new txn
@@ -61,14 +64,15 @@ func (tp *TransactionProducer) BeginTransaction() (*Transaction, error) {
 	transactionID := tp.generateTransactionID()
 
 	return &Transaction{
-		ID:       transactionID,
-		producer: tp,
-		prepared: false,
+		ID:            transactionID,
+		producer:      tp,
+		prepared:      false,
+		producerGroup: tp.group,
 	}, nil
 }
 
-// SendTransactionMessage send half message
-func (tp *TransactionProducer) SendTransactionMessageAndDoLocal(msg *TransactionMessage) (*Transaction, *TransactionResult, error) {
+// SendHalfMessageAndDoLocal send half message, then do local txn
+func (tp *TransactionProducer) SendHalfMessageAndDoLocal(msg *TransactionMessage) (*Transaction, *TransactionResult, error) {
 	txn, err := tp.BeginTransaction()
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to begin transaction: %w", err)
@@ -84,46 +88,6 @@ func (tp *TransactionProducer) SendTransactionMessageAndDoLocal(msg *Transaction
 
 // SendHalfMessage send half message
 func (t *Transaction) SendHalfMessageAndDoLocal(msg *TransactionMessage) (*TransactionResult, error) {
-	req := &transaction.TransactionPrepareRequest{
-		TransactionID: t.ID,
-		Topic:         msg.Topic,
-		Partition:     msg.Partition,
-		Key:           msg.Key,
-		Value:         msg.Value,
-		Headers:       msg.Headers,
-		Timeout:       int64(msg.Timeout / time.Millisecond),
-		ProducerGroup: t.producerGroup,
-	}
-
-	conn, err := t.producer.client.connectForDataOperation(msg.Topic, msg.Partition, false)
-	if err != nil {
-		return nil, &errors.TypedError{
-			Type:    errors.PartitionLeaderError,
-			Message: errors.FailedToConnectToPartitionMsg,
-			Cause:   err,
-		}
-	}
-	defer conn.Close()
-
-	conn.SetDeadline(time.Now().Add(t.producer.client.timeout))
-
-	if err := t.sendTransactionPrepareRequest(conn, req); err != nil {
-		return nil, fmt.Errorf("failed to send prepare request: %w", err)
-	}
-
-	response, err := t.readTransactionPrepareResponse(conn)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read prepare response: %w", err)
-	}
-
-	if response.ErrorCode != protocol.ErrorNone {
-		return nil, fmt.Errorf("prepare failed: %s", response.Error)
-	}
-
-	t.prepared = true
-	t.topic = msg.Topic
-	t.partition = msg.Partition
-
 	halfMessage := transaction.HalfMessage{
 		TransactionID: t.ID,
 		Topic:         msg.Topic,
@@ -136,17 +100,28 @@ func (t *Transaction) SendHalfMessageAndDoLocal(msg *TransactionMessage) (*Trans
 		State:         transaction.StatePrepared,
 	}
 
+	err := t.sendHalfMessage(&halfMessage, msg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send half message: %w", err)
+	}
+
+	t.prepared = true
+	t.topic = msg.Topic
+	t.partition = msg.Partition
+
+	// do local
 	localTxnState := t.producer.listener.ExecuteLocalTransaction(t.ID, halfMessage)
 
 	var finalResult *TransactionResult
 	switch localTxnState {
 	case transaction.StateCommit:
-		finalResult, err = t.Commit()
+		finalResult, err := t.Commit()
 		if err != nil {
 			return nil, fmt.Errorf("failed to commit transaction: %w", err)
 		}
+		return finalResult, nil
 	case transaction.StateRollback:
-		err = t.Rollback()
+		err := t.Rollback()
 		if err != nil {
 			return nil, fmt.Errorf("failed to rollback transaction: %w", err)
 		}
@@ -160,7 +135,7 @@ func (t *Transaction) SendHalfMessageAndDoLocal(msg *TransactionMessage) (*Trans
 			Error:         fmt.Errorf("transaction state unknown, will be checked later"),
 		}
 	default:
-		err = t.Rollback()
+		err := t.Rollback()
 		if err != nil {
 			return nil, fmt.Errorf("failed to rollback transaction: %w", err)
 		}
@@ -171,6 +146,46 @@ func (t *Transaction) SendHalfMessageAndDoLocal(msg *TransactionMessage) (*Trans
 	}
 
 	return finalResult, nil
+}
+
+func (t *Transaction) sendHalfMessage(halfMessage *transaction.HalfMessage, msg *TransactionMessage) error {
+	req := &transaction.TransactionPrepareRequest{
+		TransactionID: t.ID,
+		Topic:         msg.Topic,
+		Partition:     msg.Partition,
+		Key:           msg.Key,
+		Value:         msg.Value,
+		Headers:       msg.Headers,
+		Timeout:       int64(msg.Timeout / time.Millisecond),
+		ProducerGroup: t.producerGroup,
+	}
+
+	conn, err := t.producer.client.connectForDataOperation(msg.Topic, msg.Partition, false)
+	if err != nil {
+		return &errors.TypedError{
+			Type:    errors.PartitionLeaderError,
+			Message: errors.FailedToConnectToPartitionMsg,
+			Cause:   err,
+		}
+	}
+	defer conn.Close()
+
+	conn.SetDeadline(time.Now().Add(t.producer.client.timeout))
+
+	if err := t.sendTransactionPrepareRequest(conn, req); err != nil {
+		return fmt.Errorf("failed to send prepare request: %w", err)
+	}
+
+	response, err := t.readTransactionPrepareResponse(conn)
+	if err != nil {
+		return fmt.Errorf("failed to read prepare response: %w", err)
+	}
+
+	if response.ErrorCode != protocol.ErrorNone {
+		return fmt.Errorf("prepare failed: %s", response.Error)
+	}
+
+	return nil
 }
 
 // Commit commits

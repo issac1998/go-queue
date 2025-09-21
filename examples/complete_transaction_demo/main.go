@@ -204,7 +204,7 @@ func main() {
 			}
 
 			// 发送事务消息
-			txn, result, err := txnProducer.SendTransactionMessageAndDoLocal(txnMessage)
+			txn, result, err := txnProducer.SendHalfMessageAndDoLocal(txnMessage)
 			if err != nil {
 				log.Printf("❌ 发送事务消息失败: %v", err)
 				return
