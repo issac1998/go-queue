@@ -33,17 +33,17 @@ func NewIntegrationTest() *IntegrationTest {
 func (it *IntegrationTest) Run() error {
 	log.Println("Starting DLQ Integration Test...")
 
-	// Step 1: Start etcd
-	if err := it.startEtcd(); err != nil {
-		return fmt.Errorf("failed to start etcd: %v", err)
-	}
-	defer it.stopEtcd()
+	// // Step 1: Start etcd
+	// if err := it.startEtcd(); err != nil {
+	// 	return fmt.Errorf("failed to start etcd: %v", err)
+	// }
+	// defer it.stopEtcd()
 
-	// Step 2: Start broker cluster
-	if err := it.startBrokerCluster(); err != nil {
-		return fmt.Errorf("failed to start broker cluster: %v", err)
-	}
-	defer it.stopBrokerCluster()
+	// // Step 2: Start broker cluster
+	// if err := it.startBrokerCluster(); err != nil {
+	// 	return fmt.Errorf("failed to start broker cluster: %v", err)
+	// }
+	// defer it.stopBrokerCluster()
 
 	// Step 3: Wait for cluster to be ready
 	if err := it.waitForClusterReady(); err != nil {
@@ -278,7 +278,7 @@ func (it *IntegrationTest) createTestTopic() error {
 	}
 
 	admin := client.NewAdmin(it.clients[0])
-	
+
 	// Create main test topic
 	result, err := admin.CreateTopic(client.CreateTopicRequest{
 		Name:       it.testTopic,
@@ -292,7 +292,7 @@ func (it *IntegrationTest) createTestTopic() error {
 		return fmt.Errorf("topic creation error: %v", result.Error)
 	}
 	log.Printf("Created topic: %s", it.testTopic)
-	
+
 	// Create DLQ topic
 	dlqTopicName := it.testTopic + ".dlq"
 	dlqResult, err := admin.CreateTopic(client.CreateTopicRequest{

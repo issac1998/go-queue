@@ -72,15 +72,11 @@ func (m *Manager) HandleFailedMessage(originalMsg *client.Message, failureInfo *
 	// Update retry state
 	retryState.LastFailureTime = failureInfo.FailureTime
 
-	// Check if we should retry BEFORE incrementing retry count
 	if retryState.ShouldRetry() {
-		// Increment retry count for next attempt
 		retryState.RetryCount++
 		
-		// Schedule next retry
 		retryState.NextRetryTime = retryState.CalculateNextRetryTime()
 		
-		// Add retry attempt
 		attempt := RetryAttempt{
 			AttemptNumber: retryState.RetryCount,
 			AttemptTime:   failureInfo.FailureTime,
@@ -89,10 +85,8 @@ func (m *Manager) HandleFailedMessage(originalMsg *client.Message, failureInfo *
 		}
 		retryState.RetryAttempts = append(retryState.RetryAttempts, attempt)
 	} else {
-		// Increment retry count for final attempt
 		retryState.RetryCount++
 		
-		// Add final attempt
 		attempt := RetryAttempt{
 			AttemptNumber: retryState.RetryCount,
 			AttemptTime:   failureInfo.FailureTime,
@@ -105,7 +99,6 @@ func (m *Manager) HandleFailedMessage(originalMsg *client.Message, failureInfo *
 			return typederrors.NewTypedError(typederrors.GeneralError, "failed to send message to DLQ", err)
 		}
 
-		// Remove from retry states
 		delete(m.retryStates, key)
 	}
 
