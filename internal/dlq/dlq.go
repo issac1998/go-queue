@@ -105,7 +105,7 @@ type Consumer struct {
 }
 
 // NewConsumer creates a new DLQ-enabled consumer
-func NewConsumer(clientInstance *client.Client, consumerGroup, consumerID string) (*Consumer, error) {
+func NewDlqConsumer(clientInstance *client.Client, consumerGroup, consumerID string) (*Consumer, error) {
 	dlq, err := New(clientInstance)
 	if err != nil {
 		return nil, err
@@ -120,7 +120,7 @@ func NewConsumer(clientInstance *client.Client, consumerGroup, consumerID string
 }
 
 // NewConsumerWithConfig creates a new DLQ-enabled consumer with custom config
-func NewConsumerWithConfig(clientInstance *client.Client, consumerGroup, consumerID string, config *DLQConfig) (*Consumer, error) {
+func NewDlqConsumerWithConfig(clientInstance *client.Client, consumerGroup, consumerID string, config *DLQConfig) (*Consumer, error) {
 	dlq, err := NewWithConfig(clientInstance, config)
 	if err != nil {
 		return nil, err
@@ -153,7 +153,6 @@ func (c *Consumer) ProcessMessage(msg *client.Message, processor func(*client.Me
 	// Process the message
 	err := processor(msg)
 	if err != nil {
-		// Handle failure through DLQ
 		return c.dlq.HandleFailure(msg, c.consumerGroup, c.consumerID, err.Error())
 	}
 
