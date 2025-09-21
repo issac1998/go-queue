@@ -6,10 +6,12 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sync"
 	"time"
 
 	"github.com/issac1998/go-queue/internal/compression"
+	"github.com/issac1998/go-queue/internal/delayed"
 	"github.com/issac1998/go-queue/internal/discovery"
 	"github.com/issac1998/go-queue/internal/protocol"
 	"github.com/issac1998/go-queue/internal/raft"
@@ -34,8 +36,12 @@ type Broker struct {
 	ConsumerGroupManager *ConsumerGroupManager
 
 	// Transaction management
-	TransactionManager *transaction.TransactionManager
+	TransactionManager *transaction.PartitionTransactionManager
 	TransactionChecker *TransactionChecker
+
+	// Delayed message management
+	DelayedMessageManager *delayed.DelayedMessageManager
+	delayedScanner        *DelayedMessageScanner
 
 	// Client service
 	ClientServer *ClientServer
@@ -62,7 +68,27 @@ type Broker struct {
 	// Ordered message routing
 	orderedRouter *OrderedMessageRouter
 
+	// Independent logger for this broker instance
+	logger *log.Logger
+
 	mu sync.RWMutex
+}
+
+func (b *Broker) panicHandler(component string) {
+	if r := recover(); r != nil {
+		stack := debug.Stack()
+		if b.logger != nil {
+			b.logger.Printf("PANIC in %s: %v\nStack trace:\n%s", component, r, string(stack))
+		} else {
+			log.Printf("PANIC in %s: %v\nStack trace:\n%s", component, r, string(stack))
+		}
+
+		if logFile, err := os.OpenFile("broker-panic.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666); err == nil {
+			fmt.Fprintf(logFile, "[%s] PANIC in %s (Broker %s): %v\nStack trace:\n%s\n\n",
+				time.Now().Format("2006-01-02 15:04:05"), component, b.ID, r, string(stack))
+			logFile.Close()
+		}
+	}
 }
 
 // BrokerConfig contains all broker configuration
@@ -142,12 +168,14 @@ func NewBroker(config *BrokerConfig) (*Broker, error) {
 
 // Start initializes and starts the broker
 func (b *Broker) Start() error {
+	defer b.panicHandler("Broker.Start")
+
 	// 0. Initialize logging
 	if err := b.initLogging(); err != nil {
 		return fmt.Errorf("logging init failed: %v", err)
 	}
 
-	log.Printf("Starting Broker %s...", b.ID)
+	b.logger.Printf("Starting Broker %s...", b.ID)
 
 	// 1. Load and validate configuration
 	if err := b.loadAndValidateConfig(); err != nil {
@@ -189,6 +217,11 @@ func (b *Broker) Start() error {
 		return fmt.Errorf("transaction manager init failed: %v", err)
 	}
 
+	// 8.5. Initialize Delayed Message Manager
+	if err := b.initDelayedMessageManager(); err != nil {
+		return fmt.Errorf("delayed message manager init failed: %v", err)
+	}
+
 	// 9. Start client server
 	if err := b.startClientServer(); err != nil {
 		return fmt.Errorf("client server start failed: %v", err)
@@ -201,23 +234,31 @@ func (b *Broker) Start() error {
 
 	// 10. Register broker to controller Raft state machine
 	if err := b.Controller.RegisterBroker(); err != nil {
-		log.Printf("Warning: Failed to register broker to controller: %v", err)
+		b.logger.Printf("Warning: Failed to register broker to controller: %v", err)
 	}
+
+	// 10.5. Transaction management is now handled at partition level
+	// No need to start a global transaction Raft group
 
 	// 11. Update broker status to active after successful startup
 	if err := b.discovery.UpdateBrokerStatus(b.ID, "active"); err != nil {
-		log.Printf("Warning: Failed to update broker status to active: %v", err)
+		b.logger.Printf("Warning: Failed to update broker status to active: %v", err)
 	}
 
 	// 12. Start heartbeat to controller
 	b.startHeartbeat()
 
-	log.Printf("Broker %s started successfully", b.ID)
+	b.logger.Printf("Broker %s started successfully", b.ID)
+	// 13. Block and wait for shutdown signal
+	<-b.Ctx.Done()
+	b.logger.Printf("Broker %s shutdown signal received", b.ID)
 	return nil
 }
 
 func (b *Broker) initLogging() error {
 	if b.Config.LogDir == "" {
+		// Use default logger that outputs to stdout/stderr
+		b.logger = log.New(os.Stdout, fmt.Sprintf("[Broker-%s] ", b.ID), log.LstdFlags)
 		return nil
 	}
 
@@ -232,8 +273,9 @@ func (b *Broker) initLogging() error {
 		return fmt.Errorf("failed to open log file: %v", err)
 	}
 
-	log.SetOutput(file)
-	log.Printf("Logging initialized, output to: %s", logFile)
+	// Create independent logger for this broker instance
+	b.logger = log.New(file, fmt.Sprintf("[Broker-%s] ", b.ID), log.LstdFlags)
+	b.logger.Printf("Logging initialized, output to: %s", logFile)
 
 	return nil
 }
@@ -245,12 +287,12 @@ func (b *Broker) GetCompressor() compression.Compressor {
 
 // Stop gracefully shuts down the broker
 func (b *Broker) Stop() error {
-	log.Printf("Stopping Broker %s...", b.ID)
+	b.logger.Printf("Stopping Broker %s...", b.ID)
 
 	// Unregister broker from controller before shutdown
 	if b.Controller != nil {
 		if err := b.unregisterBroker(); err != nil {
-			log.Printf("Warning: Failed to unregister broker: %v", err)
+			b.logger.Printf("Warning: Failed to unregister broker: %v", err)
 		}
 	}
 
@@ -268,6 +310,16 @@ func (b *Broker) Stop() error {
 		b.ConsumerGroupManager.Stop()
 	}
 
+	if b.DelayedMessageManager != nil {
+		if err := b.DelayedMessageManager.Stop(); err != nil {
+			b.logger.Printf("Warning: Failed to stop delayed message manager: %v", err)
+		}
+	}
+
+	if b.delayedScanner != nil {
+		b.delayedScanner.Stop()
+	}
+
 	if b.raftManager != nil {
 		b.raftManager.Close()
 	}
@@ -278,7 +330,7 @@ func (b *Broker) Stop() error {
 
 	b.wg.Wait()
 
-	log.Printf("Broker %s stopped successfully", b.ID)
+	b.logger.Printf("Broker %s stopped successfully", b.ID)
 	return nil
 }
 
@@ -302,10 +354,10 @@ func (b *Broker) loadAndValidateConfig() error {
 
 // initRaft initializes the Raft NodeHost
 func (b *Broker) initRaft() error {
-	log.Printf("Initializing Raft NodeHost...")
+	b.logger.Printf("Initializing Raft NodeHost...")
 
 	// Create Raft manager
-	raftManager, err := raft.NewRaftManager(b.Config.RaftConfig, b.Config.DataDir)
+	raftManager, err := raft.NewRaftManager(b.Config.RaftConfig, b.Config.DataDir, b.logger)
 	if err != nil {
 		return fmt.Errorf("failed to create raft manager: %v", err)
 	}
@@ -313,13 +365,13 @@ func (b *Broker) initRaft() error {
 	b.raftManager = raftManager
 	b.NodeHost = raftManager.GetNodeHost()
 
-	log.Printf("Raft NodeHost initialized successfully")
+	b.logger.Printf("Raft NodeHost initialized successfully")
 	return nil
 }
 
 // initServiceDiscovery initializes service discovery
 func (b *Broker) initServiceDiscovery() error {
-	log.Printf("Initializing service discovery...")
+	b.logger.Printf("Initializing service discovery...")
 
 	disc, err := discovery.NewDiscovery(b.Config.Discovery)
 	if err != nil {
@@ -327,13 +379,13 @@ func (b *Broker) initServiceDiscovery() error {
 	}
 
 	b.discovery = disc
-	log.Printf("Service discovery initialized successfully")
+	b.logger.Printf("Service discovery initialized successfully")
 	return nil
 }
 
 // registerBroker registers this broker to service discovery
 func (b *Broker) registerBroker() error {
-	log.Printf("Registering broker to service discovery...")
+	b.logger.Printf("Registering broker to service discovery...")
 
 	brokerInfo := &discovery.BrokerInfo{
 		ID:          b.ID,
@@ -347,13 +399,13 @@ func (b *Broker) registerBroker() error {
 		return fmt.Errorf("failed to register broker: %v", err)
 	}
 
-	log.Printf("Broker registered successfully")
+	b.logger.Printf("Broker registered successfully")
 	return nil
 }
 
 // initController initializes the Controller
 func (b *Broker) initController() error {
-	log.Printf("Initializing Controller...")
+	b.logger.Printf("Initializing Controller...")
 
 	controller, err := NewControllerManager(b)
 	if err != nil {
@@ -372,41 +424,112 @@ func (b *Broker) initController() error {
 		}
 	}
 
-	log.Printf("Controller initialized successfully")
+	b.logger.Printf("Controller initialized successfully")
 	return nil
 }
 
 // initConsumerGroupManager initializes the consumer group manager
 func (b *Broker) initConsumerGroupManager() error {
 	b.ConsumerGroupManager = NewConsumerGroupManager(b)
-	log.Printf("Consumer Group Manager initialized")
+	b.logger.Printf("Consumer Group Manager initialized")
 	return nil
 }
 
 // initTransactionManager initializes the transaction manager
 func (b *Broker) initTransactionManager() error {
+	defer b.panicHandler("initTransactionManager")
+
+	// Create partition transaction manager, remove raftProposer parameter
+	b.TransactionManager = transaction.NewPartitionTransactionManager(
+		"", // topic - empty string indicates global manager
+		-1, // partitionID - -1 indicates global manager
+		b.logger,
+		3,              // maxCheckCount
+		30*time.Second, // checkInterval
+	)
+
+	// Create transaction checker, use broker as parameter
 	b.TransactionChecker = NewTransactionChecker(b)
-	b.TransactionManager = transaction.NewTransactionManager()
 
-	if b.raftManager != nil {
-		groupID := raft.TransactionManagerGroupID
+	b.logger.Printf("Transaction manager initialized successfully")
+	return nil
+}
 
-		raftProposer := NewBrokerRaftProposer(b.raftManager)
-
-		b.TransactionManager.EnableRaft(raftProposer, groupID)
-
-		if err := b.startTransactionRaftGroup(groupID); err != nil {
-			log.Printf("Warning: Failed to start transaction Raft group: %v", err)
-		}
+// initDelayedMessageManager initializes the delayed message manager
+func (b *Broker) initDelayedMessageManager() error {
+	// Create delayed message storage
+	storage, err := delayed.NewPebbleDelayedMessageStorage(filepath.Join(b.Config.DataDir, "delayed"))
+	if err != nil {
+		return fmt.Errorf("failed to create delayed message storage: %v", err)
 	}
 
-	log.Printf("Transaction Manager and Checker initialized")
+	// Create delayed message manager configuration (simplified without callbacks)
+	config := delayed.DelayedMessageManagerConfig{
+		Storage:         storage,
+		MaxRetries:      3,
+		CleanupInterval: 1 * time.Hour,
+	}
+
+	// Create message delivery callback function
+	deliveryCallback := func(topic string, partition int32, key, value []byte) error {
+		b.logger.Printf("Delivering delayed message to topic %s, partition %d", topic, partition)
+
+		// 构造ProduceRequest
+		produceReq := &ProduceRequest{
+			Topic:     topic,
+			Partition: partition,
+			Messages: []ProduceMessage{
+				{
+					Key:       key,
+					Value:     value,
+					Timestamp: time.Now(), 
+				},
+			},
+		}
+
+		if b.ClientServer == nil {
+			return fmt.Errorf("client server not initialized")
+		}
+
+		response, err := b.ClientServer.handleProduceToRaft(produceReq)
+		if err != nil {
+			b.logger.Printf("❌ Failed to deliver delayed message: %v", err)
+			return err
+		}
+
+		if len(response.Results) > 0 && response.Results[0].Error != "" {
+			b.logger.Printf("❌ Failed to deliver delayed message: %s", response.Results[0].Error)
+			return fmt.Errorf("delivery failed: %s", response.Results[0].Error)
+		}
+
+		b.logger.Printf("✅ Successfully delivered delayed message to %s-%d", topic, partition)
+		return nil
+	}
+
+	// Create delayed message manager
+	delayedMessageManager := delayed.NewDelayedMessageManager(config, deliveryCallback)
+	b.DelayedMessageManager = delayedMessageManager
+
+	// Start delayed message manager
+	if err := delayedMessageManager.Start(); err != nil {
+		return fmt.Errorf("failed to start delayed message manager: %v", err)
+	}
+
+	delayedScanner := NewDelayedMessageScanner(b, delayedMessageManager, 60*time.Second)
+	if err := delayedScanner.Start(); err != nil {
+		return fmt.Errorf("failed to start delayed message scanner: %v", err)
+	}
+
+	// Store scanner reference for cleanup
+	b.delayedScanner = delayedScanner
+
+	b.logger.Printf("Delayed Message Manager and Scanner initialized and started")
 	return nil
 }
 
 // startClientServer starts the client server
 func (b *Broker) startClientServer() error {
-	log.Printf("Starting client server...")
+	b.logger.Printf("Starting client server...")
 
 	clientServer, err := NewClientServer(b)
 	if err != nil {
@@ -419,7 +542,7 @@ func (b *Broker) startClientServer() error {
 		return fmt.Errorf("failed to start client server: %v", err)
 	}
 
-	log.Printf("Client server started successfully")
+	b.logger.Printf("Client server started successfully")
 	return nil
 }
 
@@ -453,19 +576,7 @@ func (b *Broker) startHeartbeat() {
 	b.wg.Add(1)
 	go func() {
 		defer b.wg.Done()
-
-		// Wait for controller to be ready before starting heartbeat
-		for i := 0; i < 10; i++ {
-			time.Sleep(1 * time.Second)
-			if b.Controller != nil {
-				break
-			}
-		}
-
-		if b.Controller == nil {
-			log.Printf("Controller not initialized after 10 seconds, heartbeat disabled")
-			return
-		}
+		defer b.panicHandler("heartbeat-goroutine")
 
 		ticker := time.NewTicker(30 * time.Second) // Send heartbeat every 30 seconds
 		defer ticker.Stop()
@@ -474,7 +585,7 @@ func (b *Broker) startHeartbeat() {
 			select {
 			case <-ticker.C:
 				if err := b.sendHeartbeat(); err != nil {
-					log.Printf("Failed to send heartbeat: %v", err)
+					b.logger.Printf("Failed to send heartbeat: %v", err)
 				}
 			case <-b.Ctx.Done():
 				return
@@ -524,7 +635,7 @@ func (b *Broker) unregisterBroker() error {
 }
 
 func (b *Broker) startSystemMetrics() error {
-	log.Printf("Starting system metrics collection for broker %s", b.ID)
+	b.logger.Printf("Starting system metrics collection for broker %s", b.ID)
 
 	b.systemMetrics = NewSystemMetrics(b)
 	return b.systemMetrics.Start()
@@ -532,7 +643,7 @@ func (b *Broker) startSystemMetrics() error {
 
 // initMessageProcessing initializes compression and deduplication components
 func (b *Broker) initMessageProcessing() error {
-	log.Printf("Initializing message processing components for broker %s", b.ID)
+	b.logger.Printf("Initializing message processing components for broker %s", b.ID)
 
 	if b.Config.CompressionEnabled {
 		var compressionType compression.CompressionType
@@ -554,15 +665,25 @@ func (b *Broker) initMessageProcessing() error {
 			return fmt.Errorf("failed to initialize compressor: %v", err)
 		}
 		b.compressor = compressor
-		log.Printf("Compression enabled with type: %s", compressionType.String())
+		b.logger.Printf("Compression enabled with type: %s", compressionType.String())
 	} else {
 		b.compressor, _ = compression.GetCompressor(compression.None)
-		log.Printf("Compression disabled")
+		b.logger.Printf("Compression disabled")
 	}
 
 	// Initialize ordered message router
 	b.orderedRouter = NewOrderedMessageRouter()
-	log.Printf("Ordered message router initialized")
+	b.logger.Printf("Ordered message router initialized")
 
 	return nil
+}
+
+// GetDelayedMessageManager gets the delayed message manager
+func (b *Broker) GetDelayedMessageManager() *delayed.DelayedMessageManager {
+	return b.DelayedMessageManager
+}
+
+// GetLogger returns the broker's independent logger instance
+func (b *Broker) GetLogger() *log.Logger {
+	return b.logger
 }

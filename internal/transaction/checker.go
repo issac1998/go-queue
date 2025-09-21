@@ -8,8 +8,8 @@ import (
 	"net"
 	"time"
 
-	"github.com/issac1998/go-queue/internal/protocol"
 	typederrors "github.com/issac1998/go-queue/internal/errors"
+	"github.com/issac1998/go-queue/internal/protocol"
 )
 
 // DefaultTransactionChecker  check txn
@@ -29,8 +29,8 @@ func NewDefaultTransactionChecker() *DefaultTransactionChecker {
 }
 
 // RegisterProducerGroup register checker
-func (c *DefaultTransactionChecker) RegisterProducerGroup(group, brokerAddr string) {
-	c.producerGroupBrokers[group] = brokerAddr
+func (c *DefaultTransactionChecker) RegisterProducerGroup(group, callbackAddr string) {
+	c.producerGroupBrokers[group] = callbackAddr
 }
 
 // CheckTransactionState check txn
@@ -38,20 +38,20 @@ func (c *DefaultTransactionChecker) RegisterProducerGroup(group, brokerAddr stri
 func (c *DefaultTransactionChecker) CheckTransactionState(transactionID TransactionID, originalMessage HalfMessage) TransactionState {
 	log.Printf("Checking transaction state for: %s", transactionID)
 
-	brokerAddr, exists := c.producerGroupBrokers[originalMessage.ProducerGroup]
+	callbackAddr, exists := c.producerGroupBrokers[originalMessage.ProducerGroup]
 	if !exists {
 		log.Printf("No broker registered for producer group: %s", originalMessage.ProducerGroup)
 		return StateUnknown
 	}
 
-	return c.CheckTransactionStateWithBroker(brokerAddr, transactionID, originalMessage)
+	return c.CheckTransactionStateNet(callbackAddr, transactionID, originalMessage)
 }
 
 // CheckTransactionStateWithBroker check status
-func (c *DefaultTransactionChecker) CheckTransactionStateWithBroker(brokerAddr string, transactionID TransactionID, originalMessage HalfMessage) TransactionState {
-	conn, err := net.DialTimeout("tcp", brokerAddr, c.connectTimeout)
+func (c *DefaultTransactionChecker) CheckTransactionStateNet(callbackAddr string, transactionID TransactionID, originalMessage HalfMessage) TransactionState {
+	conn, err := net.DialTimeout("tcp", callbackAddr, c.connectTimeout)
 	if err != nil {
-		log.Printf("Failed to connect to broker %s for transaction check: %v", brokerAddr, err)
+		log.Printf("Failed to connect to broker %s for transaction check: %v", callbackAddr, err)
 		return StateUnknown
 	}
 	defer conn.Close()
@@ -123,4 +123,24 @@ func (c *DefaultTransactionChecker) readCheckResponse(conn io.Reader) (*Transact
 	}
 
 	return &response, nil
+}
+
+// GetRegisteredProducerGroups returns all registered producer groups
+func (c *DefaultTransactionChecker) GetRegisteredProducerGroups() map[string]string {
+	result := make(map[string]string)
+	for group, addr := range c.producerGroupBrokers {
+		result[group] = addr
+	}
+	return result
+}
+
+// GetProducerGroupBroker returns the broker address for a specific producer group
+func (c *DefaultTransactionChecker) GetProducerGroupBroker(group string) (string, bool) {
+	addr, exists := c.producerGroupBrokers[group]
+	return addr, exists
+}
+
+// UnregisterProducerGroup removes a producer group from the checker
+func (c *DefaultTransactionChecker) UnregisterProducerGroup(group string) {
+	delete(c.producerGroupBrokers, group)
 }

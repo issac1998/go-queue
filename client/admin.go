@@ -12,6 +12,7 @@ import (
 )
 
 // Admin management client
+// Admin is used to manage topics CRUD operations
 type Admin struct {
 	client *Client
 }
@@ -55,14 +56,6 @@ type PartitionInfo struct {
 	MessageCount int64
 	StartOffset  int64
 	EndOffset    int64
-}
-
-// SimpleTopicInfo represents basic topic information
-type SimpleTopicInfo struct {
-	Name         string
-	Partitions   int32
-	MessageCount int64
-	Size         int64
 }
 
 // CreateTopic creates a topic
@@ -184,24 +177,6 @@ func (a *Admin) buildListTopicsRequest() ([]byte, error) {
 	if err := binary.Write(buf, binary.BigEndian, int16(protocol.ProtocolVersion)); err != nil {
 		return nil, err
 	}
-	return buf.Bytes(), nil
-}
-
-// buildDescribeTopicRequest builds describe topic request
-func (a *Admin) buildDescribeTopicRequest(topicName string) ([]byte, error) {
-	buf := new(bytes.Buffer)
-
-	if err := binary.Write(buf, binary.BigEndian, int16(protocol.ProtocolVersion)); err != nil {
-		return nil, err
-	}
-
-	if err := binary.Write(buf, binary.BigEndian, int16(len(topicName))); err != nil {
-		return nil, err
-	}
-	if _, err := buf.WriteString(topicName); err != nil {
-		return nil, err
-	}
-
 	return buf.Bytes(), nil
 }
 
@@ -358,7 +333,6 @@ func (a *Admin) parseGetTopicInfoResponse(data []byte) (*TopicInfo, error) {
 		return nil, fmt.Errorf("failed to read created time: %v", err)
 	}
 	topic.CreatedAt = time.Unix(createdAtUnix, 0)
-
 
 	var partitionCount int32
 	if err := binary.Read(buf, binary.BigEndian, &partitionCount); err != nil {

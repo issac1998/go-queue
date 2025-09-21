@@ -39,6 +39,7 @@ type RaftManager struct {
 	config   *RaftConfig
 	dataDir  string
 	nodeHost *dragonboat.NodeHost
+	logger   *log.Logger
 
 	groups map[uint64]*RaftGroup
 	mu     sync.RWMutex
@@ -68,7 +69,7 @@ type leaderState struct {
 }
 
 // NewRaftManager creates a new RaftManager instance with real Dragonboat integration
-func NewRaftManager(raftConfig *RaftConfig, dataDir string) (*RaftManager, error) {
+func NewRaftManager(raftConfig *RaftConfig, dataDir string, logger *log.Logger) (*RaftManager, error) {
 	if raftConfig == nil {
 		raftConfig = &RaftConfig{
 			RTTMillisecond:         200,
@@ -90,6 +91,7 @@ func NewRaftManager(raftConfig *RaftConfig, dataDir string) (*RaftManager, error
 	rm := &RaftManager{
 		config:             raftConfig,
 		dataDir:            dataDir,
+		logger:             logger,
 		groups:             make(map[uint64]*RaftGroup),
 		ctx:                ctx,
 		cancel:             cancel,
@@ -131,7 +133,7 @@ func (rm *RaftManager) initNodeHost() error {
 	}
 
 	rm.nodeHost = nodeHost
-	log.Printf("Dragonboat NodeHost initialized successfully on %s", rm.config.RaftAddr)
+	rm.logger.Printf("Dragonboat NodeHost initialized successfully on %s", rm.config.RaftAddr)
 
 	return nil
 }
@@ -176,7 +178,7 @@ func (rm *RaftManager) StartRaftGroup(groupID uint64, members map[uint64]string,
 		initialMembers = members
 	}
 
-	log.Printf("Starting Raft group %d (join=%t) with initialMembers: %v", groupID, join, initialMembers)
+	rm.logger.Printf("Starting Raft group %d (join=%t) with initialMembers: %v", groupID, join, initialMembers)
 
 	err := rm.nodeHost.StartCluster(initialMembers, join, func(uint64, uint64) statemachine.IStateMachine {
 		return sm
@@ -197,7 +199,7 @@ func (rm *RaftManager) StartRaftGroup(groupID uint64, members map[uint64]string,
 		IsController: groupID == 1,
 	}
 
-	log.Printf("Raft group %d started successfully (join=%t)", groupID, join)
+	rm.logger.Printf("Raft group %d started successfully (join=%t)", groupID, join)
 	return nil
 }
 
@@ -224,7 +226,7 @@ func (rm *RaftManager) StopRaftGroup(groupID uint64) error {
 	}
 
 	delete(rm.groups, groupID)
-	log.Printf("Raft group %d stopped successfully", groupID)
+	rm.logger.Printf("Raft group %d stopped successfully", groupID)
 	return nil
 }
 
@@ -318,18 +320,18 @@ func (rm *RaftManager) GetStateMachine(groupID uint64) (statemachine.IStateMachi
 // WaitForLeadershipReady waits for the raft group to have a leader within the timeout
 func (rm *RaftManager) WaitForLeadershipReady(groupID uint64, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
-	checkInterval := 1 * time.Second // Check every 100ms instead of busy waiting
+	checkInterval := 5 * time.Second
 
 	for time.Now().Before(deadline) {
 		if leaderID, exists, err := rm.GetLeaderID(groupID); err == nil && exists && leaderID != 0 {
-			log.Printf("Raft group %d has leader: %d", groupID, leaderID)
+			rm.logger.Printf("find Raft group %d leader: %d", groupID, leaderID)
 			return nil
 		}
-
+		rm.logger.Printf("not found , retry")
 		// Sleep to avoid busy waiting and reduce CPU usage
 		time.Sleep(checkInterval)
 	}
-
+	rm.logger.Printf("timeout waiting for raft group %d to establish leadership", groupID)
 	return &typederrors.TypedError{
 		Type:    typederrors.LeadershipError,
 		Message: fmt.Sprintf("timeout waiting for raft group %d to establish leadership", groupID),
@@ -371,7 +373,7 @@ func (rm *RaftManager) Close() error {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 
-	log.Printf("Shutting down RaftManager...")
+	rm.logger.Printf("Shutting down RaftManager...")
 
 	// Stop unified leadership watcher first
 	if rm.watcherCancel != nil {
@@ -382,7 +384,7 @@ func (rm *RaftManager) Close() error {
 
 	for groupID := range rm.groups {
 		if err := rm.nodeHost.StopCluster(groupID); err != nil {
-			log.Printf("Error stopping raft group %d: %v", groupID, err)
+			rm.logger.Printf("Error stopping raft group %d: %v", groupID, err)
 		}
 	}
 
@@ -390,8 +392,29 @@ func (rm *RaftManager) Close() error {
 		rm.nodeHost.Stop()
 	}
 
-	log.Printf("RaftManager shutdown completed")
+	rm.logger.Printf("RaftManager shutdown completed")
 	return nil
+}
+
+// SyncRead performs a linearizable read operation on the specified Raft group
+func (rm *RaftManager) SyncRead(ctx context.Context, groupID uint64, query interface{}) (interface{}, error) {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+
+	if rm.nodeHost == nil {
+		return nil, fmt.Errorf("NodeHost is not initialized")
+	}
+
+	if _, exists := rm.groups[groupID]; !exists {
+		return nil, fmt.Errorf("raft group %d not found", groupID)
+	}
+
+	result, err := rm.nodeHost.SyncRead(ctx, groupID, query)
+	if err != nil {
+		return nil, typederrors.NewTypedError(typederrors.GeneralError, fmt.Sprintf("SyncRead operation failed for group %d", groupID), err)
+	}
+
+	return result, nil
 }
 
 // EnsureReadIndexConsistency ensures read consistency on followers
@@ -414,7 +437,7 @@ func (rm *RaftManager) EnsureReadIndexConsistency(ctx context.Context, groupID u
 
 	select {
 	case <-result.AppliedC():
-		log.Printf("ReadIndex completed for group %d", groupID)
+		rm.logger.Printf("ReadIndex completed for group %d", groupID)
 		return 0, nil
 	case <-ctx.Done():
 		return 0, fmt.Errorf("ReadIndex operation timeout for group %d: %v", groupID, ctx.Err())

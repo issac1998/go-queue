@@ -3,19 +3,55 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"hash/fnv"
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/issac1998/go-queue/internal/broker"
 	"github.com/issac1998/go-queue/internal/discovery"
 	"github.com/issac1998/go-queue/internal/raft"
 )
 
+// panicHandler 全局 panic 处理器
+func panicHandler(component string) {
+	if r := recover(); r != nil {
+		stack := debug.Stack()
+		log.Printf("PANIC in %s: %v\nStack trace:\n%s", component, r, string(stack))
+		
+		// 记录到文件
+		if logFile, err := os.OpenFile("panic.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666); err == nil {
+			fmt.Fprintf(logFile, "[%s] PANIC in %s: %v\nStack trace:\n%s\n\n", 
+				time.Now().Format("2006-01-02 15:04:05"), component, r, string(stack))
+			logFile.Close()
+		}
+		
+		// 如果是主 goroutine panic，退出程序
+		if component == "main" {
+			log.Printf("Main goroutine panic, exiting...")
+			os.Exit(1)
+		}
+	}
+}
+
+// safeGoroutine 安全的 goroutine 包装器
+func safeGoroutine(name string, fn func()) {
+	go func() {
+		defer panicHandler(name)
+		fn()
+	}()
+}
+
 func main() {
+	// 主 goroutine panic 捕获
+	defer panicHandler("main")
+	
 	nodeID := flag.String("node-id", "", "Unique node identifier")
 	bindAddr := flag.String("bind-addr", "127.0.0.1", "Bind address")
 	bindPort := flag.Int("bind-port", 9092, "Bind port")
@@ -63,6 +99,8 @@ func main() {
 		EnableFollowerRead: *enableFollowerRead, // Set follower read configuration
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	
 	// Create and start broker
 	b := &broker.Broker{
 		ID:      config.NodeID,
@@ -75,20 +113,60 @@ func main() {
 
 	log.Printf("Starting Multi-Raft Message Queue Broker %s...", b.ID)
 
-	if err := b.Start(); err != nil {
-		log.Fatalf("Failed to start broker: %v", err)
-	}
+	// 启动 broker（在安全的 goroutine 中）
+	brokerDone := make(chan error, 1)
+	safeGoroutine("broker-start", func() {
+		if err := b.Start(); err != nil {
+			brokerDone <- fmt.Errorf("broker start failed: %v", err)
+		} else {
+			brokerDone <- nil
+		}
+	})
+
+	// 启动内存监控（在安全的 goroutine 中）
+	safeGoroutine("memory-monitor", func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		
+		for {
+			select {
+			case <-ticker.C:
+				var m runtime.MemStats
+				runtime.ReadMemStats(&m)
+				log.Printf("Memory Stats - Alloc: %d KB, Sys: %d KB, NumGC: %d", 
+					m.Alloc/1024, m.Sys/1024, m.NumGC)
+			case <-ctx.Done():
+				return
+			}
+		}
+	})
 
 	// Wait for interrupt signal
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	log.Printf("Broker %s is running. Press Ctrl+C to exit.", b.ID)
-	<-sigChan
-
-	log.Printf("Shutting down broker %s...", b.ID)
-	if err := b.Stop(); err != nil {
-		log.Printf("Error stopping broker: %v", err)
+	
+	// 等待退出信号或 broker 错误
+	select {
+	case sig := <-sigChan:
+		log.Printf("Received signal %v, shutting down...", sig)
+		cancel()
+		
+		// 给 broker 一些时间优雅关闭
+		shutdownTimer := time.NewTimer(30 * time.Second)
+		select {
+		case <-brokerDone:
+			log.Println("Broker shutdown completed")
+		case <-shutdownTimer.C:
+			log.Println("Broker shutdown timeout, forcing exit")
+		}
+		
+	case err := <-brokerDone:
+		if err != nil {
+			log.Printf("Broker error: %v", err)
+			os.Exit(1)
+		}
 	}
 
 	log.Printf("Broker %s shutdown complete", b.ID)

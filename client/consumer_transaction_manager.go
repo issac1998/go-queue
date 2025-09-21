@@ -2,12 +2,10 @@ package client
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
+	"log"
 	"sync"
 	"time"
-
-	"github.com/issac1998/go-queue/internal/protocol"
 )
 
 type ConsumerTransactionState int32
@@ -73,7 +71,7 @@ func NewConsumerTransaction(id, groupID, consumerID string, timeout time.Duratio
 func (ct *ConsumerTransaction) AddProcessedMessage(record *ProcessedRecord) {
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
-	
+
 	ct.ProcessedMessages = append(ct.ProcessedMessages, record)
 	ct.LastUpdateTime = time.Now()
 }
@@ -82,7 +80,7 @@ func (ct *ConsumerTransaction) AddProcessedMessage(record *ProcessedRecord) {
 func (ct *ConsumerTransaction) AddOffsetCommit(topic string, partition int32, offset int64) {
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
-	
+
 	if ct.OffsetCommits[topic] == nil {
 		ct.OffsetCommits[topic] = make(map[int32]int64)
 	}
@@ -94,7 +92,7 @@ func (ct *ConsumerTransaction) AddOffsetCommit(topic string, partition int32, of
 func (ct *ConsumerTransaction) UpdateState(state ConsumerTransactionState) {
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
-	
+
 	ct.State = state
 	ct.LastUpdateTime = time.Now()
 }
@@ -103,7 +101,7 @@ func (ct *ConsumerTransaction) UpdateState(state ConsumerTransactionState) {
 func (ct *ConsumerTransaction) IsExpired() bool {
 	ct.mu.RLock()
 	defer ct.mu.RUnlock()
-	
+
 	return time.Since(ct.StartTime) > ct.Timeout
 }
 
@@ -111,52 +109,48 @@ func (ct *ConsumerTransaction) IsExpired() bool {
 func (ct *ConsumerTransaction) GetState() ConsumerTransactionState {
 	ct.mu.RLock()
 	defer ct.mu.RUnlock()
-	
+
 	return ct.State
 }
 
 // ConsumerTransactionManager consumer txn manager
 type ConsumerTransactionManager struct {
-	client              *Client
-	groupID             string
-	consumerID          string
-	transactions        map[string]*ConsumerTransaction
-	currentTransaction  *ConsumerTransaction
-	defaultTimeout      time.Duration
-	mu                  sync.RWMutex
-	cleanupTicker       *time.Ticker
-	stopCleanup         chan struct{}
+	client             *Client
+	groupConsumer      *GroupConsumer // 添加 GroupConsumer 字段
+	groupID            string
+	consumerID         string
+	transactions       map[string]*ConsumerTransaction
+	currentTransaction *ConsumerTransaction
+	defaultTimeout     time.Duration
+	mu                 sync.RWMutex
+	stopCleanup        chan struct{}
+	processedMessages  map[string][]*ConsumeMessage
 }
 
-// ConsumerTransactionManagerConfig manager config
-type ConsumerTransactionManagerConfig struct {
-	GroupID           string
-	ConsumerID        string
-	DefaultTimeout    time.Duration
-	CleanupInterval   time.Duration
+// ConsumerManagerConfig manager config
+type ConsumerManagerConfig struct {
+	GroupID        string
+	ConsumerID     string
+	DefaultTimeout time.Duration
 }
 
-// NewConsumerTransactionManager create manager 
-func NewConsumerTransactionManager(client *Client, config ConsumerTransactionManagerConfig) *ConsumerTransactionManager {
+// NewConsumerTransactionManager create manager
+func NewConsumerTransactionManager(client *Client, groupConsumer *GroupConsumer, config ConsumerManagerConfig) *ConsumerTransactionManager {
 	if config.DefaultTimeout == 0 {
 		config.DefaultTimeout = 30 * time.Second
 	}
-	if config.CleanupInterval == 0 {
-		config.CleanupInterval = 5 * time.Minute
-	}
-	
+
 	ctm := &ConsumerTransactionManager{
-		client:         client,
-		groupID:        config.GroupID,
-		consumerID:     config.ConsumerID,
-		transactions:   make(map[string]*ConsumerTransaction),
-		defaultTimeout: config.DefaultTimeout,
-		stopCleanup:    make(chan struct{}),
+		client:            client,
+		groupConsumer:     groupConsumer, // 设置 GroupConsumer
+		groupID:           config.GroupID,
+		consumerID:        config.ConsumerID,
+		transactions:      make(map[string]*ConsumerTransaction),
+		defaultTimeout:    config.DefaultTimeout,
+		stopCleanup:       make(chan struct{}),
+		processedMessages: make(map[string][]*ConsumeMessage),
 	}
-	
-	ctm.cleanupTicker = time.NewTicker(config.CleanupInterval)
-	go ctm.runCleanup()
-	
+
 	return ctm
 }
 
@@ -164,91 +158,102 @@ func NewConsumerTransactionManager(client *Client, config ConsumerTransactionMan
 func (ctm *ConsumerTransactionManager) BeginTransaction(ctx context.Context) (*ConsumerTransaction, error) {
 	ctm.mu.Lock()
 	defer ctm.mu.Unlock()
-	
-	if ctm.currentTransaction != nil {
-		state := ctm.currentTransaction.GetState()
-		if state == ConsumerTransactionStateBegin || state == ConsumerTransactionStateInProgress {
-			return nil, fmt.Errorf("transaction already in progress: %s", ctm.currentTransaction.ID)
-		}
-	}
-	
+
 	transactionID := fmt.Sprintf("%s-%s-%d", ctm.groupID, ctm.consumerID, time.Now().UnixNano())
-	
+
 	transaction := NewConsumerTransaction(transactionID, ctm.groupID, ctm.consumerID, ctm.defaultTimeout)
-	
-	err := ctm.sendBeginTransactionRequest(ctx, transaction)
-	if err != nil {
-		return nil, fmt.Errorf("failed to begin transaction: %v", err)
-	}
-	
-	transaction.UpdateState(ConsumerTransactionStateInProgress)
+	transaction.UpdateState(ConsumerTransactionStateBegin)
+
 	ctm.transactions[transactionID] = transaction
 	ctm.currentTransaction = transaction
-	
+
+	log.Printf("Started transaction %s locally (no broker request)", transactionID)
 	return transaction, nil
 }
 
 // CommitTransaction commit txn
-func (ctm *ConsumerTransactionManager) CommitTransaction(ctx context.Context, transactionID string) error {
+func (ctm *ConsumerTransactionManager) CommitTransaction(ctx context.Context, transactionID string, commitHandler func(msg *ConsumeMessage) error) error {
 	ctm.mu.Lock()
 	defer ctm.mu.Unlock()
-	
+
 	transaction, exists := ctm.transactions[transactionID]
 	if !exists {
 		return fmt.Errorf("transaction not found: %s", transactionID)
 	}
-	
-	if transaction.GetState() != ConsumerTransactionStateInProgress {
-		return fmt.Errorf("transaction not in progress: %s, state: %s", transactionID, transaction.GetState())
+
+	if transaction.IsExpired() {
+		return fmt.Errorf("transaction expired: %s", transactionID)
 	}
-	
+
 	transaction.UpdateState(ConsumerTransactionStateCommitting)
-	
-	err := ctm.sendCommitTransactionRequest(ctx, transaction)
-	if err != nil {
-		transaction.UpdateState(ConsumerTransactionStateInProgress)
-		return fmt.Errorf("failed to commit transaction: %v", err)
+
+	// Execute commit handler for processed messages
+	if commitHandler != nil {
+		if messages, exists := ctm.processedMessages[transactionID]; exists {
+			for _, msg := range messages {
+				if err := commitHandler(msg); err != nil {
+					transaction.UpdateState(ConsumerTransactionStateInProgress)
+					return fmt.Errorf("commit handler failed for message: %v", err)
+				}
+			}
+		}
 	}
-	
+
+	transaction.mu.RLock()
+	for topic, partitions := range transaction.OffsetCommits {
+		for partition, offset := range partitions {
+			if groupConsumer := ctm.getGroupConsumer(); groupConsumer != nil {
+				if err := groupConsumer.CommitOffset(topic, partition, offset, fmt.Sprintf("tx:%s", transactionID)); err != nil {
+					transaction.mu.RUnlock()
+					transaction.UpdateState(ConsumerTransactionStateInProgress)
+					return fmt.Errorf("failed to commit offset for topic %s partition %d: %v", topic, partition, err)
+				}
+			}
+		}
+	}
+	transaction.mu.RUnlock()
+
 	transaction.UpdateState(ConsumerTransactionStateCommitted)
-	// compelte
-	if ctm.currentTransaction != nil && ctm.currentTransaction.ID == transactionID {
-		ctm.currentTransaction = nil
-	}
-	
+	delete(ctm.processedMessages, transactionID)
+
 	return nil
 }
 
+func (ctm *ConsumerTransactionManager) getGroupConsumer() *GroupConsumer {
+	return ctm.groupConsumer
+}
+
 // AbortTransaction abort transaction
-func (ctm *ConsumerTransactionManager) AbortTransaction(ctx context.Context, transactionID string) error {
+func (ctm *ConsumerTransactionManager) AbortTransaction(ctx context.Context, transactionID string, rollbackHandler func(msg *ConsumeMessage) error) error {
 	ctm.mu.Lock()
 	defer ctm.mu.Unlock()
-	
+
 	transaction, exists := ctm.transactions[transactionID]
 	if !exists {
 		return fmt.Errorf("transaction not found: %s", transactionID)
 	}
-	
-	state := transaction.GetState()
-	if state != ConsumerTransactionStateInProgress && state != ConsumerTransactionStateCommitting {
-		return fmt.Errorf("transaction cannot be aborted: %s, state: %s", transactionID, state)
+
+	if transaction.IsExpired() {
+		return fmt.Errorf("transaction expired: %s", transactionID)
 	}
-	
+
 	transaction.UpdateState(ConsumerTransactionStateAborting)
-	
-	err := ctm.sendAbortTransactionRequest(ctx, transaction)
-	if err != nil {
-		transaction.UpdateState(ConsumerTransactionStateInProgress)
-		return fmt.Errorf("failed to abort transaction: %v", err)
+
+	// Execute rollback handler for processed messages
+	if rollbackHandler != nil {
+		if messages, exists := ctm.processedMessages[transactionID]; exists {
+			for _, msg := range messages {
+				if err := rollbackHandler(msg); err != nil {
+					log.Printf("Rollback handler failed for message: %v", err)
+				}
+			}
+		}
 	}
-	
+
 	transaction.UpdateState(ConsumerTransactionStateAborted)
-	
-	
-	if ctm.currentTransaction != nil && ctm.currentTransaction.ID == transactionID {
-		ctm.currentTransaction = nil
-	}
-	
+	delete(ctm.processedMessages, transactionID)
+
+	log.Printf("Transaction %s aborted successfully (local cleanup only)", transactionID)
 	return nil
 }
 
@@ -256,7 +261,7 @@ func (ctm *ConsumerTransactionManager) AbortTransaction(ctx context.Context, tra
 func (ctm *ConsumerTransactionManager) GetCurrentTransaction() *ConsumerTransaction {
 	ctm.mu.RLock()
 	defer ctm.mu.RUnlock()
-	
+
 	return ctm.currentTransaction
 }
 
@@ -264,185 +269,18 @@ func (ctm *ConsumerTransactionManager) GetCurrentTransaction() *ConsumerTransact
 func (ctm *ConsumerTransactionManager) GetTransaction(transactionID string) (*ConsumerTransaction, bool) {
 	ctm.mu.RLock()
 	defer ctm.mu.RUnlock()
-	
+
 	transaction, exists := ctm.transactions[transactionID]
 	return transaction, exists
 }
 
 // Close close transaction manager
 func (ctm *ConsumerTransactionManager) Close() error {
-	if ctm.cleanupTicker != nil {
-		ctm.cleanupTicker.Stop()
-	}
-	
+
 	select {
 	case ctm.stopCleanup <- struct{}{}:
 	default:
 	}
-	
-	return nil
-}
-
-// sendBeginTransactionRequest send begin transaction request
-func (ctm *ConsumerTransactionManager) sendBeginTransactionRequest(ctx context.Context, transaction *ConsumerTransaction) error {
-	requestData, err := ctm.buildBeginTransactionRequest(transaction)
-	if err != nil {
-		return fmt.Errorf("failed to build start transaction request: %w", err)
-	}
-
-	responseData, err := ctm.client.sendMetaRequest(protocol.ConsumerBeginTransactionRequestType, requestData)
-	if err != nil {
-		return fmt.Errorf("failed to send start transaction request: %w", err)
-	}
-
-	return ctm.parseBeginTransactionResponse(responseData)
-}
-
-func (ctm *ConsumerTransactionManager) sendCommitTransactionRequest(ctx context.Context, transaction *ConsumerTransaction) error {
-	requestData, err := ctm.buildCommitTransactionRequest(transaction)
-	if err != nil {
-		return fmt.Errorf("failed to build commit transaction request: %w", err)
-	}
-
-	responseData, err := ctm.client.sendMetaRequest(protocol.ConsumerCommitTransactionRequestType, requestData)
-	if err != nil {
-		return fmt.Errorf("failed to send commit transaction request: %w", err)
-	}
-
-	return ctm.parseCommitTransactionResponse(responseData)
-}
-
-func (ctm *ConsumerTransactionManager) sendAbortTransactionRequest(ctx context.Context, transaction *ConsumerTransaction) error {
-	requestData, err := ctm.buildAbortTransactionRequest(transaction)
-	if err != nil {
-		return fmt.Errorf("failed to build abort transaction request: %w", err)
-	}
-
-	responseData, err := ctm.client.sendMetaRequest(protocol.ConsumerAbortTransactionRequestType, requestData)
-	if err != nil {
-		return fmt.Errorf("failed to send abort transaction request: %w", err)
-	}
-
-	return ctm.parseAbortTransactionResponse(responseData)
-}
-
-func (ctm *ConsumerTransactionManager) buildBeginTransactionRequest(transaction *ConsumerTransaction) ([]byte, error) {
-	request := map[string]interface{}{
-		"transaction_id": transaction.ID,
-		"consumer_id":    ctm.consumerID,
-		"group_id":       ctm.groupID,
-		"timeout_ms":     int64(transaction.Timeout / time.Millisecond),
-	}
-	return json.Marshal(request)
-}
-
-func (ctm *ConsumerTransactionManager) buildCommitTransactionRequest(transaction *ConsumerTransaction) ([]byte, error) {
-	request := map[string]interface{}{
-		"transaction_id": transaction.ID,
-		"consumer_id":    ctm.consumerID,
-		"group_id":       ctm.groupID,
-	}
-	return json.Marshal(request)
-}
-
-func (ctm *ConsumerTransactionManager) buildAbortTransactionRequest(transaction *ConsumerTransaction) ([]byte, error) {
-	request := map[string]interface{}{
-		"transaction_id": transaction.ID,
-		"consumer_id":    ctm.consumerID,
-		"group_id":       ctm.groupID,
-	}
-	return json.Marshal(request)
-}
-
-func (ctm *ConsumerTransactionManager) parseBeginTransactionResponse(responseData []byte) error {
-	var response map[string]interface{}
-	if err := json.Unmarshal(responseData, &response); err != nil {
-		return fmt.Errorf("failed to parse start transaction response: %w", err)
-	}
-
-	if errorCode, exists := response["error_code"]; exists {
-		if code, ok := errorCode.(float64); ok && code != 0 {
-			errorMsg := "unknown error"
-			if msg, exists := response["error_message"]; exists {
-				if msgStr, ok := msg.(string); ok {
-					errorMsg = msgStr
-				}
-			}
-			return fmt.Errorf("failed to start transaction: %s (error code: %.0f)", errorMsg, code)
-		}
-	}
 
 	return nil
-}
-
-func (ctm *ConsumerTransactionManager) parseCommitTransactionResponse(responseData []byte) error {
-	var response map[string]interface{}
-	if err := json.Unmarshal(responseData, &response); err != nil {
-		return fmt.Errorf("failed to parse commit transaction response: %w", err)
-	}
-
-	if errorCode, exists := response["error_code"]; exists {
-		if code, ok := errorCode.(float64); ok && code != 0 {
-			errorMsg := "unknown error"
-			if msg, exists := response["error_message"]; exists {
-				if msgStr, ok := msg.(string); ok {
-					errorMsg = msgStr
-				}
-			}
-			return fmt.Errorf("failed to commit transaction: %s (error code: %.0f)", errorMsg, code)
-		}
-	}
-
-	return nil
-}
-
-func (ctm *ConsumerTransactionManager) parseAbortTransactionResponse(responseData []byte) error {
-	var response map[string]interface{}
-	if err := json.Unmarshal(responseData, &response); err != nil {
-		return fmt.Errorf("failed to parse abort transaction response: %w", err)
-	}
-
-	if errorCode, exists := response["error_code"]; exists {
-		if code, ok := errorCode.(float64); ok && code != 0 {
-			errorMsg := "unknown error"
-			if msg, exists := response["error_message"]; exists {
-				if msgStr, ok := msg.(string); ok {
-					errorMsg = msgStr
-				}
-			}
-			return fmt.Errorf("failed to abort transaction: %s (error code: %.0f)", errorMsg, code)
-		}
-	}
-
-	return nil
-}
-
-func (ctm *ConsumerTransactionManager) runCleanup() {
-	for {
-		select {
-		case <-ctm.cleanupTicker.C:
-			ctm.cleanupExpiredTransactions()
-		case <-ctm.stopCleanup:
-			return
-		}
-	}
-}
-
-func (ctm *ConsumerTransactionManager) cleanupExpiredTransactions() {
-	ctm.mu.Lock()
-	defer ctm.mu.Unlock()
-	
-	for transactionID, transaction := range ctm.transactions {
-		if transaction.IsExpired() {
-			state := transaction.GetState()
-			if state == ConsumerTransactionStateCommitted || state == ConsumerTransactionStateAborted {
-				delete(ctm.transactions, transactionID)
-			} else {
-				transaction.UpdateState(ConsumerTransactionStateAborted)
-				if ctm.currentTransaction != nil && ctm.currentTransaction.ID == transactionID {
-					ctm.currentTransaction = nil
-				}
-			}
-		}
-	}
 }

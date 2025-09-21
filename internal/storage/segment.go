@@ -447,22 +447,187 @@ func (s *Segment) Sync() error {
 	return nil
 }
 
-// PurgeBefore removes index entries and (optionally) data before the given time.
-// This is a minimal stub; you should implement actual data deletion as needed.
-func (s *Segment) PurgeBefore(expireBefore time.Time) {
+// PurgeBefore removes index entries and data before the given time.
+func (s *Segment) PurgeBefore(expireBefore time.Time) error {
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
-	newEntries := s.IndexEntries[:0]
-	for _, entry := range s.IndexEntries {
+
+	if len(s.IndexEntries) == 0 {
+		return nil
+	}
+
+	// Find the first entry to keep
+	keepFromIndex := -1
+	var newBaseOffset int64
+	var newBasePosition int64
+
+	for i, entry := range s.IndexEntries {
 		if time.UnixMilli(entry.TimeMs).After(expireBefore) {
-			newEntries = append(newEntries, entry)
+			keepFromIndex = i
+			newBaseOffset = entry.Offset
+			newBasePosition = entry.Position
+			break
 		}
 	}
+
+	// If all entries should be purged
+	if keepFromIndex == -1 {
+		// Clear all entries and reset segment
+		s.IndexEntries = s.IndexEntries[:0]
+		s.BaseOffset = s.EndOffset
+		s.CurrentSize = 0
+		s.MinTimestamp = time.Time{}
+		s.MaxTimestamp = time.Time{}
+		
+		// Truncate files to remove all data
+		if err := s.LogFile.Truncate(0); err != nil {
+			return &typederrors.TypedError{
+				Type:    typederrors.StorageError,
+				Message: "failed to truncate log file",
+				Cause:   err,
+			}
+		}
+		
+		if err := s.IndexFile.Truncate(0); err != nil {
+			return &typederrors.TypedError{
+				Type:    typederrors.StorageError,
+				Message: "failed to truncate index file",
+				Cause:   err,
+			}
+		}
+		
+		if err := s.TimeIndexFile.Truncate(0); err != nil {
+			return &typederrors.TypedError{
+				Type:    typederrors.StorageError,
+				Message: "failed to truncate time index file",
+				Cause:   err,
+			}
+		}
+		
+		return nil
+	}
+
+	// Keep entries from keepFromIndex onwards
+	newEntries := make([]IndexEntry, len(s.IndexEntries)-keepFromIndex)
+	copy(newEntries, s.IndexEntries[keepFromIndex:])
+	
+	// Adjust positions relative to new base
+	for i := range newEntries {
+		newEntries[i].Position -= newBasePosition
+	}
+	
 	s.IndexEntries = newEntries
-	// Optionally, update MinTimestamp
+	s.BaseOffset = newBaseOffset
+
+	// Update timestamps
 	if len(s.IndexEntries) > 0 {
 		s.MinTimestamp = time.UnixMilli(s.IndexEntries[0].TimeMs)
+		s.MaxTimestamp = time.UnixMilli(s.IndexEntries[len(s.IndexEntries)-1].TimeMs)
 	} else {
 		s.MinTimestamp = time.Time{}
+		s.MaxTimestamp = time.Time{}
 	}
+
+	// Compact the log file by removing data before newBasePosition
+	if newBasePosition > 0 {
+		if err := s.compactLogFile(newBasePosition); err != nil {
+			return err
+		}
+	}
+
+	// Update current size
+	s.CurrentSize -= newBasePosition
+	if s.CurrentSize < 0 {
+		s.CurrentSize = 0
+	}
+
+	return nil
+}
+
+// compactLogFile removes data before the given position by shifting remaining data
+func (s *Segment) compactLogFile(removeBeforePos int64) error {
+	// Get current file size
+	fileInfo, err := s.LogFile.Stat()
+	if err != nil {
+		return &typederrors.TypedError{
+			Type:    typederrors.StorageError,
+			Message: "failed to get log file info",
+			Cause:   err,
+		}
+	}
+	
+	currentSize := fileInfo.Size()
+	if removeBeforePos >= currentSize {
+		// Nothing to compact
+		return nil
+	}
+
+	// Create a temporary file for compaction
+	tempFile, err := os.CreateTemp(s.DataDir, "segment_compact_*.tmp")
+	if err != nil {
+		return &typederrors.TypedError{
+			Type:    typederrors.StorageError,
+			Message: "failed to create temp file for compaction",
+			Cause:   err,
+		}
+	}
+	defer os.Remove(tempFile.Name())
+	defer tempFile.Close()
+
+	// Copy data from removeBeforePos to end of file
+	_, err = s.LogFile.Seek(removeBeforePos, io.SeekStart)
+	if err != nil {
+		return &typederrors.TypedError{
+			Type:    typederrors.StorageError,
+			Message: "failed to seek in log file",
+			Cause:   err,
+		}
+	}
+
+	_, err = io.Copy(tempFile, s.LogFile)
+	if err != nil {
+		return &typederrors.TypedError{
+			Type:    typederrors.StorageError,
+			Message: "failed to copy data during compaction",
+			Cause:   err,
+		}
+	}
+
+	// Close and reopen log file for writing
+	s.LogFile.Close()
+	
+	logFile, err := os.OpenFile(filepath.Join(s.DataDir, fmt.Sprintf("%020d.log", s.BaseOffset)), 
+		os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		return &typederrors.TypedError{
+			Type:    typederrors.StorageError,
+			Message: "failed to reopen log file",
+			Cause:   err,
+		}
+	}
+	s.LogFile = logFile
+
+	// Copy compacted data back to log file
+	tempFile.Seek(0, io.SeekStart)
+	_, err = io.Copy(s.LogFile, tempFile)
+	if err != nil {
+		return &typederrors.TypedError{
+			Type:    typederrors.StorageError,
+			Message: "failed to write compacted data",
+			Cause:   err,
+		}
+	}
+
+	// Truncate to remove any remaining old data
+	newSize := currentSize - removeBeforePos
+	err = s.LogFile.Truncate(newSize)
+	if err != nil {
+		return &typederrors.TypedError{
+			Type:    typederrors.StorageError,
+			Message: "failed to truncate log file after compaction",
+			Cause:   err,
+		}
+	}
+
+	return nil
 }

@@ -1,6 +1,7 @@
 package transaction
 
 import (
+	"context"
 	"time"
 
 	"github.com/issac1998/go-queue/internal/protocol"
@@ -17,6 +18,24 @@ const (
 	StatePrepared TransactionState = TransactionState(protocol.TransactionStatePrepared)
 	StateChecking TransactionState = TransactionState(protocol.TransactionStateChecking)
 )
+
+// String returns the string representation of TransactionState
+func (s TransactionState) String() string {
+	switch s {
+	case StateUnknown:
+		return "UNKNOWN"
+	case StateCommit:
+		return "COMMIT"
+	case StateRollback:
+		return "ROLLBACK"
+	case StatePrepared:
+		return "PREPARED"
+	case StateChecking:
+		return "CHECKING"
+	default:
+		return "INVALID"
+	}
+}
 
 // HalfMessage half message
 type HalfMessage struct {
@@ -93,6 +112,12 @@ type TransactionChecker interface {
 	CheckTransactionState(transactionID TransactionID, originalMessage HalfMessage) TransactionState
 }
 
+// RaftProposer 接口用于向Raft组提议事务命令
+type RaftProposer interface {
+	// ProposeTransactionCommand 向指定的Raft组提议事务命令
+	ProposeTransactionCommand(ctx context.Context, raftGroupID uint64, cmdType string, data map[string]interface{}) (interface{}, error)
+}
+
 // TransactionListener listen txn
 type TransactionListener interface {
 	ExecuteLocalTransaction(transactionID TransactionID, message HalfMessage) TransactionState
@@ -100,6 +125,14 @@ type TransactionListener interface {
 	CheckLocalTransaction(transactionID TransactionID, message HalfMessage) TransactionState
 }
 
-type RaftProposer interface {
-	ProposeCommand(groupID uint64, data []byte) error
+// StateMachineGetter 接口用于获取状态机实例
+type StateMachineGetter interface {
+	GetStateMachine(groupID uint64) (PartitionStateMachineInterface, error)
+	GetAllRaftGroups() []uint64 // 新增方法获取所有活跃的Raft组ID
+}
+
+// PartitionStateMachineInterface 定义分区状态机的接口
+type PartitionStateMachineInterface interface {
+	GetTimeoutTransactions() []string // 使用string类型避免循环导入
+	GetHalfMessage(txnID string) (interface{}, bool) // 使用interface{}避免循环导入
 }

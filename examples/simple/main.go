@@ -14,7 +14,7 @@ import (
 )
 
 func main() {
-	fmt.Println("=== Go Queue 简单客户端演示 ===")
+	fmt.Println("=== Go Queue Simple Client Demo ===")
 
 	// Create client config (connection pool and async IO enabled by default)
 	config := client.ClientConfig{
@@ -54,7 +54,7 @@ func main() {
 	admin := client.NewAdmin(c)
 
 	// Create topic
-	fmt.Println("\n1. 创建Topic...")
+	fmt.Println("\n1. Creating Topic...")
 	createReq := client.CreateTopicRequest{
 		Name:       "async-demo",
 		Partitions: 3,
@@ -67,15 +67,15 @@ func main() {
 	} else if createResult.Error != nil {
 		log.Printf("Failed to create topic: %v", createResult.Error)
 	} else {
-		fmt.Printf("✅ Topic创建成功: %s\n", createResult.Name)
+		fmt.Printf("✅ Topic created successfully: %s\n", createResult.Name)
 	}
 
 	// Create Producer
-	fmt.Println("\n2. 异步IO长连接演示...")
+	fmt.Println("\n2. Async IO persistent connection demo...")
 	producer := client.NewProducer(c)
 
 	// High concurrency send test - demonstrate async IO persistent connection advantages
-	fmt.Println("  发送100条消息测试异步IO性能...")
+	fmt.Println("  Sending 100 messages to test async IO performance...")
 
 	start := time.Now()
 	var wg sync.WaitGroup
@@ -100,7 +100,7 @@ func main() {
 			} else {
 				atomic.AddInt64(&successCount, 1)
 				if msgId%20 == 0 { // Print every 20 messages
-					fmt.Printf("  ✅ 消息 %d: Partition=%d, Offset=%d\n", msgId, result.Partition, result.Offset)
+					fmt.Printf("  ✅ Message %d: Partition=%d, Offset=%d\n", msgId, result.Partition, result.Offset)
 				}
 			}
 		}(i)
@@ -109,16 +109,16 @@ func main() {
 	wg.Wait()
 	duration := time.Since(start)
 
-	fmt.Printf("\n📊 异步IO性能测试结果:\n")
-	fmt.Printf("  - 总消息数: 100\n")
-	fmt.Printf("  - 成功数: %d\n", successCount)
-	fmt.Printf("  - 失败数: %d\n", errorCount)
-	fmt.Printf("  - 总用时: %v\n", duration)
-	fmt.Printf("  - 平均延迟: %v/msg\n", duration/100)
-	fmt.Printf("  - 吞吐量: %.2f msg/s\n", float64(successCount)/duration.Seconds())
+	fmt.Printf("\n📊 Async IO performance test results:\n")
+	fmt.Printf("  - Total messages: 100\n")
+	fmt.Printf("  - Success count: %d\n", successCount)
+	fmt.Printf("  - Error count: %d\n", errorCount)
+	fmt.Printf("  - Total time: %v\n", duration)
+	fmt.Printf("  - Average latency: %v/msg\n", duration/100)
+	fmt.Printf("  - Throughput: %.2f msg/s\n", float64(successCount)/duration.Seconds())
 
 	// Batch send demonstration
-	fmt.Println("\n3. 批量发送演示...")
+	fmt.Println("\n3. Batch send demo...")
 	messages := make([]client.ProduceMessage, 10)
 	for i := range messages {
 		messages[i] = client.ProduceMessage{
@@ -135,12 +135,12 @@ func main() {
 	if err != nil {
 		log.Printf("Failed to send batch: %v", err)
 	} else {
-		fmt.Printf("✅ 批量发送成功: 10条消息，用时 %v, 起始Offset=%d\n",
+		fmt.Printf("✅ Batch send successful: 10 messages, time %v, starting Offset=%d\n",
 			batchDuration, batchResult.Offset)
 	}
 
 	// Create Consumer
-	fmt.Println("\n4. 消费消息...")
+	fmt.Println("\n4. Consuming messages...")
 	consumer := client.NewConsumer(c)
 
 	// Consume messages from different partitions
@@ -158,48 +158,48 @@ func main() {
 			continue
 		}
 
-		fmt.Printf("✅ 分区 %d: 消费到 %d 条消息\n", partition, len(fetchResult.Messages))
+		fmt.Printf("✅ Partition %d: Consumed %d messages\n", partition, len(fetchResult.Messages))
 		if len(fetchResult.Messages) > 0 {
 			// Show first 3 messages
 			for i, message := range fetchResult.Messages[:min(3, len(fetchResult.Messages))] {
-				fmt.Printf("   消息 %d: Offset=%d, Value=%s\n", i, message.Offset, string(message.Value))
+				fmt.Printf("   Message %d: Offset=%d, Value=%s\n", i, message.Offset, string(message.Value))
 			}
 			if len(fetchResult.Messages) > 3 {
-				fmt.Printf("   ... 还有 %d 条消息\n", len(fetchResult.Messages)-3)
+				fmt.Printf("   ... %d more messages\n", len(fetchResult.Messages)-3)
 			}
 		}
 	}
 
 	// Show client statistics
-	fmt.Println("\n5. 性能统计...")
+	fmt.Println("\n5. Performance statistics...")
 	stats := c.GetStats()
-	fmt.Printf("📊 客户端统计:\n")
-	fmt.Printf("  - Topic缓存数: %d\n", stats.TopicCount)
-	fmt.Printf("  - 元数据TTL: %v\n", stats.MetadataTTL)
+	fmt.Printf("📊 Client statistics:\n")
+	fmt.Printf("  - Topic cache count: %d\n", stats.TopicCount)
+	fmt.Printf("  - Metadata TTL: %v\n", stats.MetadataTTL)
 
 	if stats.ConnectionPool.TotalConnections > 0 {
-		fmt.Printf("\n🔗 连接池统计:\n")
-		fmt.Printf("  - 总连接数: %d\n", stats.ConnectionPool.TotalConnections)
-		fmt.Printf("  - 活跃连接数: %d\n", stats.ConnectionPool.ActiveConnections)
-		fmt.Printf("  - Broker连接池数: %d\n", len(stats.ConnectionPool.BrokerStats))
+		fmt.Printf("\n🔗 Connection pool statistics:\n")
+		fmt.Printf("  - Total connections: %d\n", stats.ConnectionPool.TotalConnections)
+		fmt.Printf("  - Active connections: %d\n", stats.ConnectionPool.ActiveConnections)
+		fmt.Printf("  - Broker connection pools: %d\n", len(stats.ConnectionPool.BrokerStats))
 	}
 
 	if stats.AsyncIO.WorkerCount > 0 {
-		fmt.Printf("\n⚡ 异步IO统计:\n")
-		fmt.Printf("  - Worker数量: %d\n", stats.AsyncIO.WorkerCount)
-		fmt.Printf("  - 异步连接总数: %d\n", stats.AsyncIO.TotalConnections)
-		fmt.Printf("  - 异步连接活跃数: %d\n", stats.AsyncIO.ActiveConnections)
-		fmt.Printf("  - 提交队列大小: %d\n", stats.AsyncIO.SQSize)
-		fmt.Printf("  - 完成队列大小: %d\n", stats.AsyncIO.CQSize)
+		fmt.Printf("\n⚡ Async IO statistics:\n")
+		fmt.Printf("  - Worker count: %d\n", stats.AsyncIO.WorkerCount)
+		fmt.Printf("  - Total async connections: %d\n", stats.AsyncIO.TotalConnections)
+		fmt.Printf("  - Active async connections: %d\n", stats.AsyncIO.ActiveConnections)
+		fmt.Printf("  - Submit queue size: %d\n", stats.AsyncIO.SQSize)
+		fmt.Printf("  - Completion queue size: %d\n", stats.AsyncIO.CQSize)
 	}
 
-	fmt.Println("\n✅ 演示完成！")
-	fmt.Println("\n🚀 新异步IO架构特性:")
-	fmt.Println("  ✅ 长连接复用: 每个broker维护一个长连接，避免频繁建立/关闭")
-	fmt.Println("  ✅ 事件驱动: 基于事件循环的异步处理，高并发性能")
-	fmt.Println("  ✅ 智能降级: 异步连接失败时自动降级到连接池")
-	fmt.Println("  ✅ 资源管理: 连接生命周期管理，优雅关闭")
-	fmt.Println("  ✅ 双重保障: 异步IO + 连接池，确保高可用性")
+	fmt.Println("\n✅ Demo completed!")
+	fmt.Println("\n🚀 New async IO architecture features:")
+	fmt.Println("  ✅ Connection reuse: Maintains one persistent connection per broker, avoiding frequent connect/disconnect")
+	fmt.Println("  ✅ Event-driven: Event loop based async processing for high concurrency performance")
+	fmt.Println("  ✅ Smart fallback: Automatically falls back to connection pool when async connection fails")
+	fmt.Println("  ✅ Resource management: Connection lifecycle management with graceful shutdown")
+	fmt.Println("  ✅ Dual guarantee: Async IO + connection pool ensures high availability")
 }
 
 func min(a, b int) int {

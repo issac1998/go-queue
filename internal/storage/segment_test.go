@@ -238,7 +238,10 @@ func TestSegmentPurgeBefore(t *testing.T) {
 
 	// Purge messages older than 45 minutes
 	purgeTime := now.Add(-45 * time.Minute)
-	segment.PurgeBefore(purgeTime)
+	err = segment.PurgeBefore(purgeTime)
+	if err != nil {
+		t.Fatalf("failed to purge segment: %v", err)
+	}
 
 	// Should keep only the last 2 messages
 	expectedCount := 2

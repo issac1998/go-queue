@@ -59,14 +59,16 @@ type PartitionAssigner struct {
 	raftManager     *RaftManager
 	broker          BrokerInterface
 	currentBrokerID string
+	logger          *log.Logger
 }
 
 // NewPartitionAssigner creates a new Multi-Raft partition assigner
-func NewPartitionAssigner(metadata *ClusterMetadata, raftManager *RaftManager) *PartitionAssigner {
+func NewPartitionAssigner(metadata *ClusterMetadata, raftManager *RaftManager, logger *log.Logger) *PartitionAssigner {
 	return &PartitionAssigner{
 		metadata:    metadata,
 		raftManager: raftManager,
 		broker:      nil,
+		logger:      logger,
 	}
 }
 
@@ -185,21 +187,21 @@ type LeaderTransferPlan struct {
 
 // executeLeaderTransfers executes planned leader transfers using dragonboat
 func (pa *PartitionAssigner) executeLeaderTransfers(plans []LeaderTransferPlan) {
-	log.Printf("Executing %d leader transfers for load balancing", len(plans))
+	pa.logger.Printf("Executing %d leader transfers for load balancing", len(plans))
 
 	for _, plan := range plans {
 		targetNodeID, err := pa.BrokerIDToNodeID(plan.ToLeader)
 		if err != nil {
-			log.Printf("Failed to convert broker ID %s to node ID: %v", plan.ToLeader, err)
+			pa.logger.Printf("Failed to convert broker ID %s to node ID: %v", plan.ToLeader, err)
 			continue
 		}
 
 		err = pa.raftManager.TransferLeadership(plan.RaftGroupID, targetNodeID)
 		if err != nil {
-			log.Printf("Failed to transfer leadership for group %d from %s to %s: %v",
+			pa.logger.Printf("Failed to transfer leadership for group %d from %s to %s: %v",
 				plan.RaftGroupID, plan.FromLeader, plan.ToLeader, err)
 		} else {
-			log.Printf("Successfully initiated leader transfer for group %d from %s to %s",
+			pa.logger.Printf("Successfully initiated leader transfer for group %d from %s to %s",
 				plan.RaftGroupID, plan.FromLeader, plan.ToLeader)
 		}
 	}
@@ -249,35 +251,36 @@ func (pa *PartitionAssigner) findBestLeaderReplica(
 // StartPartitionRaftGroups starts Raft groups for newly assigned partitions
 // This method coordinates the distributed startup across all involved brokers
 func (pa *PartitionAssigner) StartPartitionRaftGroups(assignments []*PartitionAssignment) error {
-	log.Printf("Starting Raft groups for %d partitions across multiple brokers", len(assignments))
+	pa.logger.Printf("Starting Raft groups for %d partitions across multiple brokers", len(assignments))
 
 	for _, assignment := range assignments {
 		err := pa.startSinglePartitionRaftGroup(assignment)
 		if err != nil {
-			log.Printf("Failed to start Raft group for partition %s-%d: %v",
+			pa.logger.Printf("Failed to start Raft group for partition %s-%d: %v",
 				assignment.TopicName, assignment.PartitionID, err)
 			return err
 		}
-		log.Printf("start Raft group : %v",
+		pa.logger.Printf("start Raft group : %v",
 			assignment.RaftGroupID)
 	}
 
-	log.Printf("Successfully coordinated startup of %d partition Raft groups", len(assignments))
+	pa.logger.Printf("Successfully coordinated startup of %d partition Raft groups", len(assignments))
 
-	log.Printf("Waiting for leadership establishment across all partition Raft groups...")
+	pa.logger.Printf("Waiting for leadership establishment across all partition Raft groups...")
 	err := pa.waitForLeadershipEstablishment(assignments)
 	if err != nil {
-		log.Printf("Warning: some leadership establishments may have failed: %v", err)
+		pa.logger.Printf("Warning: some leadership establishments may have failed: %v", err)
 	}
 
-	log.Printf("Partition Raft groups startup and leadership establishment completed")
+	pa.logger.Printf("Partition Raft groups startup and leadership establishment completed")
 	return nil
 }
 
 // startSinglePartitionRaftGroup coordinates the startup of a single partition Raft group
 func (pa *PartitionAssigner) startSinglePartitionRaftGroup(assignment *PartitionAssignment) error {
-	log.Printf("Starting Raft group %d for partition %s-%d with replicas %v, preferred leader: %s",
-		assignment.RaftGroupID, assignment.TopicName, assignment.PartitionID, assignment.Replicas, assignment.PreferredLeader)
+	pa.logger.Printf("Starting Raft group %d for partition %s-%d with replicas %v, preferred leader: %s",
+		assignment.RaftGroupID, assignment.TopicName, assignment.PartitionID,
+		assignment.Replicas, assignment.PreferredLeader)
 
 	// Validate PreferredLeader is set
 	if assignment.PreferredLeader == "" {
@@ -323,7 +326,7 @@ func (pa *PartitionAssigner) startRaftGroupOnBroker(
 	join bool,
 ) error {
 
-	log.Printf("Starting Raft group %d on broker %s (join=%t)",
+	pa.logger.Printf("Starting Raft group %d on broker %s (join=%t)",
 		assignment.RaftGroupID, brokerID, join)
 
 	if brokerID == pa.getCurrentBrokerID() {
@@ -362,7 +365,7 @@ func (pa *PartitionAssigner) startRaftGroupLocally(
 		return typederrors.NewTypedError(typederrors.GeneralError, fmt.Sprintf("failed to start local Raft group %d", assignment.RaftGroupID), err)
 	}
 
-	log.Printf("Successfully started Raft group %d locally (join=%t)", assignment.RaftGroupID, join)
+	pa.logger.Printf("Successfully started Raft group %d locally (join=%t)", assignment.RaftGroupID, join)
 	return nil
 }
 
@@ -481,7 +484,7 @@ func (pa *PartitionAssigner) getCurrentBrokerID() string {
 
 // waitForLeadershipEstablishment waits for all partition Raft groups to elect leaders
 func (pa *PartitionAssigner) waitForLeadershipEstablishment(assignments []*PartitionAssignment) error {
-	timeout := 60 * time.Second
+	timeout := 120 * time.Second
 	// todo: do we need to concurrently check ?
 	for _, assignment := range assignments {
 		err := pa.raftManager.WaitForLeadershipReady(assignment.RaftGroupID, timeout)
@@ -490,6 +493,7 @@ func (pa *PartitionAssigner) waitForLeadershipEstablishment(assignments []*Parti
 				assignment.RaftGroupID, err)
 			continue
 		}
+		pa.logger.Println("get leader succeed/")
 
 		actualLeader, err := pa.getCurrentRaftLeader(assignment.RaftGroupID)
 		if err != nil {

@@ -118,14 +118,14 @@ func (gc *GroupConsumer) LeaveGroup() error {
 
 	log.Printf("Leaving consumer group: %s", gc.GroupID)
 
-	// 🔥 清理本地状态
+	// 🔥 Clean up local state
 	gc.assignment = make(map[string][]int32)
 	gc.members = make([]GroupMember, 0)
 	gc.generation = 0
 	gc.leader = ""
 
-	// 清理订阅状态（但保留订阅信息，以便重新加入时使用）
-	// gc.subscribedTopics 保留，因为可能需要重新加入
+	// Clean up subscription state (but keep subscription info for potential rejoin)
+	// gc.subscribedTopics is preserved as it may be needed for rejoining
 
 	gc.stopHeartbeatInternal()
 
@@ -362,7 +362,6 @@ type ConsumeMessage struct {
 
 // Poll polls for messages from assigned partitions
 func (gc *GroupConsumer) Poll(timeout time.Duration) ([]*ConsumeMessage, error) {
-	// Check if rebalancing is in progress
 	if gc.IsRebalancing() {
 		log.Printf("Consumer %s is rebalancing, skipping poll", gc.ConsumerID)
 		return []*ConsumeMessage{}, nil
@@ -520,7 +519,7 @@ func (gc *GroupConsumer) stopHeartbeatInternal() {
 	if gc.heartbeatTicker != nil {
 		gc.heartbeatTicker.Stop()
 		close(gc.stopHeartbeat)
-		gc.stopHeartbeat = make(chan struct{}) // 重新创建以便后续使用
+		gc.stopHeartbeat = make(chan struct{}) // Recreate for future use
 	}
 }
 
@@ -811,7 +810,7 @@ func (gc *GroupConsumer) parseHeartbeatResponse(data []byte) error {
 		gc.FetchAssignment()
 	}
 
-	// 🔥 更新本地状态
+	// 🔥 Update local state
 	gc.mu.Lock()
 	gc.generation = generation
 	gc.leader = leaderID

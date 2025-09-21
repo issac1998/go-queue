@@ -59,7 +59,7 @@ func NewEtcdDiscovery(config *DiscoveryConfig) (*EtcdDiscovery, error) {
 	_, err = client.Status(ctx, config.Endpoints[0])
 	if err != nil {
 		client.Close()
-		return nil, fmt.Errorf("failed to connect to etcd: %w", err)
+		return nil, fmt.Errorf("failed to connect to etcd: endpoints: %v, err: %w", config.Endpoints, err)
 	}
 
 	ctx, cancel = context.WithCancel(context.Background())
@@ -130,7 +130,7 @@ func (ed *EtcdDiscovery) RegisterBroker(broker *BrokerInfo) error {
 
 // DiscoverBrokers discovers all registered brokers from etcd
 func (ed *EtcdDiscovery) DiscoverBrokers() ([]*BrokerInfo, error) {
-	ctx, cancel := context.WithTimeout(ed.ctx, 5*time.Second)
+	ctx, cancel := context.WithTimeout(ed.ctx, 15*time.Second)
 	defer cancel()
 
 	// Get all brokers with the prefix

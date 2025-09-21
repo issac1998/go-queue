@@ -10,10 +10,10 @@ import (
 )
 
 func main() {
-	fmt.Println("🔍 UserData 追踪演示")
+	fmt.Println("🔍 UserData Tracking Demo")
 	fmt.Println("==================")
 
-	// 1. 创建带异步IO的客户端
+	// 1. Create client with async IO
 	clientConfig := client.ClientConfig{
 		BrokerAddrs:          []string{"localhost:9092"},
 		Timeout:              5 * time.Second,
@@ -32,11 +32,11 @@ func main() {
 	c := client.NewClient(clientConfig)
 	defer c.Close()
 
-	// 2. 创建生产者
+	// 2. Create producer
 	producer := client.NewProducer(c)
 
-	// 3. 发送消息并观察 userData 追踪
-	fmt.Println("\n📤 发送消息并追踪 userData...")
+	// 3. Send messages and observe userData tracking
+	fmt.Println("\n📤 Sending messages and tracking userData...")
 
 	for i := 0; i < 3; i++ {
 		msg := client.ProduceMessage{
@@ -51,39 +51,39 @@ func main() {
 		duration := time.Since(start)
 
 		if err != nil {
-			log.Printf("❌ 消息 %d 发送失败: %v (耗时: %v)", i, err, duration)
+			log.Printf("❌ Message %d send failed: %v (duration: %v)", i, err, duration)
 		} else {
-			log.Printf("✅ 消息 %d 发送成功: Topic=%s, Partition=%d, Offset=%d (耗时: %v)",
+			log.Printf("✅ Message %d sent successfully: Topic=%s, Partition=%d, Offset=%d (duration: %v)",
 				i, result.Topic, result.Partition, result.Offset, duration)
 		}
 
-		// 短暂延迟以观察异步行为
+		// Brief delay to observe async behavior
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	// 4. 显示统计信息
-	fmt.Println("\n📊 异步IO统计信息:")
+	// 4. Show statistics
+	fmt.Println("\n📊 Async IO statistics:")
 	stats := c.GetStats()
-	fmt.Printf("  - Worker数量: %d\n", stats.AsyncIO.WorkerCount)
-	fmt.Printf("  - 总连接数: %d\n", stats.AsyncIO.TotalConnections)
-	fmt.Printf("  - 活跃连接数: %d\n", stats.AsyncIO.ActiveConnections)
-	fmt.Printf("  - 提交队列大小: %d\n", stats.AsyncIO.SQSize)
-	fmt.Printf("  - 完成队列大小: %d\n", stats.AsyncIO.CQSize)
+	fmt.Printf("  - Worker count: %d\n", stats.AsyncIO.WorkerCount)
+	fmt.Printf("  - Total connections: %d\n", stats.AsyncIO.TotalConnections)
+	fmt.Printf("  - Active connections: %d\n", stats.AsyncIO.ActiveConnections)
+	fmt.Printf("  - Submit queue size: %d\n", stats.AsyncIO.SQSize)
+	fmt.Printf("  - Completion queue size: %d\n", stats.AsyncIO.CQSize)
 
-	fmt.Println("\n🔍 UserData 追踪说明:")
-	fmt.Println("  - 每个异步操作都有唯一的 userData (连接ID + 时间戳)")
-	fmt.Println("  - userData 在回调函数中可用于请求关联和调试")
-	fmt.Println("  - 可以通过 userData 实现请求去重和并发控制")
-	fmt.Println("  - 在生产环境中可用于分布式追踪和性能监控")
+	fmt.Println("\n🔍 UserData tracking explanation:")
+	fmt.Println("  - Each async operation has a unique userData (connection ID + timestamp)")
+	fmt.Println("  - userData is available in callback functions for request correlation and debugging")
+	fmt.Println("  - Can implement request deduplication and concurrency control through userData")
+	fmt.Println("  - Can be used for distributed tracing and performance monitoring in production")
 
-	fmt.Println("\n✅ 基础 UserData 追踪演示完成!")
+	fmt.Println("\n✅ Basic UserData tracking demo completed!")
 
-	// 5. 运行高级追踪演示
+	// 5. Run advanced tracking demo
 	DemoAdvancedTracking()
 	
-	fmt.Println("\n🎯 运行真实 UserData 使用演示...")
+	fmt.Println("\n🎯 Running real UserData usage demo...")
 	DemoRealUserDataUsage()
 	
-	fmt.Println("\n🔥 运行回调 UserData 演示...")
+	fmt.Println("\n🔥 Running callback UserData demo...")
 	DemoCallbackUsage()
 }

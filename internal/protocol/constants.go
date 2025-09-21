@@ -33,6 +33,7 @@ const (
 	TransactionCommitRequestType   int32 = 19
 	TransactionRollbackRequestType int32 = 20
 	TransactionCheckRequestType    int32 = 21
+	TransactionCheckStateRequestType int32 = 33
 	OrderedProduceRequestType      int32 = 22
 
 	// Consumer transaction request types
@@ -40,9 +41,15 @@ const (
 	ConsumerCommitTransactionRequestType int32 = 24
 	ConsumerAbortTransactionRequestType  int32 = 25
 
+	// Delayed message request types
+	DelayedProduceRequestType       int32 = 26
+	DelayedMessageQueryRequestType  int32 = 27
+	DelayedMessageCancelRequestType int32 = 28
+
 	// Group management request types
 	ListGroupsRequestType    int32 = 30
 	DescribeGroupRequestType int32 = 31
+	RegisterProducerGroupRequestType int32 = 32
 
 	ControllerDiscoverRequestType int32 = 1000
 	ControllerVerifyRequestType   int32 = 1001
@@ -98,29 +105,34 @@ const (
 
 // RequestTypeNames maps request types to human-readable names
 var RequestTypeNames = map[int32]string{
-	ProduceRequestType:             "PRODUCE",
-	FetchRequestType:               "FETCH",
-	ListTopicsRequestType:          "LIST_TOPICS",
-	CreateTopicRequestType:         "CREATE_TOPIC",
-	DeleteTopicRequestType:         "DELETE_TOPIC",
-	JoinGroupRequestType:           "JOIN_GROUP",
-	LeaveGroupRequestType:          "LEAVE_GROUP",
-	HeartbeatRequestType:           "HEARTBEAT",
-	CommitOffsetRequestType:        "COMMIT_OFFSET",
-	FetchOffsetRequestType:         "FETCH_OFFSET",
-	GetTopicInfoRequestType:        "GET_TOPIC_INFO",
-	FetchAssignmentRequestType:     "FETCH_ASSIGNMENT",
-	BatchFetchRequestType:          "BATCH_FETCH",
-	TransactionPrepareRequestType:  "TRANSACTION_PREPARE",
-	TransactionCommitRequestType:   "TRANSACTION_COMMIT",
-	TransactionRollbackRequestType: "TRANSACTION_ROLLBACK",
-	TransactionCheckRequestType:    "TRANSACTION_CHECK",
-	OrderedProduceRequestType:      "ORDERED_PRODUCE",
+	ProduceRequestType:                   "PRODUCE",
+	FetchRequestType:                     "FETCH",
+	ListTopicsRequestType:                "LIST_TOPICS",
+	CreateTopicRequestType:               "CREATE_TOPIC",
+	DeleteTopicRequestType:               "DELETE_TOPIC",
+	JoinGroupRequestType:                 "JOIN_GROUP",
+	LeaveGroupRequestType:                "LEAVE_GROUP",
+	HeartbeatRequestType:                 "HEARTBEAT",
+	CommitOffsetRequestType:              "COMMIT_OFFSET",
+	FetchOffsetRequestType:               "FETCH_OFFSET",
+	GetTopicInfoRequestType:              "GET_TOPIC_INFO",
+	FetchAssignmentRequestType:           "FETCH_ASSIGNMENT",
+	BatchFetchRequestType:                "BATCH_FETCH",
+	TransactionPrepareRequestType:        "TRANSACTION_PREPARE",
+	TransactionCommitRequestType:         "TRANSACTION_COMMIT",
+	TransactionRollbackRequestType:       "TRANSACTION_ROLLBACK",
+	TransactionCheckRequestType:          "TRANSACTION_CHECK",
+	OrderedProduceRequestType:            "ORDERED_PRODUCE",
 	ConsumerBeginTransactionRequestType:  "CONSUMER_BEGIN_TRANSACTION",
 	ConsumerCommitTransactionRequestType: "CONSUMER_COMMIT_TRANSACTION",
 	ConsumerAbortTransactionRequestType:  "CONSUMER_ABORT_TRANSACTION",
-	ListGroupsRequestType:          "LIST_GROUPS",
-	DescribeGroupRequestType:       "DESCRIBE_GROUP",
+	DelayedProduceRequestType:            "DELAYED_PRODUCE",
+	DelayedMessageQueryRequestType:       "DELAYED_MESSAGE_QUERY",
+	DelayedMessageCancelRequestType:      "DELAYED_MESSAGE_CANCEL",
+	ListGroupsRequestType:                "LIST_GROUPS",
+	DescribeGroupRequestType:             "DESCRIBE_GROUP",
+	RegisterProducerGroupRequestType:     "REGISTER_PRODUCER_GROUP",
+	TransactionCheckStateRequestType:     "TRANSACTION_CHECK_STATE",
 }
 
 // GetRequestTypeName returns the human-readable name for a request type
@@ -161,34 +173,30 @@ func GetErrorCodeName(errorCode int16) string {
 
 const (
 	// Raft command types
-	RaftCmdRegisterBroker             = "register_broker"
-	RaftCmdUnregisterBroker           = "unregister_broker"
-	RaftCmdCreateTopic                = "create_topic"
-	RaftCmdDeleteTopic                = "delete_topic"
-	RaftCmdJoinGroup                  = "join_group"
-	RaftCmdLeaveGroup                 = "leave_group"
-	RaftCmdMigrateLeader              = "migrate_leader"
-	RaftCmdUpdatePartitionAssignments = "update_partition_assignments"
-	RaftCmdMarkBrokerFailed           = "mark_broker_failed"
-	RaftCmdRebalancePartitions        = "rebalance_partitions"
-	RaftCmdCommitOffset               = "commit_offset"
-	RaftCmdUpdateSubscription         = "update_subscription"
-	RaftCmdUpdateTopicAssignment      = "update_topic_assignment"
-	RaftCmdUpdateBrokerLoad           = "update_broker_load"
-	RaftCmdStoreHalfMessage           = "store_half_message"
-	RaftCmdUpdateTransactionState     = "update_transaction_state"
-	RaftCmdDeleteHalfMessage          = "delete_half_message"
-	RaftCmdRegisterProducerGroup      = "register_producer_group"
-	RaftCmdUnregisterProducerGroup    = "unregister_producer_group"
-	
+	RaftCmdRegisterBroker          = "register_broker"
+	RaftCmdUnregisterBroker        = "unregister_broker"
+	RaftCmdCreateTopic             = "create_topic"
+	RaftCmdDeleteTopic             = "delete_topic"
+	RaftCmdJoinGroup               = "join_group"
+	RaftCmdLeaveGroup              = "leave_group"
+	RaftCmdMigrateLeader           = "migrate_leader"
+	RaftCmdMarkBrokerFailed        = "mark_broker_failed"
+	RaftCmdRebalancePartitions     = "rebalance_partitions"
+	RaftCmdCommitOffset            = "commit_offset"
+	RaftCmdUpdateSubscription      = "update_subscription"
+	RaftCmdUpdateTopicAssignment   = "update_topic_assignment"
+	RaftCmdUpdateBrokerLoad        = "update_broker_load"
+	RaftCmdStoreHalfMessage        = "store_half_message"
+	RaftCmdUpdateTransactionState  = "update_transaction_state"
+	RaftCmdDeleteHalfMessage       = "delete_half_message"
+	RaftCmdRegisterProducerGroup   = "register_producer_group"
+	RaftCmdUnregisterProducerGroup = "unregister_producer_group"
+
 	// Consumer transaction and idempotent commands
-	RaftCmdMarkMessageProcessed       = "mark_message_processed"
-	RaftCmdBeginConsumerTransaction   = "begin_consumer_transaction"
-	RaftCmdCommitConsumerTransaction  = "commit_consumer_transaction"
-	RaftCmdAbortConsumerTransaction   = "abort_consumer_transaction"
-	RaftCmdUpdateConsumerOffset       = "update_consumer_offset"
-	RaftCmdCleanupExpiredRecords      = "cleanup_expired_records"
-	RaftCmdBatchMarkProcessed         = "batch_mark_processed"
+	RaftCmdMarkMessageProcessed      = "mark_message_processed"
+	RaftCmdBeginConsumerTransaction  = "begin_consumer_transaction"
+	RaftCmdCommitConsumerTransaction = "commit_consumer_transaction"
+	RaftCmdAbortConsumerTransaction  = "abort_consumer_transaction"
 )
 
 const (
@@ -205,16 +213,6 @@ const (
 	RaftQueryGetCommittedOffset      = "get_committed_offset"
 
 	RaftQueryGetClusterMetadata = "get_cluster_metadata"
-	
-	// Consumer transaction and idempotent queries
-	RaftQueryGetProcessedMessage     = "get_processed_message"
-	RaftQueryGetConsumerTransaction  = "get_consumer_transaction"
-	RaftQueryGetConsumerOffset       = "get_consumer_offset"
-	RaftQueryGetProcessedMessages    = "get_processed_messages"
-	RaftQueryGetProcessedRecords     = "get_processed_records"
-	RaftQueryBatchGetProcessedRecords = "batch_get_processed_records"
-	RaftQueryGetConsumerTransactions = "get_consumer_transactions"
-	RaftQueryGetConsumerOffsets      = "get_consumer_offsets"
 )
 
 // ConnectToSpecificBroker connects to a specific broker address
