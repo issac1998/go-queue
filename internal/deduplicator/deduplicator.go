@@ -8,10 +8,10 @@ import (
 // Deduplicator maintains the state of a producer for deduplicator
 type Deduplicator struct {
 	ProducerID      string                   `json:"producer_id"`
-	LastSequenceNum map[int32]int64          `json:"last_sequence_num"` // per-partition sequence numbers
+	LastSequenceNum map[int32]int64          `json:"last_sequence_num"` 
 	LastUpdateTime  time.Time                `json:"last_update_time"`
 	CreatedTime     time.Time                `json:"created_time"`
-	receivedSeqNums map[int32]map[int64]bool `json:"-"` // Track received sequence numbers for AsyncIO mode per partition
+	receivedSeqNums map[int32]map[int64]bool `json:"-"` 
 	mu              sync.RWMutex             `json:"-"`
 }
 

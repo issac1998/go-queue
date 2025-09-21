@@ -68,6 +68,9 @@ var requestConfigs = map[int32]RequestConfig{
 	protocol.TransactionCommitRequestType:       {Type: DataRequest, Handler: &TransactionCommitHandler{}},
 	protocol.TransactionRollbackRequestType:     {Type: DataRequest, Handler: &TransactionRollbackHandler{}},
 	protocol.OrderedProduceRequestType:          {Type: DataRequest, Handler: &OrderedProduceHandler{}},
+	protocol.ConsumerBeginTransactionRequestType: {Type: MetadataWriteRequest, Handler: &ConsumerBeginTransactionHandler{}},
+	protocol.ConsumerCommitTransactionRequestType: {Type: MetadataWriteRequest, Handler: &ConsumerCommitTransactionHandler{}},
+	protocol.ConsumerAbortTransactionRequestType: {Type: MetadataWriteRequest, Handler: &ConsumerAbortTransactionHandler{}},
 }
 
 // NewClientServer creates a new ClientServer
@@ -547,6 +550,235 @@ func (h *ListTopicsHandler) buildListTopicsResponse(topicsData []byte) ([]byte, 
 	}
 
 	return buf.Bytes(), nil
+}
+
+// ConsumerBeginTransactionHandler handles consumer begin transaction requests
+type ConsumerBeginTransactionHandler struct{}
+
+func (h *ConsumerBeginTransactionHandler) Handle(conn net.Conn, cs *ClientServer) error {
+	requestData, err := cs.readRequestData(conn)
+	if err != nil {
+		return fmt.Errorf("failed to read request data: %v", err)
+	}
+
+	transactionID, consumerID, groupID, timeoutMs, err := h.parseBeginTransactionRequest(requestData)
+	if err != nil {
+		return fmt.Errorf("failed to parse request: %v", err)
+	}
+
+	err = cs.broker.Controller.BeginConsumerTransaction(transactionID, consumerID, groupID, timeoutMs)
+	if err != nil {
+		errorResponse, buildErr := h.buildErrorResponse(err.Error())
+		if buildErr != nil {
+			return fmt.Errorf("failed to build error response: %v", buildErr)
+		}
+		cs.sendSuccessResponse(conn, errorResponse)
+		log.Printf("Failed to begin consumer transaction '%s': %v", transactionID, err)
+		return nil
+	}
+
+	responseData, err := h.buildSuccessResponse()
+	if err != nil {
+		return fmt.Errorf("failed to build response: %v", err)
+	}
+
+	cs.sendSuccessResponse(conn, responseData)
+	log.Printf("Successfully began consumer transaction '%s' for consumer '%s' in group '%s'", transactionID, consumerID, groupID)
+	return nil
+}
+
+func (h *ConsumerBeginTransactionHandler) parseBeginTransactionRequest(data []byte) (string, string, string, int64, error) {
+	var request map[string]interface{}
+	if err := json.Unmarshal(data, &request); err != nil {
+		return "", "", "", 0, fmt.Errorf("failed to unmarshal request: %v", err)
+	}
+
+	transactionID, ok := request["transaction_id"].(string)
+	if !ok {
+		return "", "", "", 0, fmt.Errorf("missing or invalid transaction_id")
+	}
+
+	consumerID, ok := request["consumer_id"].(string)
+	if !ok {
+		return "", "", "", 0, fmt.Errorf("missing or invalid consumer_id")
+	}
+
+	groupID, ok := request["group_id"].(string)
+	if !ok {
+		return "", "", "", 0, fmt.Errorf("missing or invalid group_id")
+	}
+
+	timeoutMs, ok := request["timeout_ms"].(float64)
+	if !ok {
+		return "", "", "", 0, fmt.Errorf("missing or invalid timeout_ms")
+	}
+
+	return transactionID, consumerID, groupID, int64(timeoutMs), nil
+}
+
+func (h *ConsumerBeginTransactionHandler) buildSuccessResponse() ([]byte, error) {
+	response := map[string]interface{}{
+		"error_code": 0,
+	}
+	return json.Marshal(response)
+}
+
+func (h *ConsumerBeginTransactionHandler) buildErrorResponse(errorMsg string) ([]byte, error) {
+	response := map[string]interface{}{
+		"error_code":    1,
+		"error_message": errorMsg,
+	}
+	return json.Marshal(response)
+}
+
+// ConsumerCommitTransactionHandler handles consumer commit transaction requests
+type ConsumerCommitTransactionHandler struct{}
+
+func (h *ConsumerCommitTransactionHandler) Handle(conn net.Conn, cs *ClientServer) error {
+	requestData, err := cs.readRequestData(conn)
+	if err != nil {
+		return fmt.Errorf("failed to read request data: %v", err)
+	}
+
+	transactionID, consumerID, groupID, err := h.parseCommitTransactionRequest(requestData)
+	if err != nil {
+		return fmt.Errorf("failed to parse request: %v", err)
+	}
+
+	// 提交消费者事务
+	err = cs.broker.Controller.CommitConsumerTransaction(transactionID, consumerID, groupID)
+	if err != nil {
+		errorResponse, buildErr := h.buildErrorResponse(err.Error())
+		if buildErr != nil {
+			return fmt.Errorf("failed to build error response: %v", buildErr)
+		}
+		cs.sendSuccessResponse(conn, errorResponse)
+		log.Printf("Failed to commit consumer transaction '%s': %v", transactionID, err)
+		return nil
+	}
+
+	responseData, err := h.buildSuccessResponse()
+	if err != nil {
+		return fmt.Errorf("failed to build response: %v", err)
+	}
+
+	cs.sendSuccessResponse(conn, responseData)
+	log.Printf("Successfully committed consumer transaction '%s' for consumer '%s' in group '%s'", transactionID, consumerID, groupID)
+	return nil
+}
+
+func (h *ConsumerCommitTransactionHandler) parseCommitTransactionRequest(data []byte) (string, string, string, error) {
+	var request map[string]interface{}
+	if err := json.Unmarshal(data, &request); err != nil {
+		return "", "", "", fmt.Errorf("failed to unmarshal request: %v", err)
+	}
+
+	transactionID, ok := request["transaction_id"].(string)
+	if !ok {
+		return "", "", "", fmt.Errorf("missing or invalid transaction_id")
+	}
+
+	consumerID, ok := request["consumer_id"].(string)
+	if !ok {
+		return "", "", "", fmt.Errorf("missing or invalid consumer_id")
+	}
+
+	groupID, ok := request["group_id"].(string)
+	if !ok {
+		return "", "", "", fmt.Errorf("missing or invalid group_id")
+	}
+
+	return transactionID, consumerID, groupID, nil
+}
+
+func (h *ConsumerCommitTransactionHandler) buildSuccessResponse() ([]byte, error) {
+	response := map[string]interface{}{
+		"error_code": 0,
+	}
+	return json.Marshal(response)
+}
+
+func (h *ConsumerCommitTransactionHandler) buildErrorResponse(errorMsg string) ([]byte, error) {
+	response := map[string]interface{}{
+		"error_code":    1,
+		"error_message": errorMsg,
+	}
+	return json.Marshal(response)
+}
+
+// ConsumerAbortTransactionHandler handles consumer abort transaction requests
+type ConsumerAbortTransactionHandler struct{}
+
+func (h *ConsumerAbortTransactionHandler) Handle(conn net.Conn, cs *ClientServer) error {
+	requestData, err := cs.readRequestData(conn)
+	if err != nil {
+		return fmt.Errorf("failed to read request data: %v", err)
+	}
+
+	transactionID, consumerID, groupID, err := h.parseAbortTransactionRequest(requestData)
+	if err != nil {
+		return fmt.Errorf("failed to parse request: %v", err)
+	}
+
+	// 中止消费者事务
+	err = cs.broker.Controller.AbortConsumerTransaction(transactionID, consumerID, groupID)
+	if err != nil {
+		errorResponse, buildErr := h.buildErrorResponse(err.Error())
+		if buildErr != nil {
+			return fmt.Errorf("failed to build error response: %v", buildErr)
+		}
+		cs.sendSuccessResponse(conn, errorResponse)
+		log.Printf("Failed to abort consumer transaction '%s': %v", transactionID, err)
+		return nil
+	}
+
+	responseData, err := h.buildSuccessResponse()
+	if err != nil {
+		return fmt.Errorf("failed to build response: %v", err)
+	}
+
+	cs.sendSuccessResponse(conn, responseData)
+	log.Printf("Successfully aborted consumer transaction '%s' for consumer '%s' in group '%s'", transactionID, consumerID, groupID)
+	return nil
+}
+
+func (h *ConsumerAbortTransactionHandler) parseAbortTransactionRequest(data []byte) (string, string, string, error) {
+	var request map[string]interface{}
+	if err := json.Unmarshal(data, &request); err != nil {
+		return "", "", "", fmt.Errorf("failed to unmarshal request: %v", err)
+	}
+
+	transactionID, ok := request["transaction_id"].(string)
+	if !ok {
+		return "", "", "", fmt.Errorf("missing or invalid transaction_id")
+	}
+
+	consumerID, ok := request["consumer_id"].(string)
+	if !ok {
+		return "", "", "", fmt.Errorf("missing or invalid consumer_id")
+	}
+
+	groupID, ok := request["group_id"].(string)
+	if !ok {
+		return "", "", "", fmt.Errorf("missing or invalid group_id")
+	}
+
+	return transactionID, consumerID, groupID, nil
+}
+
+func (h *ConsumerAbortTransactionHandler) buildSuccessResponse() ([]byte, error) {
+	response := map[string]interface{}{
+		"error_code": 0,
+	}
+	return json.Marshal(response)
+}
+
+func (h *ConsumerAbortTransactionHandler) buildErrorResponse(errorMsg string) ([]byte, error) {
+	response := map[string]interface{}{
+		"error_code":    1,
+		"error_message": errorMsg,
+	}
+	return json.Marshal(response)
 }
 
 // sendOrderedProduceErrorResponse sends JSON error response for ordered produce requests

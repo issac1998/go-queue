@@ -515,7 +515,7 @@ func (cm *ControllerManager) CreateTopic(topicName string, partitions int32, rep
 	}
 
 	log.Printf("update topic to statemachine %s", topicName)
-	log.Println("send:%v", assignments)
+	log.Printf("send:%v", assignments)
 
 	cmd := &raft.ControllerCommand{
 		Type:      protocol.RaftCmdCreateTopic,
@@ -1162,4 +1162,50 @@ func (rs *RebalanceScheduler) updatePartitionAssignments(assignments []*raft.Par
 	}
 
 	return rs.controller.ExecuteCommand(cmd)
+}
+
+// BeginConsumerTransaction starts a new consumer transaction
+func (cm *ControllerManager) BeginConsumerTransaction(transactionID, consumerID, groupID string, timeoutMs int64) error {
+	cmd := &raft.ControllerCommand{
+		Type:      protocol.RaftCmdBeginConsumerTransaction,
+		ID:        uuid.New().String(),
+		Timestamp: time.Now(),
+		Data: map[string]interface{}{
+			"transaction_id": transactionID,
+			"consumer_id":    consumerID,
+			"group_id":       groupID,
+			"timeout_ms":     timeoutMs,
+		},
+	}
+	return cm.ExecuteCommand(cmd)
+}
+
+// CommitConsumerTransaction commits a consumer transaction
+func (cm *ControllerManager) CommitConsumerTransaction(transactionID, consumerID, groupID string) error {
+	cmd := &raft.ControllerCommand{
+		Type:      protocol.RaftCmdCommitConsumerTransaction,
+		ID:        uuid.New().String(),
+		Timestamp: time.Now(),
+		Data: map[string]interface{}{
+			"transaction_id": transactionID,
+			"consumer_id":    consumerID,
+			"group_id":       groupID,
+		},
+	}
+	return cm.ExecuteCommand(cmd)
+}
+
+// AbortConsumerTransaction aborts a consumer transaction
+func (cm *ControllerManager) AbortConsumerTransaction(transactionID, consumerID, groupID string) error {
+	cmd := &raft.ControllerCommand{
+		Type:      protocol.RaftCmdAbortConsumerTransaction,
+		ID:        uuid.New().String(),
+		Timestamp: time.Now(),
+		Data: map[string]interface{}{
+			"transaction_id": transactionID,
+			"consumer_id":    consumerID,
+			"group_id":       groupID,
+		},
+	}
+	return cm.ExecuteCommand(cmd)
 }

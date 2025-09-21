@@ -35,6 +35,11 @@ const (
 	TransactionCheckRequestType    int32 = 21
 	OrderedProduceRequestType      int32 = 22
 
+	// Consumer transaction request types
+	ConsumerBeginTransactionRequestType  int32 = 23
+	ConsumerCommitTransactionRequestType int32 = 24
+	ConsumerAbortTransactionRequestType  int32 = 25
+
 	// Group management request types
 	ListGroupsRequestType    int32 = 30
 	DescribeGroupRequestType int32 = 31
@@ -111,6 +116,9 @@ var RequestTypeNames = map[int32]string{
 	TransactionRollbackRequestType: "TRANSACTION_ROLLBACK",
 	TransactionCheckRequestType:    "TRANSACTION_CHECK",
 	OrderedProduceRequestType:      "ORDERED_PRODUCE",
+	ConsumerBeginTransactionRequestType:  "CONSUMER_BEGIN_TRANSACTION",
+	ConsumerCommitTransactionRequestType: "CONSUMER_COMMIT_TRANSACTION",
+	ConsumerAbortTransactionRequestType:  "CONSUMER_ABORT_TRANSACTION",
 	ListGroupsRequestType:          "LIST_GROUPS",
 	DescribeGroupRequestType:       "DESCRIBE_GROUP",
 }
@@ -172,6 +180,15 @@ const (
 	RaftCmdDeleteHalfMessage          = "delete_half_message"
 	RaftCmdRegisterProducerGroup      = "register_producer_group"
 	RaftCmdUnregisterProducerGroup    = "unregister_producer_group"
+	
+	// Consumer transaction and idempotent commands
+	RaftCmdMarkMessageProcessed       = "mark_message_processed"
+	RaftCmdBeginConsumerTransaction   = "begin_consumer_transaction"
+	RaftCmdCommitConsumerTransaction  = "commit_consumer_transaction"
+	RaftCmdAbortConsumerTransaction   = "abort_consumer_transaction"
+	RaftCmdUpdateConsumerOffset       = "update_consumer_offset"
+	RaftCmdCleanupExpiredRecords      = "cleanup_expired_records"
+	RaftCmdBatchMarkProcessed         = "batch_mark_processed"
 )
 
 const (
@@ -188,6 +205,16 @@ const (
 	RaftQueryGetCommittedOffset      = "get_committed_offset"
 
 	RaftQueryGetClusterMetadata = "get_cluster_metadata"
+	
+	// Consumer transaction and idempotent queries
+	RaftQueryGetProcessedMessage     = "get_processed_message"
+	RaftQueryGetConsumerTransaction  = "get_consumer_transaction"
+	RaftQueryGetConsumerOffset       = "get_consumer_offset"
+	RaftQueryGetProcessedMessages    = "get_processed_messages"
+	RaftQueryGetProcessedRecords     = "get_processed_records"
+	RaftQueryBatchGetProcessedRecords = "batch_get_processed_records"
+	RaftQueryGetConsumerTransactions = "get_consumer_transactions"
+	RaftQueryGetConsumerOffsets      = "get_consumer_offsets"
 )
 
 // ConnectToSpecificBroker connects to a specific broker address

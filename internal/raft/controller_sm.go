@@ -39,6 +39,11 @@ type ClusterMetadata struct {
 
 	ConsumerGroups map[string]*ConsumerGroupInfo `json:"consumer_groups"`
 
+	// Consumer transaction and idempotency tracking
+	ProcessedMessages    map[string]*ProcessedMessageInfo    `json:"processed_messages"`
+	ConsumerTransactions map[string]*ConsumerTransactionInfo `json:"consumer_transactions"`
+	ConsumerOffsets      map[string]*ConsumerOffsetInfo      `json:"consumer_offsets"`
+
 	Version    int64     `json:"version"`
 	UpdateTime time.Time `json:"update_time"`
 }
@@ -126,6 +131,40 @@ type GroupMemberInfo struct {
 	LastSeen   time.Time `json:"last_seen"`
 }
 
+// ProcessedMessageInfo tracks processed messages for idempotency
+type ProcessedMessageInfo struct {
+	MessageID   string    `json:"message_id"`
+	Topic       string    `json:"topic"`
+	Partition   int32     `json:"partition"`
+	Offset      int64     `json:"offset"`
+	ConsumerID  string    `json:"consumer_id"`
+	ProcessedAt time.Time `json:"processed_at"`
+	Result      string    `json:"result"`
+}
+
+// ConsumerTransactionInfo tracks consumer transaction state
+type ConsumerTransactionInfo struct {
+	TransactionID string                   `json:"transaction_id"`
+	ConsumerID    string                   `json:"consumer_id"`
+	GroupID       string                   `json:"group_id"`
+	State         string                   `json:"state"`
+	Messages      []*ProcessedMessageInfo  `json:"messages"`
+	Offsets       map[string]int64         `json:"offsets"`
+	StartedAt     time.Time                `json:"started_at"`
+	UpdatedAt     time.Time                `json:"updated_at"`
+	TimeoutAt     time.Time                `json:"timeout_at"`
+}
+
+// ConsumerOffsetInfo tracks consumer offset information
+type ConsumerOffsetInfo struct {
+	GroupID     string    `json:"group_id"`
+	Topic       string    `json:"topic"`
+	Partition   int32     `json:"partition"`
+	Offset      int64     `json:"offset"`
+	CommittedAt time.Time `json:"committed_at"`
+	MemberID    string    `json:"member_id"`
+}
+
 // ControllerCommand represents a command to be executed by the controller
 type ControllerCommand struct {
 	Type      string                 `json:"type"`
@@ -210,6 +249,19 @@ func (csm *ControllerStateMachine) executeCommand(cmd *ControllerCommand) (inter
 		return csm.markBrokerFailed(cmd.Data)
 	case protocol.RaftCmdRebalancePartitions:
 		return csm.rebalancePartitions(cmd.Data)
+	// Consumer transaction and idempotency commands
+	case protocol.RaftCmdMarkMessageProcessed:
+		return csm.markMessageProcessed(cmd.Data)
+	case protocol.RaftCmdBeginConsumerTransaction:
+		return csm.beginConsumerTransaction(cmd.Data)
+	case protocol.RaftCmdCommitConsumerTransaction:
+		return csm.commitConsumerTransaction(cmd.Data)
+	case protocol.RaftCmdAbortConsumerTransaction:
+		return csm.abortConsumerTransaction(cmd.Data)
+	case protocol.RaftCmdUpdateConsumerOffset:
+		return csm.updateConsumerOffset(cmd.Data)
+	case protocol.RaftCmdBatchMarkProcessed:
+		return csm.batchMarkProcessed(cmd.Data)
 	default:
 		return nil, fmt.Errorf("unknown command type: %s", cmd.Type)
 	}
@@ -798,6 +850,38 @@ func (csm *ControllerStateMachine) Lookup(query interface{}) (interface{}, error
 			return map[string]string{"leader": leader}, nil
 		}
 		return map[string]string{"error": "partition not found"}, nil
+	// Consumer transaction and idempotency queries
+	case protocol.RaftQueryGetProcessedMessage:
+		consumerID := queryObj["consumer_id"].(string)
+		topic := queryObj["topic"].(string)
+		partition := int32(queryObj["partition"].(float64))
+		offset := int64(queryObj["offset"].(float64))
+		key := fmt.Sprintf("%s:%s:%d:%d", consumerID, topic, partition, offset)
+		if msg, exists := csm.metadata.ProcessedMessages[key]; exists {
+			return msg, nil
+		}
+		return nil, fmt.Errorf("processed message not found")
+	case protocol.RaftQueryGetConsumerTransaction:
+		transactionID := queryObj["transaction_id"].(string)
+		if txn, exists := csm.metadata.ConsumerTransactions[transactionID]; exists {
+			return txn, nil
+		}
+		return nil, fmt.Errorf("transaction %s not found", transactionID)
+	case protocol.RaftQueryGetConsumerOffset:
+		groupID := queryObj["group_id"].(string)
+		topic := queryObj["topic"].(string)
+		partition := int32(queryObj["partition"].(float64))
+		key := fmt.Sprintf("%s:%s:%d", groupID, topic, partition)
+		if offset, exists := csm.metadata.ConsumerOffsets[key]; exists {
+			return offset, nil
+		}
+		return nil, fmt.Errorf("consumer offset not found")
+	case protocol.RaftQueryGetProcessedMessages:
+		return csm.metadata.ProcessedMessages, nil
+	case protocol.RaftQueryGetConsumerTransactions:
+		return csm.metadata.ConsumerTransactions, nil
+	case protocol.RaftQueryGetConsumerOffsets:
+		return csm.metadata.ConsumerOffsets, nil
 	default:
 		return nil, fmt.Errorf("unknown query type: %s", queryType)
 	}
@@ -1040,4 +1124,234 @@ func (csm *ControllerStateMachine) GetTopicMetadataWithPartitions(topicName stri
 	}
 
 	return response, nil
+}
+
+// Consumer transaction and idempotency methods
+
+// markMessageProcessed marks a message as processed for idempotency
+func (csm *ControllerStateMachine) markMessageProcessed(data map[string]interface{}) (interface{}, error) {
+	csm.mu.Lock()
+	defer csm.mu.Unlock()
+
+	messageID := data["message_id"].(string)
+	topic := data["topic"].(string)
+	partition := int32(data["partition"].(float64))
+	offset := int64(data["offset"].(float64))
+	consumerID := data["consumer_id"].(string)
+	result := data["result"].(string)
+
+	if csm.metadata.ProcessedMessages == nil {
+		csm.metadata.ProcessedMessages = make(map[string]*ProcessedMessageInfo)
+	}
+
+	key := fmt.Sprintf("%s:%s:%d:%d", consumerID, topic, partition, offset)
+	csm.metadata.ProcessedMessages[key] = &ProcessedMessageInfo{
+		MessageID:   messageID,
+		Topic:       topic,
+		Partition:   partition,
+		Offset:      offset,
+		ConsumerID:  consumerID,
+		ProcessedAt: time.Now(),
+		Result:      result,
+	}
+
+	csm.metadata.Version++
+	csm.metadata.UpdateTime = time.Now()
+
+	return map[string]interface{}{"status": "success"}, nil
+}
+
+// beginConsumerTransaction starts a new consumer transaction
+func (csm *ControllerStateMachine) beginConsumerTransaction(data map[string]interface{}) (interface{}, error) {
+	csm.mu.Lock()
+	defer csm.mu.Unlock()
+
+	transactionID := data["transaction_id"].(string)
+	consumerID := data["consumer_id"].(string)
+	groupID := data["group_id"].(string)
+	timeoutMs := int64(data["timeout_ms"].(float64))
+
+	if csm.metadata.ConsumerTransactions == nil {
+		csm.metadata.ConsumerTransactions = make(map[string]*ConsumerTransactionInfo)
+	}
+
+	// Check if transaction already exists
+	if _, exists := csm.metadata.ConsumerTransactions[transactionID]; exists {
+		return nil, fmt.Errorf("transaction %s already exists", transactionID)
+	}
+
+	now := time.Now()
+	csm.metadata.ConsumerTransactions[transactionID] = &ConsumerTransactionInfo{
+		TransactionID: transactionID,
+		ConsumerID:    consumerID,
+		GroupID:       groupID,
+		State:         "ACTIVE",
+		Messages:      make([]*ProcessedMessageInfo, 0),
+		Offsets:       make(map[string]int64),
+		StartedAt:     now,
+		UpdatedAt:     now,
+		TimeoutAt:     now.Add(time.Duration(timeoutMs) * time.Millisecond),
+	}
+
+	csm.metadata.Version++
+	csm.metadata.UpdateTime = time.Now()
+
+	return map[string]interface{}{"status": "success", "transaction_id": transactionID}, nil
+}
+
+// commitConsumerTransaction commits a consumer transaction
+func (csm *ControllerStateMachine) commitConsumerTransaction(data map[string]interface{}) (interface{}, error) {
+	csm.mu.Lock()
+	defer csm.mu.Unlock()
+
+	transactionID := data["transaction_id"].(string)
+
+	if csm.metadata.ConsumerTransactions == nil {
+		return nil, fmt.Errorf("no transactions found")
+	}
+
+	txn, exists := csm.metadata.ConsumerTransactions[transactionID]
+	if !exists {
+		return nil, fmt.Errorf("transaction %s not found", transactionID)
+	}
+
+	if txn.State != "ACTIVE" {
+		return nil, fmt.Errorf("transaction %s is not active, current state: %s", transactionID, txn.State)
+	}
+
+	// Commit all processed messages
+	if csm.metadata.ProcessedMessages == nil {
+		csm.metadata.ProcessedMessages = make(map[string]*ProcessedMessageInfo)
+	}
+
+	for _, msg := range txn.Messages {
+		key := fmt.Sprintf("%s:%s:%d:%d", msg.ConsumerID, msg.Topic, msg.Partition, msg.Offset)
+		csm.metadata.ProcessedMessages[key] = msg
+	}
+
+	// Commit offsets
+	if csm.metadata.ConsumerOffsets == nil {
+		csm.metadata.ConsumerOffsets = make(map[string]*ConsumerOffsetInfo)
+	}
+
+	for partitionKey, offset := range txn.Offsets {
+		csm.metadata.ConsumerOffsets[partitionKey] = &ConsumerOffsetInfo{
+			GroupID:     txn.GroupID,
+			Topic:       "", // Will be parsed from partitionKey
+			Partition:   0,  // Will be parsed from partitionKey
+			Offset:      offset,
+			CommittedAt: time.Now(),
+			MemberID:    txn.ConsumerID,
+		}
+	}
+
+	// Mark transaction as committed
+	txn.State = "COMMITTED"
+	txn.UpdatedAt = time.Now()
+
+	csm.metadata.Version++
+	csm.metadata.UpdateTime = time.Now()
+
+	return map[string]interface{}{"status": "success"}, nil
+}
+
+// abortConsumerTransaction aborts a consumer transaction
+func (csm *ControllerStateMachine) abortConsumerTransaction(data map[string]interface{}) (interface{}, error) {
+	csm.mu.Lock()
+	defer csm.mu.Unlock()
+
+	transactionID := data["transaction_id"].(string)
+
+	if csm.metadata.ConsumerTransactions == nil {
+		return nil, fmt.Errorf("no transactions found")
+	}
+
+	txn, exists := csm.metadata.ConsumerTransactions[transactionID]
+	if !exists {
+		return nil, fmt.Errorf("transaction %s not found", transactionID)
+	}
+
+	if txn.State != "ACTIVE" {
+		return nil, fmt.Errorf("transaction %s is not active, current state: %s", transactionID, txn.State)
+	}
+
+	// Mark transaction as aborted
+	txn.State = "ABORTED"
+	txn.UpdatedAt = time.Now()
+
+	csm.metadata.Version++
+	csm.metadata.UpdateTime = time.Now()
+
+	return map[string]interface{}{"status": "success"}, nil
+}
+
+// updateConsumerOffset updates consumer offset
+func (csm *ControllerStateMachine) updateConsumerOffset(data map[string]interface{}) (interface{}, error) {
+	csm.mu.Lock()
+	defer csm.mu.Unlock()
+
+	groupID := data["group_id"].(string)
+	topic := data["topic"].(string)
+	partition := int32(data["partition"].(float64))
+	offset := int64(data["offset"].(float64))
+	memberID := data["member_id"].(string)
+
+	if csm.metadata.ConsumerOffsets == nil {
+		csm.metadata.ConsumerOffsets = make(map[string]*ConsumerOffsetInfo)
+	}
+
+	key := fmt.Sprintf("%s:%s:%d", groupID, topic, partition)
+	csm.metadata.ConsumerOffsets[key] = &ConsumerOffsetInfo{
+		GroupID:     groupID,
+		Topic:       topic,
+		Partition:   partition,
+		Offset:      offset,
+		CommittedAt: time.Now(),
+		MemberID:    memberID,
+	}
+
+	csm.metadata.Version++
+	csm.metadata.UpdateTime = time.Now()
+
+	return map[string]interface{}{"status": "success"}, nil
+}
+
+// batchMarkProcessed marks multiple messages as processed in batch
+func (csm *ControllerStateMachine) batchMarkProcessed(data map[string]interface{}) (interface{}, error) {
+	csm.mu.Lock()
+	defer csm.mu.Unlock()
+
+	messagesData := data["messages"].([]interface{})
+
+	if csm.metadata.ProcessedMessages == nil {
+		csm.metadata.ProcessedMessages = make(map[string]*ProcessedMessageInfo)
+	}
+
+	processedCount := 0
+	for _, msgData := range messagesData {
+		msgMap := msgData.(map[string]interface{})
+		messageID := msgMap["message_id"].(string)
+		topic := msgMap["topic"].(string)
+		partition := int32(msgMap["partition"].(float64))
+		offset := int64(msgMap["offset"].(float64))
+		consumerID := msgMap["consumer_id"].(string)
+		result := msgMap["result"].(string)
+
+		key := fmt.Sprintf("%s:%s:%d:%d", consumerID, topic, partition, offset)
+		csm.metadata.ProcessedMessages[key] = &ProcessedMessageInfo{
+			MessageID:   messageID,
+			Topic:       topic,
+			Partition:   partition,
+			Offset:      offset,
+			ConsumerID:  consumerID,
+			ProcessedAt: time.Now(),
+			Result:      result,
+		}
+		processedCount++
+	}
+
+	csm.metadata.Version++
+	csm.metadata.UpdateTime = time.Now()
+
+	return map[string]interface{}{"status": "success", "processed_count": processedCount}, nil
 }
