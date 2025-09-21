@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/issac1998/go-queue/internal/compression"
+	"github.com/issac1998/go-queue/internal/delayed"
 	"github.com/issac1998/go-queue/internal/discovery"
 	"github.com/issac1998/go-queue/internal/protocol"
 	"github.com/issac1998/go-queue/internal/raft"
@@ -36,6 +37,9 @@ type Broker struct {
 	// Transaction management
 	TransactionManager *transaction.TransactionManager
 	TransactionChecker *TransactionChecker
+
+	// Delayed message management
+	DelayedMessageManager *delayed.DelayedMessageManager
 
 	// Client service
 	ClientServer *ClientServer
@@ -565,4 +569,9 @@ func (b *Broker) initMessageProcessing() error {
 	log.Printf("Ordered message router initialized")
 
 	return nil
+}
+
+// GetDelayedMessageManager 获取延迟消息管理器
+func (b *Broker) GetDelayedMessageManager() *delayed.DelayedMessageManager {
+	return b.DelayedMessageManager
 }

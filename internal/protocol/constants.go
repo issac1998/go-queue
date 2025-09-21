@@ -40,6 +40,11 @@ const (
 	ConsumerCommitTransactionRequestType int32 = 24
 	ConsumerAbortTransactionRequestType  int32 = 25
 
+	// Delayed message request types
+	DelayedProduceRequestType       int32 = 26
+	DelayedMessageQueryRequestType  int32 = 27
+	DelayedMessageCancelRequestType int32 = 28
+
 	// Group management request types
 	ListGroupsRequestType    int32 = 30
 	DescribeGroupRequestType int32 = 31
@@ -119,6 +124,9 @@ var RequestTypeNames = map[int32]string{
 	ConsumerBeginTransactionRequestType:  "CONSUMER_BEGIN_TRANSACTION",
 	ConsumerCommitTransactionRequestType: "CONSUMER_COMMIT_TRANSACTION",
 	ConsumerAbortTransactionRequestType:  "CONSUMER_ABORT_TRANSACTION",
+	DelayedProduceRequestType:            "DELAYED_PRODUCE",
+	DelayedMessageQueryRequestType:       "DELAYED_MESSAGE_QUERY",
+	DelayedMessageCancelRequestType:      "DELAYED_MESSAGE_CANCEL",
 	ListGroupsRequestType:                "LIST_GROUPS",
 	DescribeGroupRequestType:             "DESCRIBE_GROUP",
 }
