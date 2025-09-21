@@ -144,15 +144,15 @@ type ProcessedMessageInfo struct {
 
 // ConsumerTransactionInfo tracks consumer transaction state
 type ConsumerTransactionInfo struct {
-	TransactionID string                   `json:"transaction_id"`
-	ConsumerID    string                   `json:"consumer_id"`
-	GroupID       string                   `json:"group_id"`
-	State         string                   `json:"state"`
-	Messages      []*ProcessedMessageInfo  `json:"messages"`
-	Offsets       map[string]int64         `json:"offsets"`
-	StartedAt     time.Time                `json:"started_at"`
-	UpdatedAt     time.Time                `json:"updated_at"`
-	TimeoutAt     time.Time                `json:"timeout_at"`
+	TransactionID string                  `json:"transaction_id"`
+	ConsumerID    string                  `json:"consumer_id"`
+	GroupID       string                  `json:"group_id"`
+	State         string                  `json:"state"`
+	Messages      []*ProcessedMessageInfo `json:"messages"`
+	Offsets       map[string]int64        `json:"offsets"`
+	StartedAt     time.Time               `json:"started_at"`
+	UpdatedAt     time.Time               `json:"updated_at"`
+	TimeoutAt     time.Time               `json:"timeout_at"`
 }
 
 // ConsumerOffsetInfo tracks consumer offset information
@@ -724,10 +724,6 @@ func (csm *ControllerStateMachine) brokerIDToNodeID(brokerID string) uint64 {
 	h := fnv.New64a()
 	h.Write([]byte(brokerID))
 	return h.Sum64()
-}
-
-func (csm *ControllerStateMachine) updatePartitionAssignment(data map[string]interface{}) (interface{}, error) {
-	return map[string]string{"status": "success"}, nil
 }
 
 func (csm *ControllerStateMachine) updateBrokerLoad(data map[string]interface{}) (interface{}, error) {
