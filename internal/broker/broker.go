@@ -193,6 +193,11 @@ func (b *Broker) Start() error {
 		return fmt.Errorf("transaction manager init failed: %v", err)
 	}
 
+	// 8.5. Initialize Delayed Message Manager
+	if err := b.initDelayedMessageManager(); err != nil {
+		return fmt.Errorf("delayed message manager init failed: %v", err)
+	}
+
 	// 9. Start client server
 	if err := b.startClientServer(); err != nil {
 		return fmt.Errorf("client server start failed: %v", err)
@@ -270,6 +275,12 @@ func (b *Broker) Stop() error {
 
 	if b.ConsumerGroupManager != nil {
 		b.ConsumerGroupManager.Stop()
+	}
+
+	if b.DelayedMessageManager != nil {
+		if err := b.DelayedMessageManager.Stop(); err != nil {
+			log.Printf("Warning: Failed to stop delayed message manager: %v", err)
+		}
 	}
 
 	if b.raftManager != nil {
@@ -405,6 +416,28 @@ func (b *Broker) initTransactionManager() error {
 	}
 
 	log.Printf("Transaction Manager and Checker initialized")
+	return nil
+}
+
+// initDelayedMessageManager initializes the delayed message manager
+func (b *Broker) initDelayedMessageManager() error {
+	// 创建延迟消息管理器配置
+	config := delayed.DelayedMessageManagerConfig{
+		DataDir:         filepath.Join(b.Config.DataDir, "delayed"),
+		MaxRetries:      3,
+		CleanupInterval: 1 * time.Hour,
+	}
+
+	// 创建延迟消息管理器 (暂时不传producer，后续可以优化)
+	delayedMessageManager := delayed.NewDelayedMessageManager(config, nil)
+	b.DelayedMessageManager = delayedMessageManager
+
+	// 启动延迟消息管理器
+	if err := delayedMessageManager.Start(); err != nil {
+		return fmt.Errorf("failed to start delayed message manager: %v", err)
+	}
+
+	log.Printf("Delayed Message Manager initialized and started")
 	return nil
 }
 
