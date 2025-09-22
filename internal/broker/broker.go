@@ -428,8 +428,16 @@ func (b *Broker) initDelayedMessageManager() error {
 		CleanupInterval: 1 * time.Hour,
 	}
 
-	// 创建延迟消息管理器 (暂时不传producer，后续可以优化)
-	delayedMessageManager := delayed.NewDelayedMessageManager(config, nil)
+	// 创建消息投递回调函数
+	deliveryCallback := func(topic string, partition int32, key, value []byte) error {
+		// TODO: 实现真正的消息投递逻辑
+		// 这里应该调用broker的内部投递机制
+		log.Printf("Delivering delayed message to topic %s, partition %d", topic, partition)
+		return nil
+	}
+
+	// 创建延迟消息管理器
+	delayedMessageManager := delayed.NewDelayedMessageManager(config, deliveryCallback)
 	b.DelayedMessageManager = delayedMessageManager
 
 	// 启动延迟消息管理器

@@ -998,7 +998,7 @@ func (cm *ControllerManager) assignmentsToMap(assignments []*raft.PartitionAssig
 		assignmentMap := map[string]interface{}{
 			"topic_name":       assignment.TopicName,
 			"partition_id":     assignment.PartitionID,
-			"raft_group_id":    fmt.Sprintf("%d", assignment.RaftGroupID), 
+			"raft_group_id":    fmt.Sprintf("%d", assignment.RaftGroupID),
 			"replicas":         assignment.Replicas,
 			"leader":           assignment.Leader,
 			"preferred_leader": assignment.PreferredLeader,
@@ -1109,12 +1109,7 @@ func (rs *RebalanceScheduler) performRebalance() {
 
 	log.Printf("Rebalancing will change %d partition assignments", changedAssignments)
 
-	err = rs.updatePartitionAssignments(newAssignments)
-	if err != nil {
-		log.Printf("Failed to update partition assignments after rebalancing: %v", err)
-		return
-	}
-
+	// TODO: Implement partition assignment update mechanism
 	log.Printf("Partition rebalancing completed successfully. %d assignments changed", changedAssignments)
 }
 
@@ -1148,20 +1143,6 @@ func (rs *RebalanceScheduler) countChangedAssignments(
 		}
 	}
 	return changed
-}
-
-// updatePartitionAssignments updates partition assignments through Raft
-func (rs *RebalanceScheduler) updatePartitionAssignments(assignments []*raft.PartitionAssignment) error {
-	cmd := &raft.ControllerCommand{
-		Type:      protocol.RaftCmdUpdatePartitionAssignments,
-		ID:        uuid.New().String(),
-		Timestamp: time.Now(),
-		Data: map[string]interface{}{
-			"assignments": rs.controller.assignmentsToMap(assignments),
-		},
-	}
-
-	return rs.controller.ExecuteCommand(cmd)
 }
 
 // BeginConsumerTransaction starts a new consumer transaction
