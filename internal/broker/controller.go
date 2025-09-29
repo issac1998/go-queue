@@ -45,27 +45,32 @@ type HealthChecker struct {
 	checkInterval    time.Duration
 	timeout          time.Duration
 	failureThreshold int
+	logger           *log.Logger
 }
 
 // LeaderScheduler handles leader migration and load balancing
 type LeaderScheduler struct {
 	controller *ControllerManager
+	logger     *log.Logger
 }
 
 // LoadMonitor monitors cluster load and performance
 type LoadMonitor struct {
 	controller *ControllerManager
+	logger     *log.Logger
 }
 
 // FailureDetector detects broker failures and triggers recovery
 type FailureDetector struct {
 	controller *ControllerManager
+	logger     *log.Logger
 }
 
 // RebalanceScheduler handles periodic partition rebalancing
 type RebalanceScheduler struct {
 	controller *ControllerManager
 	interval   time.Duration
+	logger     *log.Logger
 }
 
 // NewControllerManager creates a new ControllerManager
@@ -78,30 +83,35 @@ func NewControllerManager(broker *Broker) (*ControllerManager, error) {
 		cancel: cancel,
 	}
 
-	cm.stateMachine = raft.NewControllerStateMachine(cm, broker.raftManager)
+	cm.stateMachine = raft.NewControllerStateMachine(cm, broker.raftManager, broker.logger)
 
 	cm.healthChecker = &HealthChecker{
 		controller:       cm,
 		checkInterval:    5 * time.Second,
 		timeout:          10 * time.Second,
 		failureThreshold: 3,
+		logger:           broker.logger,
 	}
 
 	cm.leaderScheduler = &LeaderScheduler{
 		controller: cm,
+		logger:     broker.logger,
 	}
 
 	cm.loadMonitor = &LoadMonitor{
 		controller: cm,
+		logger:     broker.logger,
 	}
 
 	cm.failureDetector = &FailureDetector{
 		controller: cm,
+		logger:     broker.logger,
 	}
 
 	cm.rebalanceScheduler = &RebalanceScheduler{
 		controller: cm,
 		interval:   5 * time.Minute, // Rebalance every 5 minutes
+		logger:     broker.logger,
 	}
 
 	return cm, nil
@@ -200,7 +210,7 @@ func (cm *ControllerManager) initControllerRaftGroup() error {
 	}
 
 	if cm.broker.raftManager.IsLeader(raft.ControllerGroupID) {
-		go cm.StartLeaderTasks()
+		cm.StartLeaderTasks()
 	}
 
 	cm.startBackgroundTasks()
@@ -218,8 +228,9 @@ func (cm *ControllerManager) waitForControllerReady(timeout time.Duration) error
 
 // startBackgroundTasks starts background monitoring tasks
 func (cm *ControllerManager) startBackgroundTasks() {
-	cm.wg.Add(1)
+	cm.wg.Add(2)
 	go cm.monitorLeadership()
+	go cm.startTransactionCheck()
 }
 
 // monitorLeadership monitors changes in Raft leadership
@@ -257,7 +268,7 @@ func (cm *ControllerManager) StartLeaderTasks() {
 	cm.leaderCtx, cm.leaderCancel = context.WithCancel(cm.ctx)
 
 	// Start existing partition Raft groups for recovery
-	go cm.startExistingPartitionGroups()
+	cm.startExistingPartitionGroups()
 
 	cm.leaderWg.Add(2)
 	go cm.healthChecker.startHealthCheck()
@@ -312,6 +323,73 @@ func (cm *ControllerManager) startExistingPartitionGroups() {
 	}
 
 	log.Printf("Successfully started %d existing partition Raft groups", len(allAssignments))
+}
+
+// startGlobalTransactionCheck starts the global transaction check task
+func (cm *ControllerManager) startTransactionCheck() {
+	defer cm.wg.Done()
+
+	ticker := time.NewTicker(300 * time.Second)
+	defer ticker.Stop()
+
+	log.Printf("Starting transaction check task for broker %s", cm.broker.ID)
+
+	for {
+		select {
+		case <-cm.ctx.Done():
+			log.Printf("Transaction check task stopped for broker %s", cm.broker.ID)
+			return
+		case <-ticker.C:
+			cm.performGlobalTransactionCheck()
+		}
+	}
+}
+
+// performGlobalTransactionCheck performs global transaction check across all partitions
+func (cm *ControllerManager) performGlobalTransactionCheck() {
+	log.Printf("Performing global transaction check")
+
+	allAssignments, err := cm.getAllPartitionAssignments()
+	if err != nil {
+		log.Printf("Failed to get partition assignments for transaction check: %v", err)
+		return
+	}
+
+	for _, assignment := range allAssignments {
+		if assignment.Leader == cm.broker.ID {
+			cm.checkPartitionTransactions(assignment)
+		}
+	}
+}
+
+// checkPartitionTransactions checks transactions for a specific partition
+func (cm *ControllerManager) checkPartitionTransactions(assignment *raft.PartitionAssignment) {
+	// 获取分区的事务管理器
+	if cm.broker.TransactionManager == nil {
+		return
+	}
+
+	// 获取过期的半消息
+	expiredTxns, err := cm.broker.TransactionManager.GetExpiredHalfMessages()
+	if err != nil {
+		log.Printf("Failed to get expired transactions for partition %s-%d: %v",
+			assignment.TopicName, assignment.PartitionID, err)
+		return
+	}
+
+	if len(expiredTxns) == 0 {
+		return
+	}
+
+	log.Printf("Found %d expired transactions in partition %s-%d",
+		len(expiredTxns), assignment.TopicName, assignment.PartitionID)
+
+	// 执行事务检查
+	err = cm.broker.TransactionManager.PerformTransactionCheck()
+	if err != nil {
+		log.Printf("Failed to perform transaction check for partition %s-%d: %v",
+			assignment.TopicName, assignment.PartitionID, err)
+	}
 }
 
 // getAllPartitionAssignments gets all partition assignments from the state machine
@@ -506,7 +584,7 @@ func (cm *ControllerManager) CreateTopic(topicName string, partitions int32, rep
 
 	log.Printf("Allocated %d partitions for topic %s", len(assignments), topicName)
 
-	log.Printf("starting Raft groups", topicName)
+	log.Printf("Starting Raft groups for topic %s", topicName)
 
 	err = partitionAssigner.StartPartitionRaftGroups(assignments)
 	if err != nil {
@@ -845,13 +923,13 @@ func (hc *HealthChecker) startHealthCheck() {
 func (hc *HealthChecker) performHealthCheck() {
 	result, err := hc.controller.QueryMetadata(protocol.RaftQueryGetBrokers, nil)
 	if err != nil {
-		log.Printf("Failed to get brokers for health check: %v", err)
+		hc.logger.Printf("Failed to get brokers for health check: %v", err)
 		return
 	}
 
 	var brokers map[string]*raft.BrokerInfo
 	if err := json.Unmarshal(result, &brokers); err != nil {
-		log.Printf("Failed to unmarshal brokers: %v", err)
+		hc.logger.Printf("Failed to unmarshal brokers: %v", err)
 		return
 	}
 
@@ -874,7 +952,7 @@ func (hc *HealthChecker) performHealthCheck() {
 
 		// Check if broker hasn't sent heartbeat in too long
 		if time.Since(broker.LastSeen) > graceTime {
-			log.Printf("Broker %s appears to be unhealthy, last seen: %v", brokerID, broker.LastSeen)
+			hc.logger.Printf("Broker %s appears to be unhealthy, last seen: %v", brokerID, broker.LastSeen)
 			hc.handleBrokerFailure(brokerID)
 		}
 	}
@@ -891,7 +969,7 @@ func (hc *HealthChecker) handleBrokerFailure(brokerID string) {
 	}
 
 	if err := hc.controller.ExecuteCommand(cmd); err != nil {
-		log.Printf("Failed to mark broker %s as failed: %v", brokerID, err)
+		hc.logger.Printf("Failed to mark broker %s as failed: %v", brokerID, err)
 	}
 }
 
@@ -899,14 +977,14 @@ func (hc *HealthChecker) checkForNewNodes(currentBrokers map[string]*raft.Broker
 	// Get all brokers from service discovery
 	discoveredBrokers, err := hc.controller.broker.discovery.DiscoverBrokers()
 	if err != nil {
-		log.Printf("Failed to get brokers from service discovery: %v", err)
+		hc.logger.Printf("Failed to get brokers from service discovery: %v", err)
 		return
 	}
 
 	// Find brokers that are in service discovery but not in current Raft cluster
 	for _, discoveredBroker := range discoveredBrokers {
 		if _, exists := currentBrokers[discoveredBroker.ID]; !exists {
-			log.Printf("Found new broker %s, adding to Controller Raft cluster", discoveredBroker.ID)
+			hc.logger.Printf("Found new broker %s, adding to Controller Raft cluster", discoveredBroker.ID)
 			hc.addNewNodeToCluster(discoveredBroker)
 		}
 	}
@@ -917,13 +995,17 @@ func (hc *HealthChecker) addNewNodeToCluster(broker *discovery.BrokerInfo) {
 	nodeID := hc.controller.brokerIDToNodeID(broker.ID)
 
 	// Add node to Controller Raft group
-	_, err := hc.controller.broker.raftManager.RequestAddNode(1, nodeID, broker.RaftAddress, 0, 30*time.Second)
-	if err != nil {
-		log.Printf("Failed to add node %s to Controller Raft cluster: %v", broker.ID, err)
-		return
+	for i := 0; i < 3; i++ {
+		_, err := hc.controller.broker.raftManager.RequestAddNode(1, nodeID, broker.RaftAddress, 0, 30*time.Second)
+		if err != nil {
+			hc.logger.Printf("Failed to add node %s to Controller Raft cluster: %v, retry : %d", broker.ID, err, i)
+			time.Sleep(3 * time.Second)
+			continue
+		}
+		break
 	}
 
-	log.Printf("Successfully added node %s to Controller Raft cluster", broker.ID)
+	hc.logger.Printf("Successfully added node %s to Controller Raft cluster", broker.ID)
 }
 
 // getAvailableBrokers returns list of available brokers
@@ -1189,4 +1271,57 @@ func (cm *ControllerManager) AbortConsumerTransaction(transactionID, consumerID,
 		},
 	}
 	return cm.ExecuteCommand(cmd)
+}
+
+// RegisterProducerGroup registers a producer group with the controller
+func (cm *ControllerManager) RegisterProducerGroup(groupID string, callbackAddr string) error {
+	cmd := &raft.ControllerCommand{
+		Type:      protocol.RaftCmdRegisterProducerGroup,
+		ID:        fmt.Sprintf("register-producer-group-%s-%d", groupID, time.Now().UnixNano()),
+		Timestamp: time.Now(),
+		Data: map[string]interface{}{
+			"group_id":      groupID,
+			"callback_addr": callbackAddr,
+		},
+	}
+
+	return cm.ExecuteCommand(cmd)
+}
+
+// UnregisterProducerGroup unregisters a producer group from the controller
+func (cm *ControllerManager) UnregisterProducerGroup(groupID string) error {
+	if cm == nil {
+		return fmt.Errorf("controller not available")
+	}
+
+	cmd := &raft.ControllerCommand{
+		Type:      protocol.RaftCmdUnregisterProducerGroup,
+		ID:        fmt.Sprintf("unregister-producer-group-%s-%d", groupID, time.Now().UnixNano()),
+		Timestamp: time.Now(),
+		Data: map[string]interface{}{
+			"group_id": groupID,
+		},
+	}
+
+	return cm.ExecuteCommand(cmd)
+}
+
+// GetProducerGroups retrieves all producer groups from the controller
+func (cm *ControllerManager) GetProducerGroups() (map[string]string, error) {
+	if cm == nil {
+		return nil, fmt.Errorf("controller not available")
+	}
+
+	// Use the controller's GetMetadata method to get cluster metadata
+	metadata, err := cm.GetMetadata()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get cluster metadata: %v", err)
+	}
+
+	result := make(map[string]string)
+	for groupID, groupInfo := range metadata.ProducerGroups {
+		result[groupID] = groupInfo.CallbackAddr
+	}
+
+	return result, nil
 }

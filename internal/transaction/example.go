@@ -7,18 +7,39 @@ import (
 	"github.com/issac1998/go-queue/internal/protocol"
 )
 
+// MockController is a simple mock implementation for examples
+type MockController struct{}
+
+func (mc *MockController) RegisterProducerGroup(producerGroup string, callbackAddr string) error {
+	return nil
+}
+
+func (mc *MockController) UnregisterProducerGroup(producerGroup string) error {
+	return nil
+}
+
+func (mc *MockController) GetProducerGroups() (map[string]string, error) {
+	return make(map[string]string), nil
+}
+
+func (mc *MockController) IsControllerLeader() bool {
+	return true
+}
+
 // ExampleUsage demonstrates how to use transaction manager
 func ExampleUsage() {
-	tm := NewTransactionManager()
+	// 创建一个简单的controller实现用于示例
+	controller := &MockController{}
+	tm := NewTransactionManager(controller)
 	defer tm.Stop()
 
-	err := tm.RegisterProducerGroup("producer-group-1", "localhost:8081")
+	err := tm.RegisterProducerGroup("producer-group-1", "localhost:8080")
 	if err != nil {
-		log.Printf("Failed to register producer group: %v", err)
+		log.Printf("Failed to register producer group 1: %v", err)
 		return
 	}
 
-	err = tm.RegisterProducerGroup("producer-group-2", "localhost:8082")
+	err = tm.RegisterProducerGroup("producer-group-2", "localhost:8081")
 	if err != nil {
 		log.Printf("Failed to register producer group: %v", err)
 		return
@@ -65,7 +86,8 @@ func ExampleUsage() {
 }
 
 func ExampleRollback() {
-	tm := NewTransactionManager()
+	controller := &MockController{}
+	tm := NewTransactionManager(controller)
 	defer tm.Stop()
 
 	req := &TransactionPrepareRequest{
@@ -102,12 +124,13 @@ func ExampleRollback() {
 }
 
 func ExampleMultipleProducerGroups() {
-	tm := NewTransactionManager()
+	controller := &MockController{}
+	tm := NewTransactionManager(controller)
 	defer tm.Stop()
 
-	tm.RegisterProducerGroup("order-service", "localhost:8081")
-	tm.RegisterProducerGroup("payment-service", "localhost:8082")
-	tm.RegisterProducerGroup("inventory-service", "localhost:8083")
+	tm.RegisterProducerGroup("order-service", "localhost:8082")
+	tm.RegisterProducerGroup("payment-service", "localhost:8083")
+	tm.RegisterProducerGroup("inventory-service", "localhost:8084")
 
 	transactions := []*TransactionPrepareRequest{
 		{

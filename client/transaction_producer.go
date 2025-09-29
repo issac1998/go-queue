@@ -3,9 +3,9 @@ package client
 import (
 	"crypto/rand"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"time"
 
@@ -18,6 +18,7 @@ import (
 type TransactionProducer struct {
 	client   *Client
 	listener transaction.TransactionListener
+	group    string
 }
 
 // TransactionMessage massage
@@ -50,20 +51,23 @@ type TransactionResult struct {
 
 // NewTransactionProducer create producer
 func NewTransactionProducer(client *Client, listener transaction.TransactionListener) *TransactionProducer {
-	return &TransactionProducer{
-		client:   client,
-		listener: listener,
-	}
+	return NewTransactionProducerWithGroup(client, listener, "default-txn-group")
+}
+
+// NewTransactionProducerWithGroup creates producer with explicit producer group
+func NewTransactionProducerWithGroup(client *Client, listener transaction.TransactionListener, group string) *TransactionProducer {
+	return &TransactionProducer{client: client, listener: listener, group: group}
 }
 
 // BeginTransaction start new txn
 func (tp *TransactionProducer) BeginTransaction() (*Transaction, error) {
-	transactionID := tp.generateTransactionID()
+	tempID := tp.generateTransactionID()
 
 	return &Transaction{
-		ID:       transactionID,
+		ID:       tempID,
 		producer: tp,
 		prepared: false,
+		producerGroup: tp.group,
 	}, nil
 }
 
@@ -84,6 +88,14 @@ func (tp *TransactionProducer) SendTransactionMessageAndDoLocal(msg *Transaction
 
 // SendHalfMessage send half message
 func (t *Transaction) SendHalfMessageAndDoLocal(msg *TransactionMessage) (*TransactionResult, error) {
+	// Store topic and partition for later use
+	t.topic = msg.Topic
+	t.partition = msg.Partition
+
+	// Now with specific topic and partition info, regenerate correct transaction ID
+	brokerID := t.producer.client.GetProducerID() // Use producer ID as broker ID
+	t.ID = t.producer.generateTransactionIDWithPartition(msg.Topic, msg.Partition, brokerID)
+
 	req := &transaction.TransactionPrepareRequest{
 		TransactionID: t.ID,
 		Topic:         msg.Topic,
@@ -121,8 +133,6 @@ func (t *Transaction) SendHalfMessageAndDoLocal(msg *TransactionMessage) (*Trans
 	}
 
 	t.prepared = true
-	t.topic = msg.Topic
-	t.partition = msg.Partition
 
 	halfMessage := transaction.HalfMessage{
 		TransactionID: t.ID,
@@ -305,11 +315,30 @@ func (t *Transaction) Rollback() error {
 
 func (tp *TransactionProducer) generateTransactionID() transaction.TransactionID {
 	timestamp := time.Now().UnixNano()
-	randomBytes := make([]byte, 8)
-	// TODO: How to generate a unique ID?
+	randomBytes := make([]byte, 4)
 	rand.Read(randomBytes)
+	sequence := binary.BigEndian.Uint32(randomBytes)
 
-	id := fmt.Sprintf("txn_%d_%s", timestamp, hex.EncodeToString(randomBytes))
+	// New transaction ID format: txn_<brokerID>_<topicHash>_<partitionID>_<timestamp>_<sequence>
+	// Note: Using default values here, actual topic and partition info will be determined when sending message
+	id := fmt.Sprintf("txn_default_0_0_%d_%d", timestamp, sequence)
+	return transaction.TransactionID(id)
+}
+
+// generateTransactionIDWithPartition generates transaction ID with partition information
+func (tp *TransactionProducer) generateTransactionIDWithPartition(topic string, partition int32, brokerID string) transaction.TransactionID {
+	timestamp := time.Now().UnixNano()
+	randomBytes := make([]byte, 4)
+	rand.Read(randomBytes)
+	sequence := binary.BigEndian.Uint32(randomBytes)
+
+	// Calculate hash value of topic
+	h := fnv.New32a()
+	h.Write([]byte(topic))
+	topicHash := h.Sum32()
+
+	// New transaction ID format: txn_<brokerID>_<topicHash>_<partitionID>_<timestamp>_<sequence>
+	id := fmt.Sprintf("txn_%s_%d_%d_%d_%d", brokerID, topicHash, partition, timestamp, sequence)
 	return transaction.TransactionID(id)
 }
 

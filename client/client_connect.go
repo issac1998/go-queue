@@ -56,9 +56,12 @@ func (c *Client) connectToController() (net.Conn, error) {
 // TODO:DO we have a better way to verify controller leader?like just send a request to the broker,
 // proxy to controller leader and then return an error to indicate local cache is stale?
 func (c *Client) connectAndVerifyController(brokerAddr string) (net.Conn, error) {
+	log.Printf("Connecting to controller at %s with timeout: %v", brokerAddr, c.timeout)
+	
 	// First verify with a separate connection
 	verifyConn, err := net.DialTimeout("tcp", brokerAddr, c.timeout)
 	if err != nil {
+		log.Printf("Failed to connect to %s for verification: %v", brokerAddr, err)
 		return nil, &errors.TypedError{
 			Type:    errors.ConnectionError,
 			Message: fmt.Sprintf("failed to connect to %s for verification", brokerAddr),
@@ -66,8 +69,10 @@ func (c *Client) connectAndVerifyController(brokerAddr string) (net.Conn, error)
 		}
 	}
 
+	log.Printf("Verifying controller leader at %s", brokerAddr)
 	if err := c.verifyControllerLeader(verifyConn); err != nil {
 		verifyConn.Close()
+		log.Printf("Broker %s is not controller leader: %v", brokerAddr, err)
 		return nil, &errors.TypedError{
 			Type:    errors.ControllerError,
 			Message: fmt.Sprintf("broker %s is not controller leader", brokerAddr),
@@ -75,10 +80,12 @@ func (c *Client) connectAndVerifyController(brokerAddr string) (net.Conn, error)
 		}
 	}
 	verifyConn.Close()
+	log.Printf("Successfully verified %s as controller leader", brokerAddr)
 
 	// Now create a fresh connection for actual requests
 	conn, err := net.DialTimeout("tcp", brokerAddr, c.timeout)
 	if err != nil {
+		log.Printf("Failed to create fresh connection to %s: %v", brokerAddr, err)
 		return nil, &errors.TypedError{
 			Type:    errors.ConnectionError,
 			Message: fmt.Sprintf("failed to connect to %s", brokerAddr),
@@ -86,35 +93,44 @@ func (c *Client) connectAndVerifyController(brokerAddr string) (net.Conn, error)
 		}
 	}
 
+	log.Printf("Successfully connected to controller at %s", brokerAddr)
 	return conn, nil
 }
 
 // verifyControllerLeader sends a verification request to check if the broker is controller leader
 func (c *Client) verifyControllerLeader(conn net.Conn) error {
-	conn.SetDeadline(time.Now().Add(c.timeout))
+	deadline := time.Now().Add(c.timeout)
+	conn.SetDeadline(deadline)
+	log.Printf("Set verification deadline to: %v (timeout: %v)", deadline, c.timeout)
 
 	requestType := protocol.ControllerVerifyRequestType
 	if err := binary.Write(conn, binary.BigEndian, requestType); err != nil {
+		log.Printf("Failed to send verification request: %v", err)
 		return fmt.Errorf("failed to send verification request: %v", err)
 	}
 
 	// Send empty data length for protocol consistency
 	dataLength := int32(0)
 	if err := binary.Write(conn, binary.BigEndian, dataLength); err != nil {
+		log.Printf("Failed to send data length: %v", err)
 		return fmt.Errorf("failed to send data length: %v", err)
 	}
 
+	log.Printf("Reading verification response... (remaining time: %v)", time.Until(deadline))
 	var responseLen int32
 	if err := binary.Read(conn, binary.BigEndian, &responseLen); err != nil {
+		log.Printf("Failed to read verification response length: %v (remaining time: %v)", err, time.Until(deadline))
 		return fmt.Errorf("failed to read verification response length: %v", err)
 	}
 
 	responseData := make([]byte, responseLen)
 	if _, err := io.ReadFull(conn, responseData); err != nil {
+		log.Printf("Failed to read verification response: %v (remaining time: %v)", err, time.Until(deadline))
 		return fmt.Errorf("failed to read verification response: %v", err)
 	}
 
 	isController := string(responseData) == "true"
+	log.Printf("Verification response: %s, isController: %v", string(responseData), isController)
 	if !isController {
 		return &errors.TypedError{
 			Type:    errors.ControllerError,
@@ -236,5 +252,6 @@ func (c *Client) isFollowerAvailable(brokerAddr string) bool {
 		return false
 	}
 	conn.Close()
+	log.Printf("Follower %s is available", brokerAddr)
 	return true
 }

@@ -21,6 +21,7 @@ import (
 type ClientServer struct {
 	broker   *Broker
 	listener net.Listener
+	logger   *log.Logger
 }
 
 // RequestHandler defines the interface for handling specific request types
@@ -73,13 +74,15 @@ var requestConfigs = map[int32]RequestConfig{
 	protocol.ConsumerAbortTransactionRequestType:  {Type: MetadataWriteRequest, Handler: &ConsumerAbortTransactionHandler{}},
 	protocol.DelayedProduceRequestType:            {Type: DataRequest, Handler: &DelayedProduceHandler{}},
 	protocol.DelayedMessageQueryRequestType:       {Type: DataRequest, Handler: &DelayedMessageQueryHandler{}},
-	protocol.DelayedMessageCancelRequestType:      {Type: DataRequest, Handler: &DelayedMessageCancelHandler{}},
+	protocol.DelayedMessageCancelRequestType:     {Type: DataRequest, Handler: &DelayedMessageCancelHandler{}},
+	protocol.RegisterProducerGroupRequestType:     {Type: DataRequest, Handler: &RegisterProducerGroupHandler{}},
 }
 
 // NewClientServer creates a new ClientServer
 func NewClientServer(broker *Broker) (*ClientServer, error) {
 	return &ClientServer{
 		broker: broker,
+		logger: broker.logger,
 	}, nil
 }
 
@@ -95,7 +98,7 @@ func (cs *ClientServer) Start() error {
 	cs.listener = listener
 	go cs.acceptConnections()
 
-	log.Printf("Client server listening on %s", addr)
+	cs.logger.Printf("Client server listening on %s", addr)
 	return nil
 }
 
@@ -121,32 +124,39 @@ func (cs *ClientServer) acceptConnections() {
 
 // handleConnection handles incoming client connections
 func (cs *ClientServer) handleConnection(conn net.Conn) {
-	defer conn.Close()
+	defer func() {
+		if r := recover(); r != nil {
+			cs.logger.Printf("Panic recovered in handleConnection from %s: %v", conn.RemoteAddr(), r)
+			// Try to send error response if connection is still valid
+			cs.sendErrorResponse(conn, fmt.Errorf("internal server error"))
+		}
+		conn.Close()
+	}()
 
-	log.Printf("New client connection from %s", conn.RemoteAddr())
+	cs.logger.Printf("New client connection from %s", conn.RemoteAddr())
 	// Set read timeout for reading request type
 	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 
 	// Read request type
 	var requestType int32
 	if err := binary.Read(conn, binary.BigEndian, &requestType); err != nil {
-		log.Printf("Failed to read request type: %v", err)
+		cs.logger.Printf("Failed to read request type: %v", err)
 		return
 	}
 
-	log.Printf("Received request type: %d", requestType)
+	cs.logger.Printf("Received request type: %d", requestType)
 
 	// Get request configuration
 	config, exists := requestConfigs[requestType]
 	if !exists {
-		log.Printf("Unknown request type: %d", requestType)
+		cs.logger.Printf("Unknown request type: %d", requestType)
 		cs.sendErrorResponse(conn, fmt.Errorf("unknown request type: %d", requestType))
 		return
 	}
 
 	// Handle the request based on its type
 	if err := cs.handleRequestByType(conn, requestType, config); err != nil {
-		log.Printf("Failed to handle request type %d: %v", requestType, err)
+		cs.logger.Printf("Failed to handle request type %d: %v", requestType, err)
 		cs.sendErrorResponse(conn, err)
 	}
 }
@@ -430,7 +440,6 @@ func (h *CreateTopicHandler) Handle(conn net.Conn, cs *ClientServer) error {
 	}
 
 	err = cs.broker.Controller.CreateTopic(topicName, partitions, replicas)
-	fmt.Println("CreateTopic result:", err)
 	if err != nil {
 		log.Printf("Failed to create topic '%s': %v", topicName, err)
 		return fmt.Errorf("failed to create topic: %v", err)
@@ -477,6 +486,84 @@ func (h *CreateTopicHandler) parseCreateTopicRequest(data []byte) (string, int32
 	}
 
 	return string(nameBytes), partitions, replicas, nil
+}
+
+// RegisterProducerGroupHandler handles producer group registration requests
+type RegisterProducerGroupHandler struct{}
+
+// Request format:
+// int16 version
+// int16 groupNameLen + bytes
+// int16 callbackAddrLen + bytes
+func (h *RegisterProducerGroupHandler) Handle(conn net.Conn, cs *ClientServer) error {
+	requestData, err := cs.readRequestData(conn)
+	if err != nil {
+		return fmt.Errorf("failed to read request data: %v", err)
+	}
+
+	buf := bytes.NewReader(requestData)
+	var version int16
+	if err := binary.Read(buf, binary.BigEndian, &version); err != nil {
+		return fmt.Errorf("failed to read version: %v", err)
+	}
+	var groupLen int16
+	if err := binary.Read(buf, binary.BigEndian, &groupLen); err != nil {
+		return fmt.Errorf("failed to read group length: %v", err)
+	}
+	if groupLen <= 0 || groupLen > 1024 { // simple validation
+		return fmt.Errorf("invalid group length: %d", groupLen)
+	}
+	groupBytes := make([]byte, groupLen)
+	if _, err := io.ReadFull(buf, groupBytes); err != nil {
+		return fmt.Errorf("failed to read group bytes: %v", err)
+	}
+
+	group := string(groupBytes)
+
+	// Read callback address
+	var callbackAddrLen int16
+	if err := binary.Read(buf, binary.BigEndian, &callbackAddrLen); err != nil {
+		return fmt.Errorf("failed to read callback address length: %v", err)
+	}
+	if callbackAddrLen < 0 || callbackAddrLen > 1024 { // simple validation
+		return fmt.Errorf("invalid callback address length: %d", callbackAddrLen)
+	}
+	
+	var callbackAddr string
+	if callbackAddrLen > 0 {
+		callbackAddrBytes := make([]byte, callbackAddrLen)
+		if _, err := io.ReadFull(buf, callbackAddrBytes); err != nil {
+			return fmt.Errorf("failed to read callback address bytes: %v", err)
+		}
+		callbackAddr = string(callbackAddrBytes)
+	}
+
+	if group == "" {
+		return fmt.Errorf("producer group name cannot be empty")
+	}
+
+	if cs.broker.TransactionManager == nil {
+		return fmt.Errorf("transaction manager not initialized")
+	}
+
+	if err := cs.broker.Controller.RegisterProducerGroup(group, callbackAddr); err != nil {
+		return fmt.Errorf("failed to register producer group with controller: %w", err)
+	}
+
+	if err := cs.broker.TransactionManager.RegisterProducerGroup(group, callbackAddr); err != nil {
+		return fmt.Errorf("failed to register producer group: %v", err)
+	}
+
+	respBuf := new(bytes.Buffer)
+	if err := binary.Write(respBuf, binary.BigEndian, int16(protocol.ErrorNone)); err != nil {
+		return fmt.Errorf("failed to write success code: %v", err)
+	}
+	if err := binary.Write(respBuf, binary.BigEndian, int16(protocol.ErrorNone)); err != nil { // second field used similarly as create topic handler
+		return fmt.Errorf("failed to write empty err msg len: %v", err)
+	}
+	cs.sendSuccessResponse(conn, respBuf.Bytes())
+	log.Printf("Registered producer group via request: %s with callback address: %s", group, callbackAddr)
+	return nil
 }
 
 // ListTopicsHandler handles list topics requests
@@ -999,27 +1086,68 @@ func (h *GetTopicInfoHandler) buildGetTopicInfoResponse(topicInfo *raft.TopicMet
 	return buf.Bytes(), nil
 }
 
+// getPartitionStatistics 获取分区统计信息
+// 使用Raft Lookup接口替代类型断言
 func (cs *ClientServer) getPartitionStatistics(topicName string, partitionID int32) (int64, int64, int64, int64) {
 	raftGroupID := cs.generateRaftGroupID(topicName, partitionID)
 
-	sm, err := cs.broker.raftManager.GetStateMachine(raftGroupID)
+	// 添加leader/follower检查
+	isLeader := cs.broker.raftManager.IsLeader(raftGroupID)
+	cs.broker.logger.Printf("Getting partition statistics for group %d, node role: %s", 
+		raftGroupID, map[bool]string{true: "leader", false: "follower"}[isLeader])
+
+	// 使用SyncRead查询指标
+	queryReq := map[string]interface{}{
+		"type": "get_metrics",
+	}
+
+	queryBytes, err := json.Marshal(queryReq)
 	if err != nil {
+		cs.broker.logger.Printf("Failed to marshal metrics query for group %d: %v", raftGroupID, err)
 		return 0, 0, 0, 0
 	}
 
-	psm, ok := sm.(*raft.PartitionStateMachine)
-	if !ok {
+	result, err := cs.broker.raftManager.SyncRead(context.Background(), raftGroupID, queryBytes)
+	if err != nil {
+		cs.broker.logger.Printf("Failed to query metrics for group %d: %v", raftGroupID, err)
 		return 0, 0, 0, 0
 	}
 
-	metrics := psm.GetMetrics()
+	// 将result转换为[]byte
+	var resultBytes []byte
+	switch r := result.(type) {
+	case []byte:
+		resultBytes = r
+	case string:
+		resultBytes = []byte(r)
+	default:
+		cs.broker.logger.Printf("Unexpected result type for group %d: %T", raftGroupID, result)
+		return 0, 0, 0, 0
+	}
+
+	// 解析查询结果
+	var response struct {
+		Success bool                   `json:"success"`
+		Metrics map[string]interface{} `json:"metrics"`
+		Error   string                 `json:"error"`
+	}
+
+	if err := json.Unmarshal(resultBytes, &response); err != nil {
+		cs.broker.logger.Printf("Failed to unmarshal metrics response for group %d: %v", raftGroupID, err)
+		return 0, 0, 0, 0
+	}
+
+	if !response.Success {
+		cs.broker.logger.Printf("Metrics query failed for group %d: %s", raftGroupID, response.Error)
+		return 0, 0, 0, 0
+	}
 
 	var partitionSize, messageCount int64
-	if bytesStored, ok := metrics["bytes_stored"].(int64); ok {
-		partitionSize = bytesStored
+	if bytesStored, ok := response.Metrics["bytes_stored"].(float64); ok {
+		partitionSize = int64(bytesStored)
 	}
-	if msgCount, ok := metrics["message_count"].(int64); ok {
-		messageCount = msgCount
+	if msgCount, ok := response.Metrics["message_count"].(float64); ok {
+		messageCount = int64(msgCount)
 	}
 
 	var startOffset, endOffset int64

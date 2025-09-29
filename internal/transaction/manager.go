@@ -1,7 +1,7 @@
 package transaction
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
 	"log"
 	"sync"
@@ -10,63 +10,81 @@ import (
 	"github.com/issac1998/go-queue/internal/protocol"
 )
 
-// TransactionManager
+// TransactionManager manages transaction lifecycle and state
 type TransactionManager struct {
-	halfMessages map[TransactionID]*HalfMessage
-	mu           sync.RWMutex
+	storage       HalfMessageStorage
+	expiryManager *ExpiryManager
+	mu            sync.RWMutex
 
 	defaultTimeout   time.Duration
 	maxCheckCount    int
 	checkInterval    time.Duration
 	maxCheckInterval time.Duration
 
-	producerGroupCallbacks map[string]string
-	producerGroupCheckers  map[string]*DefaultTransactionChecker
+	producerGroupCheckers map[string]*DefaultTransactionChecker
 
-	enableRaft   bool
-	raftGroupID  uint64
-	raftProposer RaftProposer
+	enableRaft  bool
+	raftGroupID uint64
+
+	controller ControllerInterface
+
+	errorHandler *TransactionErrorHandler
+	metrics      *TransactionErrorMetrics
+
+	queryService *TransactionQueryService
 
 	stopChan chan struct{}
 }
 
-// NewTransactionManager create txn
-func NewTransactionManager() *TransactionManager {
+// NewTransactionManager creates transaction manager with default configuration
+func NewTransactionManager(controller ControllerInterface) *TransactionManager {
+	return NewTransactionManagerWithConfig(controller, DefaultManagerConfig())
+}
+
+func NewTransactionManagerWithConfig(controller ControllerInterface, config *ManagerConfig) *TransactionManager {
+	if err := config.Validate(); err != nil {
+		log.Fatalf("Invalid transaction manager config: %v", err)
+	}
+
+	storage, err := NewPebbleHalfMessageStorage(config.StoragePath)
+	if err != nil {
+		log.Fatalf("Failed to initialize half message storage: %v", err)
+	}
+
+	expiryManager := NewExpiryManager(storage, &ExpiryManagerConfig{
+		CheckInterval: config.ExpiryCheckInterval,
+		Logger:        config.Logger,
+	})
+
 	tm := &TransactionManager{
-		halfMessages:           make(map[TransactionID]*HalfMessage),
-		defaultTimeout:         30 * time.Second,
-		maxCheckCount:          5,
-		checkInterval:          5 * time.Second,
-		maxCheckInterval:       2 * time.Minute,
-		producerGroupCallbacks: make(map[string]string),
-		producerGroupCheckers:  make(map[string]*DefaultTransactionChecker),
-		enableRaft:             false,
-		stopChan:               make(chan struct{}),
+		storage:               storage,
+		expiryManager:         expiryManager,
+		defaultTimeout:        config.DefaultTimeout,
+		maxCheckCount:         config.MaxCheckCount,
+		checkInterval:         config.CheckInterval,
+		maxCheckInterval:      config.MaxCheckInterval,
+		producerGroupCheckers: make(map[string]*DefaultTransactionChecker),
+		enableRaft:            config.EnableRaft,
+		raftGroupID:           config.RaftGroupID,
+		controller:            controller,
+		errorHandler:          NewTransactionErrorHandler(config.Logger),
+		metrics:               NewTransactionErrorMetrics(config.Logger),
+		stopChan:              make(chan struct{}),
 	}
 
 	go tm.startTransactionChecker()
 
+	tm.expiryManager.Start()
+
 	return tm
 }
 
-// EnableRaft enables Raft storage for transactions
-func (tm *TransactionManager) EnableRaft(raftProposer RaftProposer, groupID uint64) {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-
-	tm.enableRaft = true
-	tm.raftProposer = raftProposer
-	tm.raftGroupID = groupID
-
-	log.Printf("Enabled Raft storage for transactions with group ID: %d", groupID)
-}
-
-// PrepareTransaction prepare transaction
+// PrepareTransaction prepares a new transaction
 func (tm *TransactionManager) PrepareTransaction(req *TransactionPrepareRequest) (*TransactionPrepareResponse, error) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
-	if _, exists := tm.halfMessages[req.TransactionID]; exists {
+	if storedMsg, err := tm.storage.Get(string(req.TransactionID)); err == nil && storedMsg != nil {
 		return &TransactionPrepareResponse{
 			TransactionID: req.TransactionID,
 			ErrorCode:     protocol.ErrorInvalidRequest,
@@ -103,18 +121,13 @@ func (tm *TransactionManager) PrepareTransaction(req *TransactionPrepareRequest)
 		LastCheck:     time.Time{},
 	}
 
-	tm.halfMessages[req.TransactionID] = halfMessage
-
-	if tm.enableRaft && tm.raftProposer != nil {
-		if err := tm.storeHalfMessageToRaft(halfMessage); err != nil {
-			delete(tm.halfMessages, req.TransactionID)
-			log.Printf("Failed to store half message to Raft: %v", err)
-			return &TransactionPrepareResponse{
-				TransactionID: req.TransactionID,
-				ErrorCode:     protocol.ErrorInternalError,
-				Error:         "failed to persist transaction",
-			}, nil
-		}
+	expireTime := time.Now().Add(timeout)
+	if err := tm.storage.Store(string(req.TransactionID), halfMessage, expireTime); err != nil {
+		return &TransactionPrepareResponse{
+			TransactionID: req.TransactionID,
+			ErrorCode:     protocol.ErrorInternalError,
+			Error:         fmt.Sprintf("failed to store half message: %v", err),
+		}, nil
 	}
 
 	return &TransactionPrepareResponse{
@@ -123,13 +136,13 @@ func (tm *TransactionManager) PrepareTransaction(req *TransactionPrepareRequest)
 	}, nil
 }
 
-// CommitTransaction commit txn
+// CommitTransaction commits a transaction
 func (tm *TransactionManager) CommitTransaction(transactionID TransactionID) (*TransactionCommitResponse, error) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
-	halfMessage, exists := tm.halfMessages[transactionID]
-	if !exists {
+	storedMsg, err := tm.storage.Get(string(transactionID))
+	if err != nil {
 		return &TransactionCommitResponse{
 			TransactionID: transactionID,
 			ErrorCode:     protocol.ErrorInvalidRequest,
@@ -137,15 +150,11 @@ func (tm *TransactionManager) CommitTransaction(transactionID TransactionID) (*T
 		}, nil
 	}
 
-	halfMessage.State = StateCommit
+	storedMsg.HalfMessage.State = StateCommit
 
-	if tm.enableRaft {
-		if err := tm.deleteHalfMessageFromRaft(transactionID); err != nil {
-			log.Printf("Failed to delete half message from Raft: %v", err)
-		}
+	if err := tm.storage.Delete(string(transactionID)); err != nil {
+		log.Printf("Failed to delete committed transaction %s: %v", transactionID, err)
 	}
-
-	delete(tm.halfMessages, transactionID)
 
 	log.Printf("Transaction committed: %s", transactionID)
 
@@ -157,31 +166,31 @@ func (tm *TransactionManager) CommitTransaction(transactionID TransactionID) (*T
 	}, nil
 }
 
-// RollbackTransaction rollback transaction
+// RollbackTransaction rolls back a transaction
 func (tm *TransactionManager) RollbackTransaction(transactionID TransactionID) (*TransactionRollbackResponse, error) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
-	if tm.enableRaft {
-		if err := tm.deleteHalfMessageFromRaft(transactionID); err != nil {
-			log.Printf("Failed to delete half message from Raft: %v", err)
-		}
+	if err := tm.storage.Delete(string(transactionID)); err != nil {
+		log.Printf("Failed to delete rolled back transaction %s: %v", transactionID, err)
 	}
 
-	delete(tm.halfMessages, transactionID)
 	return &TransactionRollbackResponse{
 		TransactionID: transactionID,
 		ErrorCode:     protocol.ErrorNone,
 	}, nil
 }
 
-// GetHalfMessage get half message
 func (tm *TransactionManager) GetHalfMessage(transactionID TransactionID) (*HalfMessage, bool) {
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
 
-	message, exists := tm.halfMessages[transactionID]
-	return message, exists
+	storedMsg, err := tm.storage.Get(string(transactionID))
+	if err != nil || storedMsg == nil {
+		return nil, false
+	}
+
+	return storedMsg.HalfMessage, true
 }
 
 // GetAllHalfMessages get all half messages
@@ -190,58 +199,71 @@ func (tm *TransactionManager) GetAllHalfMessages() map[TransactionID]*HalfMessag
 	defer tm.mu.RUnlock()
 
 	result := make(map[TransactionID]*HalfMessage)
-	for id, message := range tm.halfMessages {
-		messageCopy := *message
-		result[id] = &messageCopy
+
+	futureTime := time.Now().Add(365 * 24 * time.Hour)
+	storedMsgs, err := tm.storage.GetExpiredMessages(futureTime)
+	if err != nil {
+		log.Printf("Failed to get all half messages: %v", err)
+		return result
 	}
+
+	for _, storedMsg := range storedMsgs {
+		result[TransactionID(storedMsg.TransactionID)] = storedMsg.HalfMessage
+	}
+
 	return result
 }
 
-// RegisterProducerGroup 注册生产者组和对应的回调地址
-func (tm *TransactionManager) RegisterProducerGroup(producerGroup, callbackAddr string) error {
+// RegisterProducerGroup registers a producer group with the transaction manager
+func (tm *TransactionManager) RegisterProducerGroup(group, callbackAddr string) error {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
-	checker := NewDefaultTransactionChecker()
-	checker.RegisterProducerGroup(producerGroup, callbackAddr)
-
-	tm.producerGroupCallbacks[producerGroup] = callbackAddr
-	tm.producerGroupCheckers[producerGroup] = checker
-
-	if tm.enableRaft {
-		if err := tm.registerProducerGroupInRaft(producerGroup, callbackAddr); err != nil {
-			delete(tm.producerGroupCallbacks, producerGroup)
-			delete(tm.producerGroupCheckers, producerGroup)
-			log.Printf("Failed to register producer group in Raft: %v", err)
-			return fmt.Errorf("failed to persist producer group registration")
-		}
+	if _, exists := tm.producerGroupCheckers[group]; !exists {
+		checker := NewDefaultTransactionChecker()
+		tm.producerGroupCheckers[group] = checker
+		log.Printf("Created new checker for producer group: %s", group)
 	}
 
-	log.Printf("Registered producer group: %s with callback: %s", producerGroup, callbackAddr)
+	checker := tm.producerGroupCheckers[group]
+	checker.RegisterProducerGroup(group, callbackAddr)
 	return nil
 }
 
-// UnregisterProducerGroup unregister producer group
+// UnregisterProducerGroup unregisters a producer group from the transaction manager
 func (tm *TransactionManager) UnregisterProducerGroup(producerGroup string) error {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
-	delete(tm.producerGroupCallbacks, producerGroup)
-	delete(tm.producerGroupCheckers, producerGroup)
+	checker, exists := tm.producerGroupCheckers[producerGroup]
+	if !exists {
+		return fmt.Errorf("producer group not found: %s", producerGroup)
+	}
 
+	checker.UnregisterProducerGroup(producerGroup)
+
+	delete(tm.producerGroupCheckers, producerGroup)
 	log.Printf("Unregistered producer group: %s", producerGroup)
+
 	return nil
 }
 
-// GetRegisteredProducerGroups get registered producer groups
+// GetRegisteredProducerGroups returns all registered producer groups
 func (tm *TransactionManager) GetRegisteredProducerGroups() map[string]string {
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
 
 	result := make(map[string]string)
-	for group, callback := range tm.producerGroupCallbacks {
-		result[group] = callback
+	for group, checker := range tm.producerGroupCheckers {
+		groups := checker.GetRegisteredProducerGroups()
+		for g, addr := range groups {
+			result[g] = addr
+		}
+		if len(groups) == 0 {
+			result[group] = ""
+		}
 	}
+
 	return result
 }
 
@@ -260,161 +282,192 @@ func (tm *TransactionManager) startTransactionChecker() {
 }
 
 func (tm *TransactionManager) checkTimeoutTransactions() {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
 
-	now := time.Now()
-	var timeoutTransactions []TransactionID
-	// do we need to sort to avoid for loop?
-	for transactionID, halfMessage := range tm.halfMessages {
-		if now.Sub(halfMessage.CreatedAt) > halfMessage.Timeout {
-			// exceed retry time
-			if halfMessage.CheckCount >= tm.maxCheckCount {
-				timeoutTransactions = append(timeoutTransactions, transactionID)
-				continue
-			}
-
-			checkInterval := tm.calculateCheckInterval(halfMessage.CheckCount)
-			if halfMessage.LastCheck.IsZero() || now.Sub(halfMessage.LastCheck) >= checkInterval {
-				if checker, exists := tm.producerGroupCheckers[halfMessage.ProducerGroup]; exists {
-					halfMessage.State = StateChecking
-					halfMessage.CheckCount++
-					halfMessage.LastCheck = now
-
-					go func(id TransactionID, msg *HalfMessage, ch *DefaultTransactionChecker) {
-						state := ch.CheckTransactionState(id, *msg)
-						tm.handleCheckResult(id, state)
-					}(transactionID, halfMessage, checker)
-				} else {
-					log.Printf("No checker found for producer group: %s", halfMessage.ProducerGroup)
-					halfMessage.State = StateRollback
-					tm.handleCheckResult(transactionID, StateUnknown)
-				}
-			}
-		}
+	expiredMsgs, err := tm.storage.GetExpiredMessages(time.Now())
+	if err != nil {
+		log.Printf("Failed to get expired messages: %v", err)
+		return
 	}
 
-	for _, transactionID := range timeoutTransactions {
-		tm.RollbackTransaction(transactionID)
-		log.Printf("Transaction timeout, rolling back: %s", transactionID)
+	for _, storedMsg := range expiredMsgs {
+		halfMessage := storedMsg.HalfMessage
+
+		if halfMessage.CheckCount >= tm.maxCheckCount {
+			log.Printf("Transaction %s exceeded max check count, removing", halfMessage.TransactionID)
+			if err := tm.storage.Delete(storedMsg.TransactionID); err != nil {
+				log.Printf("Failed to delete expired transaction %s: %v", halfMessage.TransactionID, err)
+			}
+			continue
+		}
+
+		checker, exists := tm.producerGroupCheckers[halfMessage.ProducerGroup]
+		if !exists {
+			log.Printf("No checker found for producer group: %s", halfMessage.ProducerGroup)
+			continue
+		}
+
+		// 执行回查
+		go func(txnID TransactionID, hm *HalfMessage) {
+			state := checker.CheckTransactionState(txnID, *hm)
+			tm.handleCheckResult(txnID, state)
+		}(halfMessage.TransactionID, halfMessage)
+
+		// 更新检查次数和时间
+		halfMessage.CheckCount++
+		halfMessage.LastCheck = time.Now()
+
+		// 重新存储更新后的消息
+		expireTime := time.Unix(0, storedMsg.ExpireTime*int64(time.Millisecond))
+		if err := tm.storage.Store(storedMsg.TransactionID, halfMessage, expireTime); err != nil {
+			log.Printf("Failed to update half message %s: %v", halfMessage.TransactionID, err)
+		}
 	}
 }
 
 func (tm *TransactionManager) calculateCheckInterval(checkCount int) time.Duration {
-	interval := tm.checkInterval * time.Duration(1<<uint(checkCount))
+	interval := time.Duration(checkCount) * tm.checkInterval
 	if interval > tm.maxCheckInterval {
-		interval = tm.maxCheckInterval
+		return tm.maxCheckInterval
 	}
 	return interval
 }
 
 func (tm *TransactionManager) handleCheckResult(transactionID TransactionID, state TransactionState) {
+	switch state {
+	case StateCommit:
+		_, err := tm.CommitTransaction(transactionID)
+		if err != nil {
+			log.Printf("Failed to commit transaction %s: %v", transactionID, err)
+		}
+	case StateRollback:
+		_, err := tm.RollbackTransaction(transactionID)
+		if err != nil {
+			log.Printf("Failed to rollback transaction %s: %v", transactionID, err)
+		}
+	case StatePrepared:
+		// 继续等待
+		log.Printf("Transaction %s still in prepared state", transactionID)
+	default:
+		log.Printf("Unknown transaction state for %s: %v", transactionID, state)
+	}
+}
+
+// Stop stops the transaction manager
+func (tm *TransactionManager) Stop() {
+	close(tm.stopChan)
+
+	// 停止过期管理器
+	if tm.expiryManager != nil {
+		tm.expiryManager.Stop()
+	}
+
+	// 关闭存储
+	if tm.storage != nil {
+		if err := tm.storage.Close(); err != nil {
+			log.Printf("Failed to close storage: %v", err)
+		}
+	}
+}
+
+// StoreHalfMessage stores a half message for a transaction
+func (tm *TransactionManager) StoreHalfMessage(transactionID TransactionID, message *HalfMessage) error {
+	startTime := time.Now()
+
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
-	halfMessage, exists := tm.halfMessages[transactionID]
-	if !exists {
-		return
-	}
+	// 计算过期时间
+	expireTime := message.CreatedAt.Add(message.Timeout)
 
-	switch state {
-	case StateCommit:
-		log.Printf("Transaction check result: COMMIT %s", transactionID)
-		tm.CommitTransaction(transactionID)
-
-	case StateRollback:
-		log.Printf("Transaction check result: ROLLBACK %s", transactionID)
-		tm.RollbackTransaction(transactionID)
-	default:
-		log.Printf("Unknown transaction state from check: %d for %s", state, transactionID)
-		halfMessage.State = StatePrepared
-	}
-}
-
-// Stop stop
-func (tm *TransactionManager) Stop() {
-	close(tm.stopChan)
-}
-
-func (tm *TransactionManager) storeHalfMessageToRaft(halfMessage *HalfMessage) error {
-	if !tm.enableRaft || tm.raftProposer == nil {
-		return nil
-	}
-
-	cmd := map[string]interface{}{
-		"type": protocol.RaftCmdStoreHalfMessage,
-		"data": map[string]interface{}{
-			"half_message": halfMessage,
-		},
-	}
-
-	data, err := json.Marshal(cmd)
+	// 存储到PebbleDB
+	err := tm.storage.Store(string(transactionID), message, expireTime)
 	if err != nil {
-		return fmt.Errorf("failed to marshal store command: %v", err)
+		tm.metrics.RecordError("storage_error", "store_half_message", message.ProducerGroup)
+		return err
 	}
 
-	return tm.raftProposer.ProposeCommand(tm.raftGroupID, data)
+	tm.metrics.RecordSuccess(string(transactionID), "store_half_message", time.Since(startTime))
+	return nil
 }
 
-func (tm *TransactionManager) updateTransactionStateInRaft(transactionID TransactionID, state TransactionState) error {
-	if !tm.enableRaft || tm.raftProposer == nil {
-		return nil
+// GetTransactionStatus retrieves the status of a transaction
+func (tm *TransactionManager) GetTransactionStatus(transactionID TransactionID) (map[string]interface{}, error) {
+	if tm.queryService != nil {
+		// Use query service for Raft-enabled mode
+		ctx := context.Background()
+		response, err := tm.queryService.GetHalfMessage(ctx, tm.raftGroupID, string(transactionID))
+		if err != nil {
+			return nil, err
+		}
+
+		if !response.Success {
+			return nil, fmt.Errorf("query failed: %s", response.Error)
+		}
+
+		return map[string]interface{}{
+			"transaction_id": transactionID,
+			"status":         "found",
+			"data":           response.Data,
+		}, nil
 	}
 
-	cmd := map[string]interface{}{
-		"type": protocol.RaftCmdUpdateTransactionState,
-		"data": map[string]interface{}{
-			"transaction_id": string(transactionID),
-			"state":          int16(state),
-		},
-	}
+	// 使用新的存储层
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
 
-	data, err := json.Marshal(cmd)
+	storedMsg, err := tm.storage.Get(string(transactionID))
 	if err != nil {
-		return fmt.Errorf("failed to marshal update command: %v", err)
+		return nil, fmt.Errorf("transaction not found: %s", transactionID)
 	}
 
-	return tm.raftProposer.ProposeCommand(tm.raftGroupID, data)
+	return map[string]interface{}{
+		"transaction_id": string(transactionID),
+		"state":          storedMsg.Status,
+		"created_at":     time.Unix(0, storedMsg.CreatedTime*int64(time.Millisecond)),
+		"expire_time":    time.Unix(0, storedMsg.ExpireTime*int64(time.Millisecond)),
+		"half_message":   storedMsg.HalfMessage,
+	}, nil
 }
 
-func (tm *TransactionManager) deleteHalfMessageFromRaft(transactionID TransactionID) error {
-	if !tm.enableRaft || tm.raftProposer == nil {
-		return nil
+// GetExpiredTransactions retrieves all expired transactions
+func (tm *TransactionManager) GetExpiredTransactions() ([]interface{}, error) {
+	if tm.queryService != nil {
+		// Use query service for Raft-enabled mode
+		ctx := context.Background()
+		response, err := tm.queryService.GetExpiredTransactions(ctx, tm.raftGroupID)
+		if err != nil {
+			return nil, err
+		}
+
+		if !response.Success {
+			return nil, fmt.Errorf("query failed: %s", response.Error)
+		}
+
+		// Extract expired transactions from response data
+		if data, ok := response.Data.(map[string]interface{}); ok {
+			if expiredTxns, ok := data["expired_transactions"].([]interface{}); ok {
+				return expiredTxns, nil
+			}
+		}
+
+		return []interface{}{}, nil
 	}
 
-	cmd := map[string]interface{}{
-		"type": protocol.RaftCmdDeleteHalfMessage,
-		"data": map[string]interface{}{
-			"transaction_id": string(transactionID),
-		},
-	}
+	// 使用新的存储层
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
 
-	data, err := json.Marshal(cmd)
+	storedMsgs, err := tm.storage.GetExpiredMessages(time.Now())
 	if err != nil {
-		return fmt.Errorf("failed to marshal delete command: %v", err)
+		return nil, err
 	}
 
-	return tm.raftProposer.ProposeCommand(tm.raftGroupID, data)
-}
-
-// registerProducerGroupInRaft registers a producer group in Raft
-func (tm *TransactionManager) registerProducerGroupInRaft(producerGroup, callbackAddr string) error {
-	if !tm.enableRaft || tm.raftProposer == nil {
-		return nil
+	var expired []interface{}
+	for _, storedMsg := range storedMsgs {
+		expired = append(expired, storedMsg)
 	}
 
-	cmd := map[string]interface{}{
-		"type": protocol.RaftCmdRegisterProducerGroup,
-		"data": map[string]interface{}{
-			"producer_group": producerGroup,
-			"callback_addr":  callbackAddr,
-		},
-	}
-
-	data, err := json.Marshal(cmd)
-	if err != nil {
-		return fmt.Errorf("failed to marshal register command: %v", err)
-	}
-
-	return tm.raftProposer.ProposeCommand(tm.raftGroupID, data)
+	return expired, nil
 }

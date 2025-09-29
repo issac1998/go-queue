@@ -86,8 +86,8 @@ func (dp *DelayedProducer) ProduceDelayed(topic string, partition int32, key []b
 		Key:         key,
 		Value:       value,
 		DelayLevel:  delayLevel,
-		DelayTime:   0, // 使用DelayLevel时DelayTime为0
-		DeliverTime: 0, // 由服务端计算
+		DelayTime:   0, // DelayTime is 0 when using DelayLevel
+		DeliverTime: 0, // Calculated by server
 	}
 
 	return dp.sendDelayedProduceRequest(request)
@@ -100,7 +100,7 @@ func (dp *DelayedProducer) ProduceDelayedAt(topic string, partition int32, key [
 		Partition:   partition,
 		Key:         key,
 		Value:       value,
-		DelayLevel:  0, // 使用DeliverTime时DelayLevel为0
+		DelayLevel:  0, // DelayLevel is 0 when using DeliverTime
 		DelayTime:   0,
 		DeliverTime: deliverTime,
 	}
@@ -115,9 +115,9 @@ func (dp *DelayedProducer) ProduceDelayedAfter(topic string, partition int32, ke
 		Partition:   partition,
 		Key:         key,
 		Value:       value,
-		DelayLevel:  0, // 使用DelayTime时DelayLevel为0
+		DelayLevel:  0, // DelayLevel is 0 when using DelayTime
 		DelayTime:   delayTime.Milliseconds(),
-		DeliverTime: 0, // 由服务端计算
+		DeliverTime: 0, // Calculated by server
 	}
 
 	return dp.sendDelayedProduceRequest(request)
@@ -125,25 +125,25 @@ func (dp *DelayedProducer) ProduceDelayedAfter(topic string, partition int32, ke
 
 // sendDelayedProduceRequest sends the delayed produce request to broker
 func (dp *DelayedProducer) sendDelayedProduceRequest(request *DelayedProduceRequest) (*DelayedProduceResponse, error) {
-	// 序列化请求
+	// Serialize request
 	requestData, err := json.Marshal(request)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %v", err)
 	}
 
-	// 发送请求并获取响应
+	// Send request and get response
 	responseData, err := dp.client.sendMetaRequest(protocol.DelayedProduceRequestType, requestData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send request: %v", err)
 	}
 
-	// 解析响应
+	// Parse response
 	var response DelayedProduceResponse
 	if err := json.Unmarshal(responseData, &response); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal response: %v", err)
 	}
 
-	// 检查错误
+	// Check error
 	if response.ErrorCode != 0 {
 		return &response, fmt.Errorf("delayed produce failed: %s", response.Error)
 	}
@@ -153,7 +153,7 @@ func (dp *DelayedProducer) sendDelayedProduceRequest(request *DelayedProduceRequ
 
 // QueryDelayedMessage queries the status of a delayed message
 func (dp *DelayedProducer) QueryDelayedMessage(messageID string) (*DelayedMessage, error) {
-	// 构造查询请求
+	// Construct query request
 	type QueryRequest struct {
 		MessageID string `json:"message_id"`
 	}
@@ -162,19 +162,19 @@ func (dp *DelayedProducer) QueryDelayedMessage(messageID string) (*DelayedMessag
 		MessageID: messageID,
 	}
 
-	// 序列化请求
+	// Serialize request
 	requestData, err := json.Marshal(request)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %v", err)
 	}
 
-	// 发送请求并获取响应
+	// Send request and get response
 	responseData, err := dp.client.sendMetaRequest(protocol.DelayedMessageQueryRequestType, requestData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send request: %v", err)
 	}
 
-	// 解析响应
+	// Parse response
 	type QueryResponse struct {
 		Message   *DelayedMessage `json:"message"`
 		ErrorCode int32           `json:"error_code"`
@@ -186,7 +186,7 @@ func (dp *DelayedProducer) QueryDelayedMessage(messageID string) (*DelayedMessag
 		return nil, fmt.Errorf("failed to unmarshal response: %v", err)
 	}
 
-	// 检查错误
+	// Check error
 	if response.ErrorCode != 0 {
 		return nil, fmt.Errorf("query failed: %s", response.Error)
 	}
@@ -196,7 +196,7 @@ func (dp *DelayedProducer) QueryDelayedMessage(messageID string) (*DelayedMessag
 
 // CancelDelayedMessage cancels a delayed message
 func (dp *DelayedProducer) CancelDelayedMessage(messageID string) error {
-	// 构造取消请求
+	// Construct cancel request
 	type CancelRequest struct {
 		MessageID string `json:"message_id"`
 	}
@@ -205,19 +205,19 @@ func (dp *DelayedProducer) CancelDelayedMessage(messageID string) error {
 		MessageID: messageID,
 	}
 
-	// 序列化请求
+	// Serialize request
 	requestData, err := json.Marshal(request)
 	if err != nil {
 		return fmt.Errorf("failed to marshal request: %v", err)
 	}
 
-	// 发送请求并获取响应
+	// Send request and get response
 	responseData, err := dp.client.sendMetaRequest(protocol.DelayedMessageCancelRequestType, requestData)
 	if err != nil {
 		return fmt.Errorf("failed to send request: %v", err)
 	}
 
-	// 解析响应
+	// Parse response
 	type CancelResponse struct {
 		MessageID string `json:"message_id"`
 		ErrorCode int32  `json:"error_code"`
@@ -229,7 +229,7 @@ func (dp *DelayedProducer) CancelDelayedMessage(messageID string) error {
 		return fmt.Errorf("failed to unmarshal response: %v", err)
 	}
 
-	// 检查错误
+	// Check error
 	if response.ErrorCode != 0 {
 		return fmt.Errorf("cancel failed: %s", response.Error)
 	}

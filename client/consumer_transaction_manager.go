@@ -73,7 +73,7 @@ func NewConsumerTransaction(id, groupID, consumerID string, timeout time.Duratio
 func (ct *ConsumerTransaction) AddProcessedMessage(record *ProcessedRecord) {
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
-	
+
 	ct.ProcessedMessages = append(ct.ProcessedMessages, record)
 	ct.LastUpdateTime = time.Now()
 }
@@ -82,7 +82,7 @@ func (ct *ConsumerTransaction) AddProcessedMessage(record *ProcessedRecord) {
 func (ct *ConsumerTransaction) AddOffsetCommit(topic string, partition int32, offset int64) {
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
-	
+
 	if ct.OffsetCommits[topic] == nil {
 		ct.OffsetCommits[topic] = make(map[int32]int64)
 	}
@@ -94,7 +94,7 @@ func (ct *ConsumerTransaction) AddOffsetCommit(topic string, partition int32, of
 func (ct *ConsumerTransaction) UpdateState(state ConsumerTransactionState) {
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
-	
+
 	ct.State = state
 	ct.LastUpdateTime = time.Now()
 }
@@ -103,7 +103,7 @@ func (ct *ConsumerTransaction) UpdateState(state ConsumerTransactionState) {
 func (ct *ConsumerTransaction) IsExpired() bool {
 	ct.mu.RLock()
 	defer ct.mu.RUnlock()
-	
+
 	return time.Since(ct.StartTime) > ct.Timeout
 }
 
@@ -111,40 +111,40 @@ func (ct *ConsumerTransaction) IsExpired() bool {
 func (ct *ConsumerTransaction) GetState() ConsumerTransactionState {
 	ct.mu.RLock()
 	defer ct.mu.RUnlock()
-	
+
 	return ct.State
 }
 
 // ConsumerTransactionManager consumer txn manager
 type ConsumerTransactionManager struct {
-	client              *Client
-	groupID             string
-	consumerID          string
-	transactions        map[string]*ConsumerTransaction
-	currentTransaction  *ConsumerTransaction
-	defaultTimeout      time.Duration
-	mu                  sync.RWMutex
-	cleanupTicker       *time.Ticker
-	stopCleanup         chan struct{}
+	client             *Client
+	groupID            string
+	consumerID         string
+	transactions       map[string]*ConsumerTransaction
+	currentTransaction *ConsumerTransaction
+	defaultTimeout     time.Duration
+	mu                 sync.RWMutex
+	cleanupTicker      *time.Ticker
+	stopCleanup        chan struct{}
 }
 
-// ConsumerTransactionManagerConfig manager config
-type ConsumerTransactionManagerConfig struct {
-	GroupID           string
-	ConsumerID        string
-	DefaultTimeout    time.Duration
-	CleanupInterval   time.Duration
+// ConsumerManagerConfig manager config
+type ConsumerManagerConfig struct {
+	GroupID         string
+	ConsumerID      string
+	DefaultTimeout  time.Duration
+	CleanupInterval time.Duration
 }
 
-// NewConsumerTransactionManager create manager 
-func NewConsumerTransactionManager(client *Client, config ConsumerTransactionManagerConfig) *ConsumerTransactionManager {
+// NewConsumerTransactionManager create manager
+func NewConsumerTransactionManager(client *Client, config ConsumerManagerConfig) *ConsumerTransactionManager {
 	if config.DefaultTimeout == 0 {
 		config.DefaultTimeout = 30 * time.Second
 	}
 	if config.CleanupInterval == 0 {
 		config.CleanupInterval = 5 * time.Minute
 	}
-	
+
 	ctm := &ConsumerTransactionManager{
 		client:         client,
 		groupID:        config.GroupID,
@@ -153,10 +153,10 @@ func NewConsumerTransactionManager(client *Client, config ConsumerTransactionMan
 		defaultTimeout: config.DefaultTimeout,
 		stopCleanup:    make(chan struct{}),
 	}
-	
+
 	ctm.cleanupTicker = time.NewTicker(config.CleanupInterval)
 	go ctm.runCleanup()
-	
+
 	return ctm
 }
 
@@ -164,27 +164,27 @@ func NewConsumerTransactionManager(client *Client, config ConsumerTransactionMan
 func (ctm *ConsumerTransactionManager) BeginTransaction(ctx context.Context) (*ConsumerTransaction, error) {
 	ctm.mu.Lock()
 	defer ctm.mu.Unlock()
-	
+
 	if ctm.currentTransaction != nil {
 		state := ctm.currentTransaction.GetState()
 		if state == ConsumerTransactionStateBegin || state == ConsumerTransactionStateInProgress {
 			return nil, fmt.Errorf("transaction already in progress: %s", ctm.currentTransaction.ID)
 		}
 	}
-	
+
 	transactionID := fmt.Sprintf("%s-%s-%d", ctm.groupID, ctm.consumerID, time.Now().UnixNano())
-	
+
 	transaction := NewConsumerTransaction(transactionID, ctm.groupID, ctm.consumerID, ctm.defaultTimeout)
-	
+
 	err := ctm.sendBeginTransactionRequest(ctx, transaction)
 	if err != nil {
 		return nil, fmt.Errorf("failed to begin transaction: %v", err)
 	}
-	
+
 	transaction.UpdateState(ConsumerTransactionStateInProgress)
 	ctm.transactions[transactionID] = transaction
 	ctm.currentTransaction = transaction
-	
+
 	return transaction, nil
 }
 
@@ -192,30 +192,30 @@ func (ctm *ConsumerTransactionManager) BeginTransaction(ctx context.Context) (*C
 func (ctm *ConsumerTransactionManager) CommitTransaction(ctx context.Context, transactionID string) error {
 	ctm.mu.Lock()
 	defer ctm.mu.Unlock()
-	
+
 	transaction, exists := ctm.transactions[transactionID]
 	if !exists {
 		return fmt.Errorf("transaction not found: %s", transactionID)
 	}
-	
+
 	if transaction.GetState() != ConsumerTransactionStateInProgress {
 		return fmt.Errorf("transaction not in progress: %s, state: %s", transactionID, transaction.GetState())
 	}
-	
+
 	transaction.UpdateState(ConsumerTransactionStateCommitting)
-	
+
 	err := ctm.sendCommitTransactionRequest(ctx, transaction)
 	if err != nil {
 		transaction.UpdateState(ConsumerTransactionStateInProgress)
 		return fmt.Errorf("failed to commit transaction: %v", err)
 	}
-	
+
 	transaction.UpdateState(ConsumerTransactionStateCommitted)
 	// compelte
 	if ctm.currentTransaction != nil && ctm.currentTransaction.ID == transactionID {
 		ctm.currentTransaction = nil
 	}
-	
+
 	return nil
 }
 
@@ -223,32 +223,31 @@ func (ctm *ConsumerTransactionManager) CommitTransaction(ctx context.Context, tr
 func (ctm *ConsumerTransactionManager) AbortTransaction(ctx context.Context, transactionID string) error {
 	ctm.mu.Lock()
 	defer ctm.mu.Unlock()
-	
+
 	transaction, exists := ctm.transactions[transactionID]
 	if !exists {
 		return fmt.Errorf("transaction not found: %s", transactionID)
 	}
-	
+
 	state := transaction.GetState()
 	if state != ConsumerTransactionStateInProgress && state != ConsumerTransactionStateCommitting {
 		return fmt.Errorf("transaction cannot be aborted: %s, state: %s", transactionID, state)
 	}
-	
+
 	transaction.UpdateState(ConsumerTransactionStateAborting)
-	
+
 	err := ctm.sendAbortTransactionRequest(ctx, transaction)
 	if err != nil {
 		transaction.UpdateState(ConsumerTransactionStateInProgress)
 		return fmt.Errorf("failed to abort transaction: %v", err)
 	}
-	
+
 	transaction.UpdateState(ConsumerTransactionStateAborted)
-	
-	
+
 	if ctm.currentTransaction != nil && ctm.currentTransaction.ID == transactionID {
 		ctm.currentTransaction = nil
 	}
-	
+
 	return nil
 }
 
@@ -256,7 +255,7 @@ func (ctm *ConsumerTransactionManager) AbortTransaction(ctx context.Context, tra
 func (ctm *ConsumerTransactionManager) GetCurrentTransaction() *ConsumerTransaction {
 	ctm.mu.RLock()
 	defer ctm.mu.RUnlock()
-	
+
 	return ctm.currentTransaction
 }
 
@@ -264,7 +263,7 @@ func (ctm *ConsumerTransactionManager) GetCurrentTransaction() *ConsumerTransact
 func (ctm *ConsumerTransactionManager) GetTransaction(transactionID string) (*ConsumerTransaction, bool) {
 	ctm.mu.RLock()
 	defer ctm.mu.RUnlock()
-	
+
 	transaction, exists := ctm.transactions[transactionID]
 	return transaction, exists
 }
@@ -274,12 +273,12 @@ func (ctm *ConsumerTransactionManager) Close() error {
 	if ctm.cleanupTicker != nil {
 		ctm.cleanupTicker.Stop()
 	}
-	
+
 	select {
 	case ctm.stopCleanup <- struct{}{}:
 	default:
 	}
-	
+
 	return nil
 }
 
@@ -431,7 +430,7 @@ func (ctm *ConsumerTransactionManager) runCleanup() {
 func (ctm *ConsumerTransactionManager) cleanupExpiredTransactions() {
 	ctm.mu.Lock()
 	defer ctm.mu.Unlock()
-	
+
 	for transactionID, transaction := range ctm.transactions {
 		if transaction.IsExpired() {
 			state := transaction.GetState()

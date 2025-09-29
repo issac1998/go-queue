@@ -90,30 +90,30 @@ func runIntegrationTests() {
 	}
 }
 
-func printTestSummary() {
-	fmt.Println(`
+func printTestSummary() { // intentionally kept for potential future use
+	 fmt.Print(`
 === 测试要求说明 ===
 
 1. 环境搭建:
-   - 运行 chmod +x test_setup.sh && ./test_setup.sh 搭建测试环境
-   - 包含3个etcd节点和3个broker节点
+	- 运行 chmod +x test_setup.sh && ./test_setup.sh 搭建测试环境
+	- 包含3个etcd节点和3个broker节点
 
 2. 测试覆盖:
-   - 基础生产消费功能
-   - 批量操作
-   - 消费者组
-   - Topic管理
-   - 事务支持
-   - 错误处理
-   - 高负载场景
-   - 集群弹性
+	- 基础生产消费功能
+	- 批量操作
+	- 消费者组
+	- Topic管理
+	- 事务支持
+	- 错误处理
+	- 高负载场景
+	- 集群弹性
 
 3. 清理环境:
-   - 运行 ./test_cleanup.sh 清理测试环境
+	- 运行 ./test_cleanup.sh 清理测试环境
 
 4. 测试说明:
-   - 所有测试使用真实的etcd和broker集群
-   - 每个测试前会清理历史数据
-   - 测试涵盖完整的消息队列功能
+	- 所有测试使用真实的etcd和broker集群
+	- 每个测试前会清理历史数据
+	- 测试涵盖完整的消息队列功能
 `)
 }

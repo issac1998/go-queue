@@ -33,6 +33,7 @@ const (
 	TransactionCommitRequestType   int32 = 19
 	TransactionRollbackRequestType int32 = 20
 	TransactionCheckRequestType    int32 = 21
+	TransactionCheckStateRequestType int32 = 33
 	OrderedProduceRequestType      int32 = 22
 
 	// Consumer transaction request types
@@ -48,6 +49,7 @@ const (
 	// Group management request types
 	ListGroupsRequestType    int32 = 30
 	DescribeGroupRequestType int32 = 31
+	RegisterProducerGroupRequestType int32 = 32
 
 	ControllerDiscoverRequestType int32 = 1000
 	ControllerVerifyRequestType   int32 = 1001
@@ -129,6 +131,8 @@ var RequestTypeNames = map[int32]string{
 	DelayedMessageCancelRequestType:      "DELAYED_MESSAGE_CANCEL",
 	ListGroupsRequestType:                "LIST_GROUPS",
 	DescribeGroupRequestType:             "DESCRIBE_GROUP",
+	RegisterProducerGroupRequestType:     "REGISTER_PRODUCER_GROUP",
+	TransactionCheckStateRequestType:     "TRANSACTION_CHECK_STATE",
 }
 
 // GetRequestTypeName returns the human-readable name for a request type

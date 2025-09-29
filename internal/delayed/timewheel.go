@@ -6,35 +6,32 @@ import (
 	"time"
 )
 
-// TimeWheelTask 时间轮任务
+// TimeWheelTask time wheel task
 type TimeWheelTask struct {
 	ID          string
-	ExecuteTime int64 // 执行时间戳(毫秒)
+	ExecuteTime int64
 	Data        interface{}
 	Callback    func(interface{})
 }
 
-// TimeWheelSlot 时间轮槽位
+// TimeWheelSlot time wheel slot
 type TimeWheelSlot struct {
 	tasks *list.List
 	mutex sync.RWMutex
 }
 
-// NewTimeWheelSlot 创建新的时间轮槽位
 func NewTimeWheelSlot() *TimeWheelSlot {
 	return &TimeWheelSlot{
 		tasks: list.New(),
 	}
 }
 
-// AddTask 添加任务到槽位
 func (slot *TimeWheelSlot) AddTask(task *TimeWheelTask) {
 	slot.mutex.Lock()
 	defer slot.mutex.Unlock()
 	slot.tasks.PushBack(task)
 }
 
-// GetExpiredTasks 获取已到期的任务
 func (slot *TimeWheelSlot) GetExpiredTasks(currentTime int64) []*TimeWheelTask {
 	slot.mutex.Lock()
 	defer slot.mutex.Unlock()
@@ -50,7 +47,6 @@ func (slot *TimeWheelSlot) GetExpiredTasks(currentTime int64) []*TimeWheelTask {
 		}
 	}
 
-	// 移除已到期的任务
 	for _, e := range toRemove {
 		slot.tasks.Remove(e)
 	}
@@ -58,11 +54,11 @@ func (slot *TimeWheelSlot) GetExpiredTasks(currentTime int64) []*TimeWheelTask {
 	return expiredTasks
 }
 
-// TimeWheel 时间轮调度器
+// TimeWheel time wheel scheduler
 type TimeWheel struct {
 	slots        []*TimeWheelSlot
 	slotCount    int
-	tickMs       int64 // 刻度时间(毫秒)
+	tickMs       int64
 	currentSlot  int
 	startTime    int64
 	ticker       *time.Ticker
@@ -72,7 +68,6 @@ type TimeWheel struct {
 	running      bool
 }
 
-// NewTimeWheel 创建新的时间轮
 func NewTimeWheel(slotCount int, tickMs int64, callback func(*TimeWheelTask)) *TimeWheel {
 	slots := make([]*TimeWheelSlot, slotCount)
 	for i := 0; i < slotCount; i++ {
@@ -91,7 +86,7 @@ func NewTimeWheel(slotCount int, tickMs int64, callback func(*TimeWheelTask)) *T
 	}
 }
 
-// Start 启动时间轮
+// Start starts the time wheel
 func (tw *TimeWheel) Start() {
 	tw.mutex.Lock()
 	defer tw.mutex.Unlock()
@@ -106,7 +101,6 @@ func (tw *TimeWheel) Start() {
 	go tw.run()
 }
 
-// Stop 停止时间轮
 func (tw *TimeWheel) Stop() {
 	tw.mutex.Lock()
 	defer tw.mutex.Unlock()
@@ -120,7 +114,6 @@ func (tw *TimeWheel) Stop() {
 	tw.ticker.Stop()
 }
 
-// AddTask 添加任务到时间轮
 func (tw *TimeWheel) AddTask(task *TimeWheelTask) {
 	tw.mutex.RLock()
 	defer tw.mutex.RUnlock()
@@ -129,28 +122,21 @@ func (tw *TimeWheel) AddTask(task *TimeWheelTask) {
 		return
 	}
 
-	// 计算任务应该放在哪个槽位
 	slotIndex := tw.calculateSlotIndex(task.ExecuteTime)
 	tw.slots[slotIndex].AddTask(task)
 }
 
-// calculateSlotIndex 计算任务应该放在哪个槽位
 func (tw *TimeWheel) calculateSlotIndex(executeTime int64) int {
-	// 计算相对于当前时间的延迟
 	delay := executeTime - time.Now().UnixMilli()
 	if delay < 0 {
 		delay = 0
 	}
 
-	// 计算需要多少个tick
 	ticks := delay / tw.tickMs
-
-	// 计算目标槽位
 	targetSlot := (tw.currentSlot + int(ticks)) % tw.slotCount
 	return targetSlot
 }
 
-// run 时间轮运行循环
 func (tw *TimeWheel) run() {
 	for {
 		select {
@@ -162,26 +148,19 @@ func (tw *TimeWheel) run() {
 	}
 }
 
-// tick 时间轮滴答
 func (tw *TimeWheel) tick() {
 	currentTime := time.Now().UnixMilli()
-
-	// 获取当前槽位的已到期任务
 	expiredTasks := tw.slots[tw.currentSlot].GetExpiredTasks(currentTime)
 
-	// 执行已到期的任务
 	for _, task := range expiredTasks {
 		if tw.taskCallback != nil {
-			// 异步执行任务，避免阻塞时间轮
 			go tw.taskCallback(task)
 		}
 	}
 
-	// 移动到下一个槽位
 	tw.currentSlot = (tw.currentSlot + 1) % tw.slotCount
 }
 
-// GetStats 获取时间轮统计信息
 func (tw *TimeWheel) GetStats() TimeWheelStats {
 	tw.mutex.RLock()
 	defer tw.mutex.RUnlock()
@@ -208,7 +187,7 @@ func (tw *TimeWheel) GetStats() TimeWheelStats {
 	return stats
 }
 
-// TimeWheelStats 时间轮统计信息
+// TimeWheelStats time wheel statistics
 type TimeWheelStats struct {
 	SlotCount   int   `json:"slot_count"`
 	TickMs      int64 `json:"tick_ms"`

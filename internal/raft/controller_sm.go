@@ -25,6 +25,8 @@ type ControllerStateMachine struct {
 
 	leaderWatchers map[string]func()
 	watcherMu      sync.RWMutex
+
+	logger *log.Logger
 }
 
 // ClusterMetadata stores all cluster-wide metadata
@@ -38,6 +40,9 @@ type ClusterMetadata struct {
 	LeaderAssignments map[string]string `json:"leader_assignments"`
 
 	ConsumerGroups map[string]*ConsumerGroupInfo `json:"consumer_groups"`
+
+	// Producer Groups for transaction support
+	ProducerGroups map[string]*ProducerGroupInfo `json:"producer_groups"`
 
 	// Consumer transaction and idempotency tracking
 	ProcessedMessages    map[string]*ProcessedMessageInfo    `json:"processed_messages"`
@@ -181,7 +186,7 @@ type ControllerManager interface {
 
 // NewControllerStateMachine creates a controller state machine with Multi-Raft support
 // TODO: KV?
-func NewControllerStateMachine(manager ControllerManager, raftManager *RaftManager) *ControllerStateMachine {
+func NewControllerStateMachine(manager ControllerManager, raftManager *RaftManager, logger *log.Logger) *ControllerStateMachine {
 	metadata := &ClusterMetadata{
 		ClusterID:            fmt.Sprintf("cluster-%d", time.Now().Unix()),
 		Brokers:              make(map[string]*BrokerInfo),
@@ -189,6 +194,10 @@ func NewControllerStateMachine(manager ControllerManager, raftManager *RaftManag
 		PartitionAssignments: make(map[string]*PartitionAssignment),
 		LeaderAssignments:    make(map[string]string),
 		ConsumerGroups:       make(map[string]*ConsumerGroupInfo),
+		ProducerGroups:       make(map[string]*ProducerGroupInfo),
+		ProcessedMessages:    make(map[string]*ProcessedMessageInfo),
+		ConsumerTransactions: make(map[string]*ConsumerTransactionInfo),
+		ConsumerOffsets:      make(map[string]*ConsumerOffsetInfo),
 		Version:              1,
 		UpdateTime:           time.Now(),
 	}
@@ -196,8 +205,9 @@ func NewControllerStateMachine(manager ControllerManager, raftManager *RaftManag
 	return &ControllerStateMachine{
 		manager:           manager,
 		metadata:          metadata,
-		partitionAssigner: NewPartitionAssigner(metadata, raftManager),
+		partitionAssigner: NewPartitionAssigner(metadata, raftManager, logger),
 		leaderWatchers:    make(map[string]func()),
+		logger:            logger,
 	}
 }
 
@@ -208,13 +218,13 @@ func (csm *ControllerStateMachine) Update(data []byte) (statemachine.Result, err
 
 	var cmd ControllerCommand
 	if err := json.Unmarshal(data, &cmd); err != nil {
-		log.Printf("Failed to unmarshal controller command: %v", err)
+		csm.logger.Printf("Failed to unmarshal controller command: %v", err)
 		return statemachine.Result{Value: 0}, err
 	}
 
 	result, err := csm.executeCommand(&cmd)
 	if err != nil {
-		log.Printf("Failed to execute controller command %s: %v", cmd.Type, err)
+		csm.logger.Printf("Failed to execute controller command %s: %v", cmd.Type, err)
 		return statemachine.Result{Value: 0}, err
 	}
 
@@ -249,6 +259,8 @@ func (csm *ControllerStateMachine) executeCommand(cmd *ControllerCommand) (inter
 		return csm.markBrokerFailed(cmd.Data)
 	case protocol.RaftCmdRebalancePartitions:
 		return csm.rebalancePartitions(cmd.Data)
+	case protocol.RaftCmdMigrateLeader:
+		return csm.migrateLeader(cmd.Data)
 	// Consumer transaction and idempotency commands
 	case protocol.RaftCmdMarkMessageProcessed:
 		return csm.markMessageProcessed(cmd.Data)
@@ -262,8 +274,13 @@ func (csm *ControllerStateMachine) executeCommand(cmd *ControllerCommand) (inter
 		return csm.updateConsumerOffset(cmd.Data)
 	case protocol.RaftCmdBatchMarkProcessed:
 		return csm.batchMarkProcessed(cmd.Data)
+	case protocol.RaftCmdRegisterProducerGroup:
+		return csm.registerProducerGroup(cmd.Data)
+	case protocol.RaftCmdUnregisterProducerGroup:
+		return csm.unregisterProducerGroup(cmd.Data)
 	default:
-		return nil, fmt.Errorf("unknown command type: %s", cmd.Type)
+		csm.logger.Printf("Unknown command type: %s", cmd.Type)
+		return nil, typederrors.NewTypedError(typederrors.GeneralError, "unknown command type", nil)
 	}
 }
 
@@ -289,7 +306,7 @@ func (csm *ControllerStateMachine) registerBroker(data map[string]interface{}) (
 				LastUpdated: time.Now(),
 			}
 		}
-		log.Printf("Updated existing broker %s at %s:%d", brokerID, address, port)
+		csm.logger.Printf("Registered new broker %s at %s:%d", brokerID, address, port)
 		return existingBroker, nil
 	}
 
@@ -303,14 +320,13 @@ func (csm *ControllerStateMachine) registerBroker(data map[string]interface{}) (
 		LoadMetrics: &LoadMetrics{
 			LastUpdated: time.Now(),
 		},
-		LastSeen: time.Now(),
-		// Set registration time to provide grace period for health checks
+		LastSeen:     time.Now(),
 		RegisteredAt: time.Now(),
 	}
 
 	csm.metadata.Brokers[brokerID] = broker
 
-	log.Printf("Registered new broker %s at %s:%d", brokerID, address, port)
+	csm.logger.Printf("Registered new broker %s at %s:%d", brokerID, address, port)
 	return broker, nil
 }
 
@@ -330,11 +346,11 @@ func (csm *ControllerStateMachine) unregisterBroker(data map[string]interface{})
 	for _, assignment := range affectedAssignments {
 		partitionKey := fmt.Sprintf("%s-%d", assignment.TopicName, assignment.PartitionID)
 		delete(csm.metadata.PartitionAssignments, partitionKey)
-		log.Printf("Removed partition assignment %s due to broker %s unregistration", partitionKey, brokerID)
+		csm.logger.Printf("Removed partition assignment %s due to broker %s unregistration", partitionKey, brokerID)
 	}
 
 	delete(csm.metadata.Brokers, brokerID)
-	log.Printf("Unregistered broker %s and cleaned up %d partition assignments", brokerID, len(affectedAssignments))
+	csm.logger.Printf("Unregistered broker %s and cleaned up %d partition assignments", brokerID, len(affectedAssignments))
 	return map[string]interface{}{
 		"status":             "success",
 		"cleaned_partitions": len(affectedAssignments),
@@ -350,7 +366,7 @@ func (csm *ControllerStateMachine) createTopic(data map[string]interface{}) (int
 
 	// Check if topic already exists
 	if existingTopic, exists := csm.metadata.Topics[topicName]; exists {
-		log.Printf("Topic %s already exists in state machine, checking partition assignments", topicName)
+		csm.logger.Printf("Topic %s already exists in state machine, checking partition assignments", topicName)
 
 		// Check if partition assignments exist for this topic
 		missingAssignments := false
@@ -364,7 +380,7 @@ func (csm *ControllerStateMachine) createTopic(data map[string]interface{}) (int
 
 		// If assignments are missing, recreate them from the provided data
 		if missingAssignments {
-			log.Printf("Topic %s exists but partition assignments are missing, recreating assignments", topicName)
+			csm.logger.Printf("Topic %s exists but partition assignments are missing, recreating assignments", topicName)
 			// Parse and restore assignments
 			assignmentsData, ok := data["assignments"]
 			if ok {
@@ -375,7 +391,7 @@ func (csm *ControllerStateMachine) createTopic(data map[string]interface{}) (int
 						csm.metadata.PartitionAssignments[partitionKey] = assignment
 						csm.metadata.LeaderAssignments[partitionKey] = assignment.Leader
 					}
-					log.Printf("Restored %d partition assignments for topic %s", len(assignments), topicName)
+					csm.logger.Printf("Restored %d partition assignments for topic %s", len(assignments), topicName)
 					return map[string]interface{}{
 						"success":                  true,
 						"topic":                    existingTopic,
@@ -434,7 +450,7 @@ func (csm *ControllerStateMachine) createTopic(data map[string]interface{}) (int
 		csm.metadata.LeaderAssignments[partitionKey] = assignment.Leader
 	}
 
-	log.Printf("Topic %s created with %d partitions (metadata updated in StateMachine)", topicName, len(assignments))
+	csm.logger.Printf("Topic %s created with %d partitions (metadata updated in StateMachine)", topicName, len(assignments))
 
 	for _, assignment := range assignments {
 		partitionKey := fmt.Sprintf("%s-%d", topicName, assignment.PartitionID)
@@ -539,13 +555,13 @@ func (csm *ControllerStateMachine) deleteTopic(data map[string]interface{}) (int
 		return nil, fmt.Errorf("topic %s does not exist", topicName)
 	}
 
-	log.Printf("Deleting topic %s metadata (Raft groups already stopped by Controller Leader)", topicName)
+	csm.logger.Printf("Deleting topic %s metadata (Raft groups already stopped by Controller Leader)", topicName)
 
 	// Parse assignments to be deleted from the command data
 	assignmentsData, ok := data["assignments"]
 	if !ok {
 		// Fallback: find assignments by topic name
-		log.Printf("No pre-computed assignments provided, finding by topic name")
+		csm.logger.Printf("No pre-computed assignments provided, finding by topic name")
 		var partitionKeysToDelete []string
 		for partitionKey, assignment := range csm.metadata.PartitionAssignments {
 			if assignment.TopicName == topicName {
@@ -564,7 +580,7 @@ func (csm *ControllerStateMachine) deleteTopic(data map[string]interface{}) (int
 
 		delete(csm.metadata.Topics, topicName)
 
-		log.Printf("Topic %s metadata deleted: removed %d partitions", topicName, deletedPartitions)
+		csm.logger.Printf("Topic %s metadata deleted: removed %d partitions", topicName, deletedPartitions)
 		return map[string]interface{}{
 			"status":             "metadata_deleted",
 			"topic":              topicName,
@@ -590,7 +606,7 @@ func (csm *ControllerStateMachine) deleteTopic(data map[string]interface{}) (int
 
 	delete(csm.metadata.Topics, topicName)
 
-	log.Printf("Topic %s metadata deleted: removed %d partitions (Raft groups already stopped)",
+	csm.logger.Printf("Topic %s metadata deleted: removed %d partitions (Raft groups already stopped)",
 		topicName, deletedPartitions)
 
 	return map[string]interface{}{
@@ -634,7 +650,7 @@ func (csm *ControllerStateMachine) joinGroup(data map[string]interface{}) (inter
 	}
 	group.LastUpdated = time.Now()
 
-	log.Printf("Member %s joined group %s", memberID, groupID)
+	csm.logger.Printf("Member %s joined group %s", memberID, groupID)
 	return map[string]string{"status": "success", "group_id": groupID, "member_id": memberID}, nil
 }
 
@@ -660,7 +676,7 @@ func (csm *ControllerStateMachine) leaveGroup(data map[string]interface{}) (inte
 		}
 	}
 
-	log.Printf("Member %s left group %s", memberID, groupID)
+	csm.logger.Printf("Member %s left group %s", memberID, groupID)
 	return map[string]string{"status": "success", "group_id": groupID, "member_id": memberID}, nil
 }
 
@@ -706,7 +722,7 @@ func (csm *ControllerStateMachine) executeRaftLeaderTransfer(assignment *Partiti
 		return nil, typederrors.NewTypedError(typederrors.LeadershipError, "failed to transfer leadership", err)
 	}
 
-	log.Printf("Initiated leader transfer for partition %s (group %d) to broker %s (node %d)",
+	csm.logger.Printf("Initiated leader transfer for partition %s (group %d) to broker %s (node %d)",
 		partitionKey, assignment.RaftGroupID, newLeader, targetNodeID)
 
 	// The actual leader update will happen through the leader change watcher
@@ -737,7 +753,7 @@ func (csm *ControllerStateMachine) updateBrokerLoad(data map[string]interface{})
 		// If broker was marked as failed but is now sending heartbeats, restore it to active
 		if broker.Status == "failed" {
 			broker.Status = "active"
-			log.Printf("Restored broker %s to active status after receiving heartbeat", brokerID)
+			csm.logger.Printf("Restored broker %s to active status after receiving heartbeat", brokerID)
 		}
 	}
 
@@ -751,12 +767,12 @@ func (csm *ControllerStateMachine) markBrokerFailed(data map[string]interface{})
 		broker.Status = "failed"
 	}
 
-	log.Printf("Marked broker %s as failed", brokerID)
+	csm.logger.Printf("Marked broker %s as failed", brokerID)
 	return map[string]string{"status": "success"}, nil
 }
 
 func (csm *ControllerStateMachine) rebalancePartitions(data map[string]interface{}) (interface{}, error) {
-	log.Printf("Starting partition rebalancing")
+	csm.logger.Printf("Starting partition rebalancing")
 
 	// Perform rebalancing
 	availableBrokers := csm.getAvailableBrokers()
@@ -773,7 +789,7 @@ func (csm *ControllerStateMachine) rebalancePartitions(data map[string]interface
 		if oldAssignment, exists := csm.metadata.PartitionAssignments[partitionKey]; exists {
 			if oldAssignment.Leader != assignment.Leader {
 				changedAssignments++
-				log.Printf("Partition %s leader changed from %s to %s",
+				csm.logger.Printf("Partition %s leader changed from %s to %s",
 					partitionKey, oldAssignment.Leader, assignment.Leader)
 			}
 		}
@@ -782,7 +798,7 @@ func (csm *ControllerStateMachine) rebalancePartitions(data map[string]interface
 		csm.metadata.LeaderAssignments[partitionKey] = assignment.Leader
 	}
 
-	log.Printf("Partition rebalancing completed. %d assignments changed", changedAssignments)
+	csm.logger.Printf("Partition rebalancing completed. %d assignments changed", changedAssignments)
 
 	return map[string]interface{}{
 		"status":              "success",
@@ -921,17 +937,17 @@ func (csm *ControllerStateMachine) RecoverFromSnapshot(r io.Reader, files []stat
 	if csm.partitionAssigner != nil {
 		raftManager = csm.partitionAssigner.raftManager
 	}
-	csm.partitionAssigner = NewPartitionAssigner(csm.metadata, raftManager)
+	csm.partitionAssigner = NewPartitionAssigner(csm.metadata, raftManager, csm.logger)
 	csm.mu.Unlock()
 
-	log.Printf("Recovered controller state machine from snapshot, version: %d, partitions: %d",
+	csm.logger.Printf("Recovered controller state machine from snapshot, version: %d, partitions: %d",
 		metadata.Version, len(metadata.PartitionAssignments))
 	return nil
 }
 
 // Close implements the statemachine.IStateMachine interface
 func (csm *ControllerStateMachine) Close() error {
-	log.Printf("Closing controller state machine")
+	csm.logger.Printf("Closing controller state machine")
 	// Stop all leader watchers
 	csm.stopAllLeaderWatchers()
 	return nil
@@ -1025,7 +1041,7 @@ func (csm *ControllerStateMachine) startLeaderWatcher(partitionKey string, assig
 		}
 		newLeaderBrokerID := csm.nodeIDToBrokerID(newLeaderNodeID)
 		if newLeaderBrokerID != "" && newLeaderBrokerID != assignment.Leader {
-			log.Printf("Leader change detected for partition %s: %s -> %s", partitionKey, assignment.Leader, newLeaderBrokerID)
+			csm.logger.Printf("Leader change detected for partition %s: %s -> %s", partitionKey, assignment.Leader, newLeaderBrokerID)
 			csm.mu.Lock()
 			if currentAssignment, exists := csm.metadata.PartitionAssignments[partitionKey]; exists {
 				currentAssignment.Leader = newLeaderBrokerID
@@ -1038,12 +1054,12 @@ func (csm *ControllerStateMachine) startLeaderWatcher(partitionKey string, assig
 	})
 
 	if err != nil {
-		log.Printf("Failed to start leader watcher for partition %s: %v", partitionKey, err)
+		csm.logger.Printf("Failed to start leader watcher for partition %s: %v", partitionKey, err)
 		return
 	}
 
 	csm.leaderWatchers[partitionKey] = cancelFunc
-	log.Printf("Started leader watcher for partition %s (group %d)", partitionKey, assignment.RaftGroupID)
+	csm.logger.Printf("Started leader watcher for partition %s (group %d)", partitionKey, assignment.RaftGroupID)
 }
 
 // stopLeaderWatcher stops watching for leader changes on a partition
@@ -1054,7 +1070,7 @@ func (csm *ControllerStateMachine) stopLeaderWatcher(partitionKey string) {
 	if cancelFunc, exists := csm.leaderWatchers[partitionKey]; exists {
 		cancelFunc()
 		delete(csm.leaderWatchers, partitionKey)
-		log.Printf("Stopped leader watcher for partition %s", partitionKey)
+		csm.logger.Printf("Stopped leader watcher for partition %s", partitionKey)
 	}
 }
 
@@ -1065,7 +1081,7 @@ func (csm *ControllerStateMachine) stopAllLeaderWatchers() {
 
 	for partitionKey, cancelFunc := range csm.leaderWatchers {
 		cancelFunc()
-		log.Printf("Stopped leader watcher for partition %s", partitionKey)
+		csm.logger.Printf("Stopped leader watcher for partition %s", partitionKey)
 	}
 	csm.leaderWatchers = make(map[string]func())
 }
@@ -1350,4 +1366,91 @@ func (csm *ControllerStateMachine) batchMarkProcessed(data map[string]interface{
 	csm.metadata.UpdateTime = time.Now()
 
 	return map[string]interface{}{"status": "success", "processed_count": processedCount}, nil
+}
+
+// ProducerGroupInfo contains information about a producer group
+type ProducerGroupInfo struct {
+	GroupID      string    `json:"group_id"`
+	CallbackAddr string    `json:"callback_addr"`
+	RegisteredAt time.Time `json:"registered_at"`
+	LastSeen     time.Time `json:"last_seen"`
+}
+
+// registerProducerGroup registers a producer group in the controller metadata
+func (csm *ControllerStateMachine) registerProducerGroup(data map[string]interface{}) (interface{}, error) {
+	csm.mu.Lock()
+	defer csm.mu.Unlock()
+
+	groupID, ok := data["group_id"].(string)
+	if !ok {
+		return nil, typederrors.NewTypedError(typederrors.GeneralError, "group_id is required", nil)
+	}
+
+	callbackAddr, ok := data["callback_addr"].(string)
+	if !ok {
+		return nil, typederrors.NewTypedError(typederrors.GeneralError, "callback_addr is required", nil)
+	}
+
+	now := time.Now()
+	
+	// Check if producer group already exists
+	if existingGroup, exists := csm.metadata.ProducerGroups[groupID]; exists {
+		// Update existing group's callback address and last seen time
+		existingGroup.CallbackAddr = callbackAddr
+		existingGroup.LastSeen = now
+		csm.logger.Printf("Updated producer group %s with callback address %s", groupID, callbackAddr)
+	} else {
+		// Create new producer group with callback address
+		csm.metadata.ProducerGroups[groupID] = &ProducerGroupInfo{
+			GroupID:      groupID,
+			CallbackAddr: callbackAddr,
+			RegisteredAt: now,
+			LastSeen:     now,
+		}
+		csm.logger.Printf("Registered new producer group %s with callback address %s", groupID, callbackAddr)
+	}
+
+	csm.metadata.Version++
+	csm.metadata.UpdateTime = now
+
+	return map[string]interface{}{
+		"success":      true,
+		"group_id":     groupID,
+		"callback_addr": callbackAddr,
+		"registered":   true,
+	}, nil
+}
+
+// unregisterProducerGroup removes a producer group from the controller metadata
+func (csm *ControllerStateMachine) unregisterProducerGroup(data map[string]interface{}) (interface{}, error) {
+	csm.mu.Lock()
+	defer csm.mu.Unlock()
+
+	groupID, ok := data["group_id"].(string)
+	if !ok {
+		return nil, typederrors.NewTypedError(typederrors.GeneralError, "group_id is required", nil)
+	}
+
+	// Check if producer group exists
+	if _, exists := csm.metadata.ProducerGroups[groupID]; !exists {
+		return map[string]interface{}{
+			"success":      true,
+			"group_id":     groupID,
+			"unregistered": false,
+			"message":      "producer group not found",
+		}, nil
+	}
+
+	// Remove producer group
+	delete(csm.metadata.ProducerGroups, groupID)
+	csm.logger.Printf("Unregistered producer group %s", groupID)
+
+	csm.metadata.Version++
+	csm.metadata.UpdateTime = time.Now()
+
+	return map[string]interface{}{
+		"success":      true,
+		"group_id":     groupID,
+		"unregistered": true,
+	}, nil
 }

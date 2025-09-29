@@ -10,13 +10,13 @@ import (
 )
 
 func main() {
-	// 创建客户端
+	// Create client
 	c := client.NewClient(client.ClientConfig{
 		BrokerAddrs: []string{"localhost:19999"},
 		Timeout:     5 * time.Second,
 	})
 
-	// 创建事务性消费者配置
+	// Create transactional consumer configuration
 	config := client.TransactionalConsumerConfig{
 		GroupConsumerConfig: client.GroupConsumerConfig{
 			GroupID:        "example-group",
@@ -34,7 +34,7 @@ func main() {
 		},
 	}
 
-	// 创建事务性消费者
+	// Create transactional consumer
 	consumer, err := client.NewTransactionalConsumer(c, config)
 	if err != nil {
 		log.Fatalf("Failed to create transactional consumer: %v", err)
@@ -43,26 +43,26 @@ func main() {
 
 	log.Println("Starting transactional consumer with exact-once semantics...")
 
-	// 加入消费者组
+	// Join consumer group
 	err = consumer.JoinGroup()
 	if err != nil {
 		log.Fatalf("Failed to join group: %v", err)
 	}
 	defer consumer.LeaveGroup()
 
-	// 订阅主题
+	// Subscribe to topics
 	err = consumer.Subscribe([]string{"test-topic"})
 	if err != nil {
 		log.Fatalf("Failed to subscribe to topics: %v", err)
 	}
 
-	// 使用事务性消费
+	// Use transactional consumption
 	ctx := context.Background()
 	err = consumer.ConsumeTransactionally(ctx, func(messages []*client.ConsumeMessage) error {
 		log.Printf("Processing batch of %d messages with exact-once semantics", len(messages))
 		
 		for _, msg := range messages {
-			// 处理消息业务逻辑
+			// Process message business logic
 			err := processMessage(msg)
 			if err != nil {
 				return fmt.Errorf("failed to process message: %v", err)
@@ -78,15 +78,15 @@ func main() {
 	}
 }
 
-// processMessage 模拟消息处理逻辑
+// processMessage simulates message processing logic
 func processMessage(msg *client.ConsumeMessage) error {
 	log.Printf("Processing message: Topic=%s, Partition=%d, Offset=%d, Value=%s",
 		msg.Topic, msg.Partition, msg.Offset, string(msg.Value))
 	
-	// 模拟处理时间
+	// Simulate processing time
 	time.Sleep(10 * time.Millisecond)
 	
-	// 模拟偶尔的处理失败
+	// Simulate occasional processing failure
 	if string(msg.Value) == "error" {
 		return fmt.Errorf("simulated processing error")
 	}

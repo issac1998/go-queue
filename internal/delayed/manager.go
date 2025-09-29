@@ -12,10 +12,10 @@ import (
 	"time"
 )
 
-// MessageDeliveryCallback 消息投递回调函数类型
+// MessageDeliveryCallback message delivery callback function type
 type MessageDeliveryCallback func(topic string, partition int32, key, value []byte) error
 
-// DelayedMessageManager 延迟消息管理器
+// DelayedMessageManager delayed message manager
 type DelayedMessageManager struct {
 	dataDir          string
 	timeWheel        *TimeWheel
@@ -23,17 +23,15 @@ type DelayedMessageManager struct {
 	messagesMutex    sync.RWMutex
 	deliveryCallback MessageDeliveryCallback
 
-	// 配置参数
 	maxRetries      int32
 	cleanupInterval time.Duration
 
-	// 运行状态
 	running       bool
 	stopCh        chan struct{}
 	cleanupTicker *time.Ticker
 }
 
-// DelayedMessageStats 延迟消息统计
+// DelayedMessageStats delayed message statistics
 type DelayedMessageStats struct {
 	TotalMessages     int64 `json:"total_messages"`
 	PendingMessages   int64 `json:"pending_messages"`
@@ -42,14 +40,14 @@ type DelayedMessageStats struct {
 	CancelledMessages int64 `json:"cancelled_messages"`
 }
 
-// DelayedMessageManagerConfig 延迟消息管理器配置
+// DelayedMessageManagerConfig delayed message manager configuration
 type DelayedMessageManagerConfig struct {
 	DataDir         string
 	MaxRetries      int32
 	CleanupInterval time.Duration
 }
 
-// NewDelayedMessageManager 创建延迟消息管理器
+// NewDelayedMessageManager creates a delayed message manager
 func NewDelayedMessageManager(config DelayedMessageManagerConfig, deliveryCallback MessageDeliveryCallback) *DelayedMessageManager {
 	dmm := &DelayedMessageManager{
 		dataDir:          config.DataDir,
@@ -60,35 +58,28 @@ func NewDelayedMessageManager(config DelayedMessageManagerConfig, deliveryCallba
 		stopCh:           make(chan struct{}),
 	}
 
-	// 创建时间轮，传入消息投递回调
 	dmm.timeWheel = NewTimeWheel(TimeWheelSize, TimeWheelTickMs, dmm.handleExpiredTask)
 
 	return dmm
 }
 
-// Start 启动延迟消息管理器
 func (dmm *DelayedMessageManager) Start() error {
 	if dmm.running {
 		return fmt.Errorf("delayed message manager already running")
 	}
 
-	// 确保数据目录存在
 	if err := os.MkdirAll(dmm.dataDir, 0755); err != nil {
 		return fmt.Errorf("failed to create data directory: %v", err)
 	}
 
-	// 加载已有的延迟消息
 	if err := dmm.loadMessages(); err != nil {
 		log.Printf("Warning: Failed to load delayed messages: %v", err)
 	}
 
-	// 启动时间轮
 	dmm.timeWheel.Start()
 
-	// 重新调度已有的消息
 	dmm.scheduleExistingMessages()
 
-	// 启动清理协程
 	dmm.cleanupTicker = time.NewTicker(dmm.cleanupInterval)
 	go dmm.cleanupLoop()
 
@@ -98,24 +89,20 @@ func (dmm *DelayedMessageManager) Start() error {
 	return nil
 }
 
-// Stop 停止延迟消息管理器
 func (dmm *DelayedMessageManager) Stop() error {
 	if !dmm.running {
-		return nil
+		return fmt.Errorf("delayed message manager not running")
 	}
 
 	dmm.running = false
 	close(dmm.stopCh)
 
-	// 停止时间轮
 	dmm.timeWheel.Stop()
 
-	// 停止清理协程
 	if dmm.cleanupTicker != nil {
 		dmm.cleanupTicker.Stop()
 	}
 
-	// 保存所有消息
 	if err := dmm.saveMessages(); err != nil {
 		log.Printf("Warning: Failed to save messages during shutdown: %v", err)
 	}
@@ -124,19 +111,15 @@ func (dmm *DelayedMessageManager) Stop() error {
 	return nil
 }
 
-// ScheduleMessage 调度延迟消息
 func (dmm *DelayedMessageManager) ScheduleMessage(req *DelayedProduceRequest) (*DelayedProduceResponse, error) {
 	if !dmm.running {
 		return nil, fmt.Errorf("delayed message manager not running")
 	}
 
-	// 生成消息ID
 	messageID := dmm.generateMessageID()
 
-	// 计算投递时间
 	deliverTime := CalculateDeliverTime(DelayLevel(req.DelayLevel), req.DelayTime, req.DeliverTime)
 
-	// 创建延迟消息
 	message := &DelayedMessage{
 		ID:          messageID,
 		Topic:       req.Topic,
@@ -151,17 +134,14 @@ func (dmm *DelayedMessageManager) ScheduleMessage(req *DelayedProduceRequest) (*
 		UpdateTime:  time.Now().UnixMilli(),
 	}
 
-	// 保存消息
 	dmm.messagesMutex.Lock()
 	dmm.messages[messageID] = message
 	dmm.messagesMutex.Unlock()
 
-	// 持久化消息
 	if err := dmm.saveMessage(message); err != nil {
 		log.Printf("Warning: Failed to save delayed message: %v", err)
 	}
 
-	// 添加到时间轮
 	task := &TimeWheelTask{
 		ID:          messageID,
 		ExecuteTime: deliverTime,
@@ -180,7 +160,6 @@ func (dmm *DelayedMessageManager) ScheduleMessage(req *DelayedProduceRequest) (*
 	}, nil
 }
 
-// handleExpiredTask 处理过期任务
 func (dmm *DelayedMessageManager) handleExpiredTask(task *TimeWheelTask) {
 	message, ok := task.Data.(*DelayedMessage)
 	if !ok {
@@ -191,11 +170,9 @@ func (dmm *DelayedMessageManager) handleExpiredTask(task *TimeWheelTask) {
 	dmm.deliverMessage(message)
 }
 
-// deliverMessage 投递延迟消息
 func (dmm *DelayedMessageManager) deliverMessage(message *DelayedMessage) {
 	log.Printf("Delivering delayed message %s to topic %s", message.ID, message.Topic)
 
-	// 投递消息
 	if dmm.deliveryCallback == nil {
 		log.Printf("Warning: Delivery callback is nil, marking message %s as delivered", message.ID)
 		message.MarkDelivered()
@@ -205,7 +182,6 @@ func (dmm *DelayedMessageManager) deliverMessage(message *DelayedMessage) {
 
 	err := dmm.deliveryCallback(message.Topic, message.Partition, message.Key, message.Value)
 	if err != nil {
-		// 投递失败，检查是否可以重试
 		if message.CanRetry() {
 			message.MarkFailed(err.Error())
 			log.Printf("Failed to deliver delayed message %s, retry count: %d, error: %v",
@@ -223,23 +199,19 @@ func (dmm *DelayedMessageManager) deliverMessage(message *DelayedMessage) {
 			log.Printf("Delayed message %s failed permanently after %d retries", message.ID, message.RetryCount)
 		}
 	} else {
-		// 投递成功
 		message.MarkDelivered()
 		log.Printf("Successfully delivered delayed message %s", message.ID)
 	}
 
-	// 保存消息状态
 	dmm.saveMessage(message)
 }
 
-// generateMessageID 生成消息ID
 func (dmm *DelayedMessageManager) generateMessageID() string {
 	bytes := make([]byte, 16)
 	rand.Read(bytes)
 	return hex.EncodeToString(bytes)
 }
 
-// loadMessages 从磁盘加载消息
 func (dmm *DelayedMessageManager) loadMessages() error {
 	files, err := filepath.Glob(filepath.Join(dmm.dataDir, "*.json"))
 	if err != nil {
@@ -266,7 +238,6 @@ func (dmm *DelayedMessageManager) loadMessages() error {
 	return nil
 }
 
-// saveMessages 保存所有消息到磁盘
 func (dmm *DelayedMessageManager) saveMessages() error {
 	dmm.messagesMutex.RLock()
 	defer dmm.messagesMutex.RUnlock()
@@ -280,7 +251,6 @@ func (dmm *DelayedMessageManager) saveMessages() error {
 	return nil
 }
 
-// saveMessage 保存单个消息到磁盘
 func (dmm *DelayedMessageManager) saveMessage(message *DelayedMessage) error {
 	data, err := json.Marshal(message)
 	if err != nil {
@@ -291,7 +261,6 @@ func (dmm *DelayedMessageManager) saveMessage(message *DelayedMessage) error {
 	return os.WriteFile(filename, data, 0644)
 }
 
-// scheduleExistingMessages 重新调度已有消息
 func (dmm *DelayedMessageManager) scheduleExistingMessages() {
 	dmm.messagesMutex.RLock()
 	defer dmm.messagesMutex.RUnlock()
@@ -302,10 +271,8 @@ func (dmm *DelayedMessageManager) scheduleExistingMessages() {
 	for _, message := range dmm.messages {
 		if message.Status == StatusPending {
 			if message.DeliverTime <= now {
-				// 已过期，立即投递
 				go dmm.deliverMessage(message)
 			} else {
-				// 重新调度
 				task := &TimeWheelTask{
 					ID:          message.ID,
 					ExecuteTime: message.DeliverTime,
@@ -320,7 +287,6 @@ func (dmm *DelayedMessageManager) scheduleExistingMessages() {
 	log.Printf("Rescheduled %d pending delayed messages", scheduled)
 }
 
-// cleanupLoop 清理循环
 func (dmm *DelayedMessageManager) cleanupLoop() {
 	for {
 		select {
@@ -332,21 +298,18 @@ func (dmm *DelayedMessageManager) cleanupLoop() {
 	}
 }
 
-// cleanup 清理已完成的消息
 func (dmm *DelayedMessageManager) cleanup() {
 	dmm.messagesMutex.Lock()
 	defer dmm.messagesMutex.Unlock()
 
-	cutoffTime := time.Now().Add(-24 * time.Hour).UnixMilli() // 保留24小时
+	cutoffTime := time.Now().Add(-24 * time.Hour).UnixMilli()
 	cleaned := 0
 
 	for id, message := range dmm.messages {
 		if message.Status != StatusPending && message.CreateTime < cutoffTime {
-			// 删除消息文件
 			filename := filepath.Join(dmm.dataDir, message.ID+".json")
 			os.Remove(filename)
 
-			// 从内存中删除
 			delete(dmm.messages, id)
 			cleaned++
 		}
@@ -357,7 +320,6 @@ func (dmm *DelayedMessageManager) cleanup() {
 	}
 }
 
-// GetStats 获取统计信息
 func (dmm *DelayedMessageManager) GetStats() DelayedMessageStats {
 	dmm.messagesMutex.RLock()
 	defer dmm.messagesMutex.RUnlock()
@@ -381,7 +343,6 @@ func (dmm *DelayedMessageManager) GetStats() DelayedMessageStats {
 	return stats
 }
 
-// GetMessage 获取消息
 func (dmm *DelayedMessageManager) GetMessage(messageID string) (*DelayedMessage, error) {
 	dmm.messagesMutex.RLock()
 	defer dmm.messagesMutex.RUnlock()
@@ -394,7 +355,6 @@ func (dmm *DelayedMessageManager) GetMessage(messageID string) (*DelayedMessage,
 	return message, nil
 }
 
-// CancelMessage 取消消息
 func (dmm *DelayedMessageManager) CancelMessage(messageID string) error {
 	dmm.messagesMutex.Lock()
 	defer dmm.messagesMutex.Unlock()

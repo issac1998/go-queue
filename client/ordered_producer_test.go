@@ -19,7 +19,7 @@ func TestOrderedPartitioner(t *testing.T) {
 			partition1, partition2, partition3)
 	}
 
-	// 验证分区在有效范围内
+	// Verify partition is within valid range
 	if partition1 < 0 || partition1 >= numPartitions {
 		t.Errorf("Partition %d is out of range [0, %d)", partition1, numPartitions)
 	}
@@ -60,7 +60,7 @@ func TestOrderedPartitionerHashConsistency(t *testing.T) {
 	messageGroup := "test-group"
 	numPartitions := int32(3)
 
-	// 不同的分区器实例对相同输入应该产生相同结果
+	// Different partitioner instances should produce same result for same input
 	partition1 := partitioner1.SelectPartitionForMessageGroup(messageGroup, numPartitions)
 	partition2 := partitioner2.SelectPartitionForMessageGroup(messageGroup, numPartitions)
 

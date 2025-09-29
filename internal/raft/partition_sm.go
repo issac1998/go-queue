@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -103,9 +104,12 @@ type PartitionCommand struct {
 
 // Command types for partition operations
 const (
-	CmdProduceMessage = "produce_message"
-	CmdProduceBatch   = "produce_batch"
-	CmdCleanup        = "cleanup"
+	CmdProduceMessage      = "produce_message"
+	CmdProduceBatch        = "produce_batch"
+	CmdCleanup             = "cleanup"
+	CmdTransactionPrepare  = "transaction_prepare"
+	CmdTransactionCommit   = "transaction_commit"
+	CmdTransactionRollback = "transaction_rollback"
 )
 
 // ProduceBatchCommand represents a batch of messages to be produced
@@ -153,6 +157,11 @@ type PartitionStateMachine struct {
 	// Ordering components
 	orderedMessageManager *ordering.OrderedMessageManager
 
+	// Transaction management
+	halfMessages       map[TransactionID]*HalfMessage
+	transactionTimeout time.Duration
+	transactionMu      sync.RWMutex
+
 	// Metrics
 	messageCount int64
 	bytesStored  int64
@@ -161,6 +170,9 @@ type PartitionStateMachine struct {
 
 	// State
 	isReady bool
+
+	// Logging
+	logger *log.Logger
 }
 
 // NewPartitionStateMachine creates a state machine for a partition
@@ -178,6 +190,11 @@ func NewPartitionStateMachine(topicName string, partitionID int32, dataDir strin
 		return nil, typederrors.NewTypedError(typederrors.StorageError, "failed to create partition storage", err)
 	}
 
+	file, err := os.OpenFile(fmt.Sprintf("partition-%d", partitionID), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open log file: %v", err)
+	}
+
 	psm := &PartitionStateMachine{
 		TopicName:             topicName,
 		PartitionID:           partitionID,
@@ -187,12 +204,16 @@ func NewPartitionStateMachine(topicName string, partitionID int32, dataDir strin
 		DeduplicatorManager:   deduplicator.NewDeduplicatorManager(),
 		deduplicatorEnabled:   true,
 		orderedMessageManager: ordering.NewOrderedMessageManager(100, 30*time.Second), // 100 message window, 30s timeout
+		halfMessages:          make(map[TransactionID]*HalfMessage),
+		transactionTimeout:    30 * time.Second,
 		isReady:               true,
 		lastWrite:             time.Now(),
 		lastRead:              time.Now(),
+
+		logger: log.New(file, fmt.Sprintf("[partition-%d] ", partitionID), log.LstdFlags),
 	}
 
-	log.Printf("Created PartitionStateMachine for %s-%d", topicName, partitionID)
+	psm.logger.Printf("Created PartitionStateMachine for %s-%d", topicName, partitionID)
 	return psm, nil
 }
 
@@ -204,7 +225,7 @@ func (psm *PartitionStateMachine) Update(data []byte) (statemachine.Result, erro
 
 	var cmd PartitionCommand
 	if err := json.Unmarshal(data, &cmd); err != nil {
-		log.Printf("Failed to unmarshal partition command: %v", err)
+		psm.logger.Printf("Failed to unmarshal partition command: %v", err)
 		return statemachine.Result{Value: 0}, typederrors.NewTypedError(typederrors.GeneralError, "failed to unmarshal partition command", err)
 	}
 
@@ -215,9 +236,15 @@ func (psm *PartitionStateMachine) Update(data []byte) (statemachine.Result, erro
 		return psm.handleProduceBatch(cmd.Data)
 	case CmdCleanup:
 		return psm.handleCleanup(cmd.Data)
+	case CmdTransactionPrepare:
+		return psm.handleTransactionPrepare(cmd.Data)
+	case CmdTransactionCommit:
+		return psm.handleTransactionCommit(cmd.Data)
+	case CmdTransactionRollback:
+		return psm.handleTransactionRollback(cmd.Data)
 	default:
 		err := fmt.Errorf("unknown command type: %s", cmd.Type)
-		log.Printf("PartitionStateMachine error: %v", err)
+		psm.logger.Printf("PartitionStateMachine error: %v", err)
 		return statemachine.Result{Value: 0}, err
 	}
 }
@@ -241,7 +268,7 @@ func (psm *PartitionStateMachine) handleProduceMessage(data map[string]interface
 
 		// Check for duplicate messages first
 		if deduplicator.IsDuplicateSequenceNumber(psm.PartitionID, msg.SequenceNumber, msg.AsyncIO) {
-			log.Printf("Duplicate sequence number %d for producer %s on partition %d",
+			psm.logger.Printf("Duplicate sequence number %d for producer %s on partition %d",
 				msg.SequenceNumber, msg.ProducerID, psm.PartitionID)
 
 			lastOffset := deduplicator.GetLastSequenceNumber(psm.PartitionID)
@@ -309,7 +336,7 @@ func (psm *PartitionStateMachine) handleProduceMessage(data map[string]interface
 
 		// Check for duplicate messages first
 		if deduplicator.IsDuplicateSequenceNumber(psm.PartitionID, msg.SequenceNumber, msg.AsyncIO) {
-			log.Printf("Duplicate sequence number %d for producer %s on partition %d",
+			psm.logger.Printf("Duplicate sequence number %d for producer %s on partition %d",
 				msg.SequenceNumber, msg.ProducerID, psm.PartitionID)
 
 			lastOffset := deduplicator.GetLastSequenceNumber(psm.PartitionID)
@@ -326,7 +353,7 @@ func (psm *PartitionStateMachine) handleProduceMessage(data map[string]interface
 
 		// Validate sequence number for non-AsyncIO (must be strictly sequential)
 		if !deduplicator.IsValidSequenceNumber(psm.PartitionID, msg.SequenceNumber, msg.AsyncIO) {
-			log.Printf("Invalid sequence number %d for producer %s on partition %d, expected %d",
+			psm.logger.Printf("Invalid sequence number %d for producer %s on partition %d, expected %d",
 				msg.SequenceNumber, msg.ProducerID, psm.PartitionID,
 				deduplicator.GetLastSequenceNumber(psm.PartitionID)+1)
 
@@ -361,7 +388,7 @@ func (psm *PartitionStateMachine) handleProduceMessage(data map[string]interface
 
 	resultBytes, err := json.Marshal(result)
 	if err != nil {
-		log.Printf("Failed to marshal write result: %v", err)
+		psm.logger.Printf("Failed to marshal write result: %v", err)
 		resultBytes = []byte(fmt.Sprintf(`{"offset":%d,"timestamp":"%s"}`, offset, msg.Timestamp.Format(time.RFC3339)))
 	}
 
@@ -427,17 +454,15 @@ func (psm *PartitionStateMachine) storeMessage(msg *ProduceMessage) (int64, erro
 		if len(serializedMsg) >= 1024 {
 			compressedMsg, err := psm.compressor.Compress(serializedMsg)
 			if err != nil {
-				log.Printf("Compression failed, storing uncompressed: %v", err)
+				psm.logger.Printf("Compression failed, storing uncompressed: %v", err)
 				finalMsg = serializedMsg
 			} else {
-				finalMsg = make([]byte, 1+len(compressedMsg))
-				finalMsg[0] = byte(psm.compressor.Type())
-				copy(finalMsg[1:], compressedMsg)
+				finalMsg = compressedMsg
+				psm.logger.Printf("Message compressed: %d -> %d bytes (ratio: %.2f)",
+					len(serializedMsg), len(compressedMsg), float64(len(compressedMsg))/float64(len(serializedMsg)))
 			}
 		} else {
-			finalMsg = make([]byte, 1+len(serializedMsg))
-			finalMsg[0] = byte(compression.None)
-			copy(finalMsg[1:], serializedMsg)
+			finalMsg = serializedMsg
 		}
 	} else {
 		finalMsg = make([]byte, 1+len(serializedMsg))
@@ -478,7 +503,7 @@ func (psm *PartitionStateMachine) handleProduceBatch(data map[string]interface{}
 					Offset:    lastOffset,
 					Timestamp: msg.Timestamp,
 				}
-				log.Printf("Duplicate sequence number %d detected for producer %s in batch message %d", msg.SequenceNumber, msg.ProducerID, i)
+				psm.logger.Printf("Duplicate sequence number %d detected for producer %s in batch message %d", msg.SequenceNumber, msg.ProducerID, i)
 				continue
 			}
 
@@ -506,16 +531,17 @@ func (psm *PartitionStateMachine) handleProduceBatch(data map[string]interface{}
 			if len(serializedMsg) >= 1024 {
 				compressedMsg, err := psm.compressor.Compress(serializedMsg)
 				if err != nil {
-					results[i] = WriteResult{Error: fmt.Sprintf("compression failed for message %d: %v", i, err)}
-					log.Printf("Compression failed for message %d, storing uncompressed: %v", i, err)
-					finalMsg = serializedMsg
+					psm.logger.Printf("Compression failed for message %d, storing uncompressed: %v", i, err)
+					finalMsg = make([]byte, 1+len(serializedMsg))
+					finalMsg[0] = byte(compression.None)
+					copy(finalMsg[1:], serializedMsg)
 				} else {
 					finalMsg = make([]byte, 1+len(compressedMsg))
 					finalMsg[0] = byte(psm.compressor.Type())
 					copy(finalMsg[1:], compressedMsg)
 
 					compressionRatio := float64(len(compressedMsg)) / float64(len(serializedMsg))
-					log.Printf("Message %d compressed: %d -> %d bytes (ratio: %.2f)",
+					psm.logger.Printf("Message %d compressed: %d -> %d bytes (ratio: %.2f)",
 						i, len(serializedMsg), len(compressedMsg), compressionRatio)
 				}
 			} else {
@@ -532,7 +558,7 @@ func (psm *PartitionStateMachine) handleProduceBatch(data map[string]interface{}
 		offset, err := psm.partition.Append(finalMsg, msg.Timestamp)
 		if err != nil {
 			results[i] = WriteResult{Error: fmt.Sprintf("failed to append message %d: %v", i, err)}
-			log.Printf("Failed to append message %d: %v", i, err)
+			psm.logger.Printf("Failed to append message %d: %v", i, err)
 			continue
 		}
 
@@ -549,17 +575,17 @@ func (psm *PartitionStateMachine) handleProduceBatch(data map[string]interface{}
 			Offset:    offset,
 			Timestamp: msg.Timestamp,
 		}
-		log.Printf("Produced message %d to %s-%d at offset %d", i, psm.TopicName, psm.PartitionID, offset)
+		psm.logger.Printf("Produced message %d to %s-%d at offset %d", i, psm.TopicName, psm.PartitionID, offset)
 	}
 
 	batchResult := BatchWriteResult{Results: results}
 	batchResultBytes, err := json.Marshal(batchResult)
 	if err != nil {
-		log.Printf("Failed to marshal batch write result: %v", err)
+		psm.logger.Printf("Failed to marshal batch write result: %v", err)
 		batchResultBytes = []byte(`{"results":[],"error":"failed to marshal results"}`)
 	}
 
-	log.Printf("Produced batch of %d messages to %s-%d", len(batchCmd.Messages), psm.TopicName, psm.PartitionID)
+	psm.logger.Printf("Produced batch of %d messages to %s-%d", len(batchCmd.Messages), psm.TopicName, psm.PartitionID)
 
 	return statemachine.Result{
 		Value: 0,
@@ -567,10 +593,10 @@ func (psm *PartitionStateMachine) handleProduceBatch(data map[string]interface{}
 	}, nil
 }
 
-// handleCleanup handles partition cleanup operations
+// handleCleanup performs cleanup operations on the partition
 func (psm *PartitionStateMachine) handleCleanup(data map[string]interface{}) (statemachine.Result, error) {
-	// This would handle cleanup operations like log compaction
-	log.Printf("Performed cleanup on %s-%d", psm.TopicName, psm.PartitionID)
+	// Perform cleanup operations here
+	psm.logger.Printf("Performed cleanup on %s-%d", psm.TopicName, psm.PartitionID)
 
 	result := map[string]interface{}{
 		"status": "success",
@@ -582,6 +608,53 @@ func (psm *PartitionStateMachine) handleCleanup(data map[string]interface{}) (st
 		Value: 1,
 		Data:  resultBytes,
 	}, nil
+}
+
+// HalfMessageQueryRequest represents a query for half message
+type HalfMessageQueryRequest struct {
+	Type          string `json:"type"`
+	TransactionID string `json:"transaction_id"`
+}
+
+// HalfMessageQueryResponse represents the response for half message query
+type HalfMessageQueryResponse struct {
+	Success     bool         `json:"success"`
+	HalfMessage *HalfMessage `json:"half_message,omitempty"`
+	Error       string       `json:"error,omitempty"`
+}
+
+// ExpiredTransactionsQueryRequest represents a query for expired transactions
+type ExpiredTransactionsQueryRequest struct {
+	Type string `json:"type"`
+}
+
+// ExpiredTransactionsQueryResponse represents the response for expired transactions query
+type ExpiredTransactionsQueryResponse struct {
+	Success              bool                    `json:"success"`
+	ExpiredTransactions  []ExpiredTransactionInfo `json:"expired_transactions,omitempty"`
+	Error                string                  `json:"error,omitempty"`
+}
+
+// ExpiredTransactionInfo contains information about an expired transaction
+type ExpiredTransactionInfo struct {
+	TransactionID TransactionID `json:"transaction_id"`
+	ProducerGroup string        `json:"producer_group"`
+	Topic         string        `json:"topic"`
+	Partition     int32         `json:"partition"`
+	CreatedAt     time.Time     `json:"created_at"`
+	Timeout       time.Duration `json:"timeout"`
+}
+
+// MetricsQueryRequest defines metrics query request
+type MetricsQueryRequest struct {
+	Type string `json:"type"`
+}
+
+// MetricsQueryResponse defines metrics query response
+type MetricsQueryResponse struct {
+	Success bool                   `json:"success"`
+	Metrics map[string]interface{} `json:"metrics,omitempty"`
+	Error   string                 `json:"error,omitempty"`
 }
 
 // Lookup implements statemachine.IStateMachine interface
@@ -601,7 +674,25 @@ func (psm *PartitionStateMachine) Lookup(query interface{}) (interface{}, error)
 		return nil, fmt.Errorf("invalid query type: %T", query)
 	}
 
-	// Try to parse as BatchFetchRequest first
+	// Try to parse as HalfMessageQueryRequest first
+	var halfMsgReq HalfMessageQueryRequest
+	if err := json.Unmarshal(queryBytes, &halfMsgReq); err == nil && halfMsgReq.Type == "get_half_message" {
+		return psm.handleGetHalfMessageQuery(&halfMsgReq)
+	}
+
+	// Try to parse as ExpiredTransactionsQueryRequest
+	var expiredReq ExpiredTransactionsQueryRequest
+	if err := json.Unmarshal(queryBytes, &expiredReq); err == nil && expiredReq.Type == "get_expired_transactions" {
+		return psm.handleGetExpiredTransactionsQuery(&expiredReq)
+	}
+
+	// Try to parse as MetricsQueryRequest
+	var metricsReq MetricsQueryRequest
+	if err := json.Unmarshal(queryBytes, &metricsReq); err == nil && metricsReq.Type == "get_metrics" {
+		return psm.handleGetMetricsQuery(&metricsReq)
+	}
+
+	// Try to parse as BatchFetchRequest
 	var batchReq BatchFetchRequest
 	if err := json.Unmarshal(queryBytes, &batchReq); err == nil && len(batchReq.Requests) > 0 {
 		return psm.handleBatchFetchMessages(&batchReq)
@@ -613,6 +704,62 @@ func (psm *PartitionStateMachine) Lookup(query interface{}) (interface{}, error)
 	}
 
 	return psm.handleFetchMessages(&req)
+}
+
+// handleGetHalfMessageQuery handles half message query requests
+func (psm *PartitionStateMachine) handleGetHalfMessageQuery(req *HalfMessageQueryRequest) (*HalfMessageQueryResponse, error) {
+	psm.transactionMu.RLock()
+	defer psm.transactionMu.RUnlock()
+
+	halfMessage, exists := psm.halfMessages[TransactionID(req.TransactionID)]
+	if !exists {
+		return &HalfMessageQueryResponse{
+			Success: false,
+			Error:   fmt.Sprintf("transaction not found: %s", req.TransactionID),
+		}, nil
+	}
+
+	return &HalfMessageQueryResponse{
+		Success:     true,
+		HalfMessage: halfMessage,
+	}, nil
+}
+
+// handleGetExpiredTransactionsQuery handles expired transactions query requests
+func (psm *PartitionStateMachine) handleGetExpiredTransactionsQuery(req *ExpiredTransactionsQueryRequest) (*ExpiredTransactionsQueryResponse, error) {
+	psm.transactionMu.RLock()
+	defer psm.transactionMu.RUnlock()
+
+	var expiredTransactions []ExpiredTransactionInfo
+	now := time.Now()
+
+	for txnID, halfMessage := range psm.halfMessages {
+		// Check if transaction has expired
+		if now.Sub(halfMessage.CreatedAt) > halfMessage.Timeout {
+			expiredInfo := ExpiredTransactionInfo{
+				TransactionID: txnID,
+				ProducerGroup: halfMessage.ProducerGroup,
+				Topic:         halfMessage.Topic,
+				Partition:     halfMessage.Partition,
+				CreatedAt:     halfMessage.CreatedAt,
+				Timeout:       halfMessage.Timeout,
+			}
+			expiredTransactions = append(expiredTransactions, expiredInfo)
+		}
+	}
+
+	return &ExpiredTransactionsQueryResponse{
+		Success:             true,
+		ExpiredTransactions: expiredTransactions,
+	}, nil
+}
+
+func (psm *PartitionStateMachine) handleGetMetricsQuery(req *MetricsQueryRequest) (*MetricsQueryResponse, error) {
+	metrics := psm.GetMetrics()
+	return &MetricsQueryResponse{
+		Success: true,
+		Metrics: metrics,
+	}, nil
 }
 
 // handleBatchFetchMessages handles batch message fetching
@@ -651,7 +798,7 @@ func (psm *PartitionStateMachine) handleBatchFetchMessages(req *BatchFetchReques
 				NextOffset: fetchRange.Offset,
 				Error:      fmt.Sprintf("failed to read range %d: %v", i, err),
 			}
-			log.Printf("Failed to read messages for range %d: %v", i, err)
+			psm.logger.Printf("Failed to read messages for range %d: %v", i, err)
 		} else {
 			results[i] = FetchResult{
 				Messages:   messages,
@@ -662,7 +809,7 @@ func (psm *PartitionStateMachine) handleBatchFetchMessages(req *BatchFetchReques
 
 	psm.lastRead = time.Now()
 
-	log.Printf("✅ Batch fetched %d ranges from %s-%d",
+	psm.logger.Printf("✅ Batch fetched %d ranges from %s-%d",
 		len(req.Requests), psm.TopicName, psm.PartitionID)
 
 	return &BatchFetchResponse{
@@ -686,7 +833,7 @@ func (psm *PartitionStateMachine) handleFetchMessages(req *FetchRequest) (*Fetch
 
 	messages, nextOffset, err := psm.readMessagesFromStorage(req.Offset, req.MaxBytes)
 	if err != nil {
-		log.Printf("Failed to read messages: %v", err)
+		psm.logger.Printf("Failed to read messages: %v", err)
 		return &FetchResponse{
 			Topic:     req.Topic,
 			Partition: req.Partition,
@@ -697,7 +844,7 @@ func (psm *PartitionStateMachine) handleFetchMessages(req *FetchRequest) (*Fetch
 
 	psm.lastRead = time.Now()
 
-	log.Printf("Fetched %d messages from %s-%d starting at offset %d",
+	psm.logger.Printf("Fetched %d messages from %s-%d starting at offset %d",
 		len(messages), psm.TopicName, psm.PartitionID, req.Offset)
 
 	return &FetchResponse{
@@ -732,14 +879,14 @@ func (psm *PartitionStateMachine) readMessagesFromStorage(startOffset int64, max
 				// Message is compressed, decompress it
 				compressor, err := compression.GetCompressor(compressionType)
 				if err != nil {
-					log.Printf("Failed to get decompressor for type %d at offset %d: %v", compressionType, currentOffset, err)
+					psm.logger.Printf("Failed to get decompressor for type %d at offset %d: %v", compressionType, currentOffset, err)
 					currentOffset++
 					continue
 				}
 
 				decompressedData, err := compressor.Decompress(messageData[1:])
 				if err != nil {
-					log.Printf("Failed to decompress message at offset %d: %v", currentOffset, err)
+					psm.logger.Printf("Failed to decompress message at offset %d: %v", currentOffset, err)
 					currentOffset++
 					continue
 				}
@@ -755,7 +902,7 @@ func (psm *PartitionStateMachine) readMessagesFromStorage(startOffset int64, max
 		// Deserialize message
 		var msg StoredMessage
 		if err := json.Unmarshal(actualMessageData, &msg); err != nil {
-			log.Printf("Failed to unmarshal stored message at offset %d: %v", currentOffset, err)
+			psm.logger.Printf("Failed to unmarshal stored message at offset %d: %v", currentOffset, err)
 			currentOffset++
 			continue
 		}
@@ -796,14 +943,14 @@ func (psm *PartitionStateMachine) readMessagesFromStorageWithCount(startOffset i
 			if compressionType != compression.None {
 				compressor, err := compression.GetCompressor(compressionType)
 				if err != nil {
-					log.Printf("Failed to get decompressor for type %d at offset %d: %v", compressionType, currentOffset, err)
+					psm.logger.Printf("Failed to get decompressor for type %d at offset %d: %v", compressionType, currentOffset, err)
 					currentOffset++
 					continue
 				}
 
 				decompressedData, err := compressor.Decompress(messageData[1:])
 				if err != nil {
-					log.Printf("Failed to decompress message at offset %d: %v", currentOffset, err)
+					psm.logger.Printf("Failed to decompress message at offset %d: %v", currentOffset, err)
 					currentOffset++
 					continue
 				}
@@ -817,7 +964,7 @@ func (psm *PartitionStateMachine) readMessagesFromStorageWithCount(startOffset i
 
 		var msg StoredMessage
 		if err := json.Unmarshal(actualMessageData, &msg); err != nil {
-			log.Printf("Failed to unmarshal stored message at offset %d: %v", currentOffset, err)
+			psm.logger.Printf("Failed to unmarshal stored message at offset %d: %v", currentOffset, err)
 			currentOffset++
 			continue
 		}
@@ -861,7 +1008,7 @@ func (psm *PartitionStateMachine) SaveSnapshot(w io.Writer, fc statemachine.ISna
 		return typederrors.NewTypedError(typederrors.GeneralError, "failed to write snapshot", err)
 	}
 
-	log.Printf("Saved snapshot for %s-%d with %d producer states", psm.TopicName, psm.PartitionID, len(deduplicators))
+	psm.logger.Printf("Saved snapshot for %s-%d with %d producer states", psm.TopicName, psm.PartitionID, len(deduplicators))
 	return nil
 }
 
@@ -891,11 +1038,11 @@ func (psm *PartitionStateMachine) RecoverFromSnapshot(r io.Reader, files []state
 
 	if deduplicatorsData, ok := snapshot["producer_states"]; ok {
 		if err := psm.restorededuplicators(deduplicatorsData); err != nil {
-			log.Printf("Failed to restore producer states: %v", err)
+			psm.logger.Printf("Failed to restore producer states: %v", err)
 		}
 	}
 
-	log.Printf("Recovered from snapshot for %s-%d", psm.TopicName, psm.PartitionID)
+	psm.logger.Printf("Recovered from snapshot for %s-%d", psm.TopicName, psm.PartitionID)
 	return nil
 }
 
@@ -930,7 +1077,7 @@ func (psm *PartitionStateMachine) restorededuplicators(data interface{}) error {
 		restoredCount++
 	}
 
-	log.Printf("Restored %d producer states for partition %s-%d", restoredCount, psm.TopicName, psm.PartitionID)
+	psm.logger.Printf("Restored %d producer states for partition %s-%d", restoredCount, psm.TopicName, psm.PartitionID)
 	return nil
 }
 
@@ -945,13 +1092,13 @@ func (psm *PartitionStateMachine) Close() error {
 
 	if psm.partition != nil {
 		if err := psm.partition.Close(); err != nil {
-			log.Printf("Failed to close partition storage: %v", err)
+			psm.logger.Printf("Failed to close partition storage: %v", err)
 			return err
 		}
 	}
 
 	psm.isReady = false
-	log.Printf("Closed PartitionStateMachine for %s-%d", psm.TopicName, psm.PartitionID)
+	psm.logger.Printf("Closed PartitionStateMachine for %s-%d", psm.TopicName, psm.PartitionID)
 	return nil
 }
 
@@ -967,11 +1114,148 @@ func (psm *PartitionStateMachine) GetMetrics() map[string]interface{} {
 	psm.mu.RLock()
 	defer psm.mu.RUnlock()
 
+	psm.transactionMu.RLock()
+	transactionCount := len(psm.halfMessages)
+	psm.transactionMu.RUnlock()
+
 	return map[string]interface{}{
-		"message_count": psm.messageCount,
-		"bytes_stored":  psm.bytesStored,
-		"last_write":    psm.lastWrite,
-		"last_read":     psm.lastRead,
-		"is_ready":      psm.isReady,
+		"message_count":     psm.messageCount,
+		"bytes_stored":      psm.bytesStored,
+		"last_write":        psm.lastWrite,
+		"last_read":         psm.lastRead,
+		"is_ready":          psm.isReady,
+		"transaction_count": transactionCount,
 	}
+}
+
+func (psm *PartitionStateMachine) handleTransactionPrepare(data map[string]interface{}) (statemachine.Result, error) {
+	psm.transactionMu.Lock()
+	defer psm.transactionMu.Unlock()
+
+	transactionID := TransactionID(data["transaction_id"].(string))
+	producerGroup := data["producer_group"].(string)
+	timeout := time.Duration(data["timeout"].(float64)) * time.Second
+
+	halfMessageData, ok := data["half_message"].(map[string]interface{})
+	if !ok {
+		return statemachine.Result{Value: 0}, fmt.Errorf("invalid half message data")
+	}
+
+	halfMessage := &HalfMessage{
+		TransactionID: transactionID,
+		ProducerGroup: producerGroup,
+		Topic:         halfMessageData["topic"].(string),
+		Partition:     int32(halfMessageData["partition"].(float64)),
+		Key:           []byte(halfMessageData["key"].(string)),
+		Value:         []byte(halfMessageData["value"].(string)),
+		Headers:       make(map[string]string),
+		CreatedAt:     time.Now(),
+		Timeout:       timeout,
+		State:         StatePrepared,
+	}
+
+	if headers, ok := halfMessageData["headers"].(map[string]interface{}); ok {
+		for k, v := range headers {
+			halfMessage.Headers[k] = v.(string)
+		}
+	}
+
+	psm.halfMessages[transactionID] = halfMessage
+
+	psm.logger.Printf("Transaction prepared: %s", transactionID)
+	return statemachine.Result{Value: 1}, nil
+}
+
+func (psm *PartitionStateMachine) handleTransactionCommit(data map[string]interface{}) (statemachine.Result, error) {
+	psm.transactionMu.Lock()
+	defer psm.transactionMu.Unlock()
+
+	transactionID := TransactionID(data["transaction_id"].(string))
+
+	halfMessage, exists := psm.halfMessages[transactionID]
+	if !exists {
+		return statemachine.Result{Value: 0}, fmt.Errorf("transaction not found: %s", transactionID)
+	}
+
+	if halfMessage.State != StatePrepared {
+		return statemachine.Result{Value: 0}, fmt.Errorf("transaction not in prepared state: %s", transactionID)
+	}
+
+	halfMessage.State = StateCommit
+
+	msg := &ProduceMessage{
+		Topic:     halfMessage.Topic,
+		Partition: halfMessage.Partition,
+		Key:       halfMessage.Key,
+		Value:     halfMessage.Value,
+		Headers:   halfMessage.Headers,
+		Timestamp: time.Now(),
+	}
+
+	delete(psm.halfMessages, transactionID)
+
+	offset, err := psm.storeMessage(msg)
+	if err != nil {
+		return statemachine.Result{Value: 0}, fmt.Errorf("failed to store committed message: %w", err)
+	}
+
+	psm.logger.Printf("Transaction committed: %s, offset: %d", transactionID, offset)
+	return statemachine.Result{Value: uint64(offset)}, nil
+}
+
+func (psm *PartitionStateMachine) handleTransactionRollback(data map[string]interface{}) (statemachine.Result, error) {
+	psm.transactionMu.Lock()
+	defer psm.transactionMu.Unlock()
+
+	transactionID := TransactionID(data["transaction_id"].(string))
+
+	halfMessage, exists := psm.halfMessages[transactionID]
+	if !exists {
+		return statemachine.Result{Value: 0}, fmt.Errorf("transaction not found: %s", transactionID)
+	}
+
+	halfMessage.State = StateRollback
+	delete(psm.halfMessages, transactionID)
+
+	psm.logger.Printf("Transaction rolled back: %s", transactionID)
+	return statemachine.Result{Value: 1}, nil
+}
+
+// GetHalfMessage retrieves half message for transaction check
+func (psm *PartitionStateMachine) GetHalfMessage(txnID TransactionID) (*HalfMessage, bool) {
+	psm.transactionMu.RLock()
+	defer psm.transactionMu.RUnlock()
+
+	halfMessage, exists := psm.halfMessages[txnID]
+	return halfMessage, exists
+}
+
+// GetTimeoutTransactions returns list of timeout transactions
+func (psm *PartitionStateMachine) GetTimeoutTransactions() []TransactionID {
+	psm.transactionMu.RLock()
+	defer psm.transactionMu.RUnlock()
+
+	now := time.Now()
+	var timeoutTxns []TransactionID
+
+	for txnID, halfMessage := range psm.halfMessages {
+		if now.Sub(halfMessage.CreatedAt) > halfMessage.Timeout {
+			timeoutTxns = append(timeoutTxns, txnID)
+		}
+	}
+
+	return timeoutTxns
+}
+
+// GetAllHalfMessages returns all half messages for monitoring and debugging
+func (psm *PartitionStateMachine) GetAllHalfMessages() map[TransactionID]*HalfMessage {
+	psm.transactionMu.RLock()
+	defer psm.transactionMu.RUnlock()
+
+	result := make(map[TransactionID]*HalfMessage)
+	for txnID, halfMessage := range psm.halfMessages {
+		copyMessage := *halfMessage
+		result[txnID] = &copyMessage
+	}
+	return result
 }

@@ -4,41 +4,41 @@ import (
 	"time"
 )
 
-// DelayedMessageStatus 延迟消息状态
+// DelayedMessageStatus delayed message status
 type DelayedMessageStatus int32
 
 const (
-	StatusPending   DelayedMessageStatus = 0 // 等待投递
-	StatusDelivered DelayedMessageStatus = 1 // 已投递
-	StatusFailed    DelayedMessageStatus = 2 // 投递失败
-	StatusCanceled  DelayedMessageStatus = 3 // 已取消
+	StatusPending   DelayedMessageStatus = 0
+	StatusDelivered DelayedMessageStatus = 1
+	StatusFailed    DelayedMessageStatus = 2
+	StatusCanceled  DelayedMessageStatus = 3
 )
 
-// DelayLevel 延迟级别定义
+// DelayLevel delay level definition
 type DelayLevel int32
 
 const (
-	DelayLevel1s  DelayLevel = 1  // 1秒
-	DelayLevel5s  DelayLevel = 2  // 5秒
-	DelayLevel10s DelayLevel = 3  // 10秒
-	DelayLevel30s DelayLevel = 4  // 30秒
-	DelayLevel1m  DelayLevel = 5  // 1分钟
-	DelayLevel2m  DelayLevel = 6  // 2分钟
-	DelayLevel3m  DelayLevel = 7  // 3分钟
-	DelayLevel4m  DelayLevel = 8  // 4分钟
-	DelayLevel5m  DelayLevel = 9  // 5分钟
-	DelayLevel6m  DelayLevel = 10 // 6分钟
-	DelayLevel7m  DelayLevel = 11 // 7分钟
-	DelayLevel8m  DelayLevel = 12 // 8分钟
-	DelayLevel9m  DelayLevel = 13 // 9分钟
-	DelayLevel10m DelayLevel = 14 // 10分钟
-	DelayLevel20m DelayLevel = 15 // 20分钟
-	DelayLevel30m DelayLevel = 16 // 30分钟
-	DelayLevel1h  DelayLevel = 17 // 1小时
-	DelayLevel2h  DelayLevel = 18 // 2小时
+	DelayLevel1s  DelayLevel = 1
+	DelayLevel5s  DelayLevel = 2
+	DelayLevel10s DelayLevel = 3
+	DelayLevel30s DelayLevel = 4
+	DelayLevel1m  DelayLevel = 5
+	DelayLevel2m  DelayLevel = 6
+	DelayLevel3m  DelayLevel = 7
+	DelayLevel4m  DelayLevel = 8
+	DelayLevel5m  DelayLevel = 9
+	DelayLevel6m  DelayLevel = 10
+	DelayLevel7m  DelayLevel = 11
+	DelayLevel8m  DelayLevel = 12
+	DelayLevel9m  DelayLevel = 13
+	DelayLevel10m DelayLevel = 14
+	DelayLevel20m DelayLevel = 15
+	DelayLevel30m DelayLevel = 16
+	DelayLevel1h  DelayLevel = 17
+	DelayLevel2h  DelayLevel = 18
 )
 
-// DelayLevelDurations 延迟级别对应的时间
+// DelayLevelDurations delay level duration mappings
 var DelayLevelDurations = map[DelayLevel]time.Duration{
 	DelayLevel1s:  1 * time.Second,
 	DelayLevel5s:  5 * time.Second,
@@ -60,7 +60,6 @@ var DelayLevelDurations = map[DelayLevel]time.Duration{
 	DelayLevel2h:  2 * time.Hour,
 }
 
-// GetDelayDuration 获取延迟级别对应的时间
 func GetDelayDuration(level DelayLevel) time.Duration {
 	if duration, exists := DelayLevelDurations[level]; exists {
 		return duration
@@ -68,7 +67,7 @@ func GetDelayDuration(level DelayLevel) time.Duration {
 	return 0
 }
 
-// DelayedMessage 延迟消息结构
+// DelayedMessage delayed message structure
 type DelayedMessage struct {
 	ID          string               `json:"id"`
 	Topic       string               `json:"topic"`
@@ -76,28 +75,28 @@ type DelayedMessage struct {
 	Key         []byte               `json:"key,omitempty"`
 	Value       []byte               `json:"value"`
 	Headers     map[string]string    `json:"headers,omitempty"`
-	CreateTime  int64                `json:"create_time"`  // 创建时间戳(毫秒)
-	DeliverTime int64                `json:"deliver_time"` // 投递时间戳(毫秒)
+	CreateTime  int64                `json:"create_time"`
+	DeliverTime int64                `json:"deliver_time"`
 	Status      DelayedMessageStatus `json:"status"`
 	RetryCount  int                  `json:"retry_count"`
 	MaxRetries  int                  `json:"max_retries"`
 	LastError   string               `json:"last_error,omitempty"`
-	UpdateTime  int64                `json:"update_time"` // 最后更新时间
+	UpdateTime  int64                `json:"update_time"`
 }
 
-// DelayedProduceRequest 延迟消息生产请求
+// DelayedProduceRequest delayed message produce request
 type DelayedProduceRequest struct {
 	Topic       string            `json:"topic"`
 	Partition   int32             `json:"partition"`
 	Key         []byte            `json:"key,omitempty"`
 	Value       []byte            `json:"value"`
 	Headers     map[string]string `json:"headers,omitempty"`
-	DelayLevel  int32             `json:"delay_level,omitempty"`  // 延迟级别
-	DelayTime   int64             `json:"delay_time,omitempty"`   // 延迟时长(毫秒)
-	DeliverTime int64             `json:"deliver_time,omitempty"` // 投递时间戳(毫秒)
+	DelayLevel  int32             `json:"delay_level,omitempty"`
+	DelayTime   int64             `json:"delay_time,omitempty"`
+	DeliverTime int64             `json:"deliver_time,omitempty"`
 }
 
-// DelayedProduceResponse 延迟消息生产响应
+// DelayedProduceResponse delayed message produce response
 type DelayedProduceResponse struct {
 	MessageID   string `json:"message_id"`
 	Topic       string `json:"topic"`
@@ -107,23 +106,19 @@ type DelayedProduceResponse struct {
 	Error       string `json:"error,omitempty"`
 }
 
-// IsExpired 检查消息是否已到期
 func (dm *DelayedMessage) IsExpired() bool {
 	return time.Now().UnixMilli() >= dm.DeliverTime
 }
 
-// CanRetry 检查消息是否可以重试
 func (dm *DelayedMessage) CanRetry() bool {
 	return dm.RetryCount < dm.MaxRetries
 }
 
-// MarkDelivered 标记消息为已投递
 func (dm *DelayedMessage) MarkDelivered() {
 	dm.Status = StatusDelivered
 	dm.UpdateTime = time.Now().UnixMilli()
 }
 
-// MarkFailed 标记消息投递失败
 func (dm *DelayedMessage) MarkFailed(err string) {
 	dm.Status = StatusFailed
 	dm.LastError = err
@@ -131,37 +126,26 @@ func (dm *DelayedMessage) MarkFailed(err string) {
 	dm.UpdateTime = time.Now().UnixMilli()
 }
 
-// CalculateDeliverTime 计算投递时间
 func CalculateDeliverTime(delayLevel DelayLevel, delayTime int64, deliverTime int64) int64 {
 	now := time.Now().UnixMilli()
 
-	// 优先使用明确指定的投递时间
 	if deliverTime > 0 {
 		return deliverTime
 	}
 
-	// 其次使用延迟时长
 	if delayTime > 0 {
 		return now + delayTime
 	}
 
-	// 最后使用延迟级别
 	if duration := GetDelayDuration(delayLevel); duration > 0 {
 		return now + duration.Milliseconds()
 	}
 
-	// 默认延迟1秒
 	return now + 1000
 }
 
-// Constants for time wheel
 const (
-	// TimeWheelTickMs 时间轮刻度（毫秒）
-	TimeWheelTickMs = 1000 // 1秒
-
-	// TimeWheelSize 时间轮大小
-	TimeWheelSize = 3600 // 1小时，3600秒
-
-	// MaxDelayTime 最大延迟时间（40天）
-	MaxDelayTime = 40 * 24 * time.Hour
+	TimeWheelTickMs = 1000
+	TimeWheelSize   = 3600
+	MaxDelayTime    = 40 * 24 * time.Hour
 )

@@ -252,7 +252,7 @@ func (c *Client) setControllerAddr(addr string) {
 
 // sendMetaRequest sends request and handles response
 func (c *Client) sendMetaRequest(requestType int32, requestData []byte) ([]byte, error) {
-	log.Printf("Sending meta request type: %d, data length: %d", requestType, len(requestData))
+	log.Printf("Sending meta request type: %d, data length: %d, client timeout: %v", requestType, len(requestData), c.timeout)
 	var conn net.Conn
 	var err error
 
@@ -265,7 +265,9 @@ func (c *Client) sendMetaRequest(requestType int32, requestData []byte) ([]byte,
 	}
 	defer conn.Close()
 
-	conn.SetDeadline(time.Now().Add(c.timeout))
+	deadline := time.Now().Add(c.timeout)
+	conn.SetDeadline(deadline)
+	log.Printf("Set connection deadline to: %v (timeout: %v)", deadline, c.timeout)
 
 	log.Printf("Sending request type: %d", requestType)
 	if err := binary.Write(conn, binary.BigEndian, requestType); err != nil {
@@ -287,10 +289,10 @@ func (c *Client) sendMetaRequest(requestType int32, requestData []byte) ([]byte,
 		return nil, fmt.Errorf("failed to send request data: %v", err)
 	}
 
-	log.Printf("Reading response length...")
+	log.Printf("Reading response length... (remaining time until deadline: %v)", time.Until(deadline))
 	var responseLen int32
 	if err := binary.Read(conn, binary.BigEndian, &responseLen); err != nil {
-		log.Printf("Failed to read response length: %v", err)
+		log.Printf("Failed to read response length: %v (remaining time: %v)", err, time.Until(deadline))
 		return nil, fmt.Errorf("failed to read response length: %v", err)
 	}
 	log.Printf("Response length: %d", responseLen)
@@ -299,10 +301,11 @@ func (c *Client) sendMetaRequest(requestType int32, requestData []byte) ([]byte,
 
 	responseData := make([]byte, actualDataLen)
 	if _, err := io.ReadFull(conn, responseData); err != nil {
-		log.Printf("Failed to read response data: %v", err)
+		log.Printf("Failed to read response data: %v (remaining time: %v)", err, time.Until(deadline))
 		return nil, fmt.Errorf("failed to read response data: %v", err)
 	}
 
+	log.Printf("Successfully completed meta request, total time used: %v", c.timeout-time.Until(deadline))
 	return responseData, nil
 }
 

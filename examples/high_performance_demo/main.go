@@ -12,14 +12,14 @@ import (
 )
 
 func main() {
-	fmt.Println("=== Go Queue 高性能客户端演示 ===")
+	fmt.Println("=== Go Queue High Performance Client Demo ===")
 
-	// 配置高性能客户端
+	// Configure high performance client
 	config := client.ClientConfig{
 		BrokerAddrs: []string{"localhost:9092"},
 		Timeout:     5 * time.Second,
 
-		// 性能优化配置
+		// Performance optimization configuration
 		EnableConnectionPool: true,
 		EnableAsyncIO:        true,
 		ConnectionPool: pool.ConnectionPoolConfig{
@@ -40,43 +40,43 @@ func main() {
 			MaxConnections: 1000,
 		},
 
-		// 批量处理配置
+		// Batch processing configuration
 		BatchSize:       100,
 		BatchTimeout:    10 * time.Millisecond,
 		MaxPendingBatch: 2000,
 	}
 
-	// 创建高性能客户端
+	// Create high performance client
 	hpClient := client.NewClient(config)
 	defer hpClient.Close()
 
-	// 首先创建必要的topic
-	fmt.Println("\n0. 创建测试topic...")
+	// First create necessary topics
+	fmt.Println("\n0. Creating test topics...")
 	createTestTopics(config)
 
-	// 创建生产者
+	// Create producer
 	producer := client.NewProducer(hpClient)
 
-	fmt.Println("\n1. 性能基准测试...")
+	fmt.Println("\n1. Performance benchmark test...")
 	runPerformanceBenchmark(producer)
 
-	fmt.Println("\n2. 批量处理演示...")
+	fmt.Println("\n2. Batch processing demo...")
 	runBatchProcessingDemo(producer)
 
-	fmt.Println("\n3. 获取性能统计...")
+	fmt.Println("\n3. Get performance statistics...")
 	showPerformanceStats(hpClient)
 
-	fmt.Println("\n演示完成！")
+	fmt.Println("\nDemo completed!")
 }
 
-// runPerformanceBenchmark 运行性能基准测试
+// runPerformanceBenchmark runs performance benchmark test
 func runPerformanceBenchmark(producer *client.Producer) {
-	messageCount := 100 // 减少消息数量以便演示
+	messageCount := 100 // Reduce message count for demo
 	messageSize := 1024 // 1KB per message
 
-	fmt.Printf("发送 %d 条消息，每条 %d 字节...\n", messageCount, messageSize)
+	fmt.Printf("Sending %d messages, %d bytes each...\n", messageCount, messageSize)
 
-	// 准备测试数据
+	// Prepare test data
 	payload := make([]byte, messageSize)
 	for i := range payload {
 		payload[i] = byte(i % 256)
@@ -84,7 +84,7 @@ func runPerformanceBenchmark(producer *client.Producer) {
 
 	start := time.Now()
 
-	// 批量发送消息
+	// Batch send messages
 	var wg sync.WaitGroup
 	batchSize := 10
 	for i := 0; i < messageCount; i += batchSize {
@@ -116,21 +116,21 @@ func runPerformanceBenchmark(producer *client.Producer) {
 	wg.Wait()
 	duration := time.Since(start)
 
-	// 计算性能指标
+	// Calculate performance metrics
 	throughput := float64(messageCount) / duration.Seconds()
 	dataRate := float64(messageCount*messageSize) / duration.Seconds() / (1024 * 1024) // MB/s
 
-	fmt.Printf("✅ 发送完成!\n")
-	fmt.Printf("   - 总时间: %v\n", duration)
-	fmt.Printf("   - 吞吐量: %.2f msg/s\n", throughput)
-	fmt.Printf("   - 数据速率: %.2f MB/s\n", dataRate)
+	fmt.Printf("✅ Send completed!\n")
+	fmt.Printf("   - Total time: %v\n", duration)
+	fmt.Printf("   - Throughput: %.2f msg/s\n", throughput)
+	fmt.Printf("   - Data rate: %.2f MB/s\n", dataRate)
 }
 
-// runBatchProcessingDemo 运行批量处理演示
+// runBatchProcessingDemo runs batch processing demo
 func runBatchProcessingDemo(producer *client.Producer) {
-	fmt.Println("演示批量处理优化...")
+	fmt.Println("Demonstrating batch processing optimization...")
 
-	// 创建批量消息
+	// Create batch messages
 	messages := make([]client.ProduceMessage, 50)
 	for i := range messages {
 		messages[i] = client.ProduceMessage{
@@ -149,55 +149,55 @@ func runBatchProcessingDemo(producer *client.Producer) {
 		return
 	}
 
-	fmt.Printf("✅ 批量发送完成!\n")
-	fmt.Printf("   - 消息数量: %d\n", len(messages))
-	fmt.Printf("   - 发送时间: %v\n", duration)
-	fmt.Printf("   - 起始偏移量: %d\n", result.Offset)
+	fmt.Printf("✅ Batch send completed!\n")
+	fmt.Printf("   - Message count: %d\n", len(messages))
+	fmt.Printf("   - Send time: %v\n", duration)
+	fmt.Printf("   - Starting offset: %d\n", result.Offset)
 }
 
-// showPerformanceStats 显示性能统计
+// showPerformanceStats displays performance statistics
 func showPerformanceStats(client *client.Client) {
-	fmt.Println("=== 性能统计信息 ===")
+	fmt.Println("=== Performance Statistics ===")
 
 	stats := client.GetStats()
 
-	// 客户端统计
-	fmt.Printf("📊 客户端统计:\n")
-	fmt.Printf("  - Topic缓存数: %d\n", stats.TopicCount)
-	fmt.Printf("  - 元数据TTL: %v\n", stats.MetadataTTL)
+	// Client statistics
+	fmt.Printf("📊 Client Statistics:\n")
+	fmt.Printf("  - Topic cache count: %d\n", stats.TopicCount)
+	fmt.Printf("  - Metadata TTL: %v\n", stats.MetadataTTL)
 
-	// 连接池统计
+	// Connection pool statistics
 	if stats.ConnectionPool.TotalConnections > 0 {
-		fmt.Printf("\n🔗 连接池统计:\n")
-		fmt.Printf("  - 总连接数: %d\n", stats.ConnectionPool.TotalConnections)
-		fmt.Printf("  - 活跃连接数: %d\n", stats.ConnectionPool.ActiveConnections)
-		fmt.Printf("  - Broker连接池数: %d\n", len(stats.ConnectionPool.BrokerStats))
+		fmt.Printf("\n🔗 Connection Pool Statistics:\n")
+		fmt.Printf("  - Total connections: %d\n", stats.ConnectionPool.TotalConnections)
+		fmt.Printf("  - Active connections: %d\n", stats.ConnectionPool.ActiveConnections)
+		fmt.Printf("  - Broker connection pools: %d\n", len(stats.ConnectionPool.BrokerStats))
 
 		for addr, brokerStats := range stats.ConnectionPool.BrokerStats {
-			fmt.Printf("    - %s: 总连接=%d, 活跃=%d, 池大小=%d\n",
+			fmt.Printf("    - %s: Total=%d, Active=%d, Pool size=%d\n",
 				addr, brokerStats.TotalConnections, brokerStats.ActiveConnections, brokerStats.PoolSize)
 		}
 	}
 
-	// 异步IO统计
+	// Async IO statistics
 	if stats.AsyncIO.WorkerCount > 0 {
-		fmt.Printf("\n⚡ 异步IO统计:\n")
-		fmt.Printf("  - 总连接数: %d\n", stats.AsyncIO.TotalConnections)
-		fmt.Printf("  - 活跃连接数: %d\n", stats.AsyncIO.ActiveConnections)
-		fmt.Printf("  - Worker数量: %d\n", stats.AsyncIO.WorkerCount)
-		fmt.Printf("  - 提交队列大小: %d\n", stats.AsyncIO.SQSize)
-		fmt.Printf("  - 完成队列大小: %d\n", stats.AsyncIO.CQSize)
+		fmt.Printf("\n⚡ Async IO Statistics:\n")
+		fmt.Printf("  - Total connections: %d\n", stats.AsyncIO.TotalConnections)
+		fmt.Printf("  - Active connections: %d\n", stats.AsyncIO.ActiveConnections)
+		fmt.Printf("  - Worker count: %d\n", stats.AsyncIO.WorkerCount)
+		fmt.Printf("  - Submit queue size: %d\n", stats.AsyncIO.SQSize)
+		fmt.Printf("  - Completion queue size: %d\n", stats.AsyncIO.CQSize)
 	}
 
-	// 计算效率指标
-	fmt.Printf("\n🚀 性能优化特性:\n")
-	fmt.Println("✅ 连接池: 复用连接，减少建立/关闭开销")
-	fmt.Println("✅ 异步IO: 非阻塞操作，提高并发性能")
-	fmt.Println("✅ 批量处理: 减少网络往返，提高吞吐量")
-	fmt.Println("✅ 智能缓冲: 自动调节批量大小和时间")
+	// Calculate efficiency metrics
+	fmt.Printf("\n🚀 Performance Optimization Features:\n")
+	fmt.Println("✅ Connection Pool: Reuse connections, reduce establishment/closure overhead")
+	fmt.Println("✅ Async IO: Non-blocking operations, improve concurrent performance")
+	fmt.Println("✅ Batch Processing: Reduce network round trips, improve throughput")
+	fmt.Println("✅ Smart Buffering: Automatically adjust batch size and timing")
 }
 
-// createTestTopics 创建测试需要的topic
+// createTestTopics creates topics needed for testing
 func createTestTopics(config client.ClientConfig) {
 	baseClient := client.NewClient(config)
 	admin := client.NewAdmin(baseClient)
@@ -223,6 +223,6 @@ func createTestTopics(config client.ClientConfig) {
 		}
 	}
 
-	// 等待topic创建完成
+	// Wait for topic creation to complete
 	time.Sleep(2 * time.Second)
 }

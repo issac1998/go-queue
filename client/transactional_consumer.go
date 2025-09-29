@@ -52,13 +52,13 @@ func NewTransactionalConsumer(client *Client, config TransactionalConsumerConfig
 
 	groupConsumer := NewGroupConsumer(client, config.GroupConsumerConfig)
 
-	transactionManagerConfig := ConsumerTransactionManagerConfig{
+	ManagerConfig := ConsumerManagerConfig{
 		GroupID:         config.GroupID,
 		ConsumerID:      config.ConsumerID,
 		DefaultTimeout:  config.TransactionTimeout,
 		CleanupInterval: 5 * time.Minute,
 	}
-	transactionManager := NewConsumerTransactionManager(client, transactionManagerConfig)
+	transactionManager := NewConsumerTransactionManager(client, ManagerConfig)
 
 	var idempotentManager *IdempotentManager
 	if config.EnableIdempotent {
@@ -122,7 +122,6 @@ func (tc *TransactionalConsumer) ConsumeTransactionally(ctx context.Context, han
 		}
 		tc.mu.RUnlock()
 
-		
 		messages, err := tc.groupConsumer.Poll(5 * time.Second)
 		if err != nil {
 			log.Printf("Failed to poll messages: %v", err)
@@ -157,7 +156,6 @@ func (tc *TransactionalConsumer) ConsumeTransactionallyWithManualCommit(ctx cont
 		}
 		tc.mu.RUnlock()
 
-		
 		messages, err := tc.groupConsumer.Poll(5 * time.Second)
 		if err != nil {
 			log.Printf("Failed to poll messages: %v", err)
@@ -246,7 +244,6 @@ func (tc *TransactionalConsumer) processBatch(ctx context.Context, messages []*C
 		}
 	}
 
-	
 	err = tc.commitOffsets(filteredMessages, transaction)
 	if err != nil {
 		return fmt.Errorf("failed to commit offsets: %v", err)
