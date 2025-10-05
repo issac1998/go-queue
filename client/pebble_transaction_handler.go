@@ -82,12 +82,10 @@ func (pth *PebbleTransactionHandler) UnregisterListener(producerGroup string) {
 
 // CheckTransaction 检查事务状态
 func (pth *PebbleTransactionHandler) CheckTransaction(producerGroup, transactionID string, messageKey, messageValue []byte) transaction.TransactionState {
-	// 首先尝试从PebbleDB获取缓存的状态
 	if state := pth.getCachedTransactionState(producerGroup, transactionID); state != transaction.StateUnknown {
 		return state
 	}
 
-	// 如果没有缓存状态，使用监听器检查
 	pth.mu.RLock()
 	listener, exists := pth.listeners[producerGroup]
 	pth.mu.RUnlock()
@@ -97,16 +95,9 @@ func (pth *PebbleTransactionHandler) CheckTransaction(producerGroup, transaction
 		return transaction.StateUnknown
 	}
 
-	// 构造HalfMessage
-	halfMessage := transaction.HalfMessage{
-		Key:   messageKey,
-		Value: messageValue,
-	}
+	// 使用transactionID作为messageID传递给listener
+	state := listener.CheckLocalTransaction(transaction.TransactionID(transactionID), transactionID)
 
-	// 使用标准TransactionListener接口
-	state := listener.CheckLocalTransaction(transaction.TransactionID(transactionID), halfMessage)
-
-	// 缓存状态到PebbleDB
 	pth.cacheTransactionState(producerGroup, transactionID, messageKey, messageValue, state)
 
 	return state

@@ -21,13 +21,14 @@ type PebbleTransactionManager struct {
 
 // PebbleHalfMessage PebbleDB存储的半消息结构
 type PebbleHalfMessage struct {
-	TransactionID string           `json:"transaction_id"`
-	Topic         string           `json:"topic"`
-	Partition     int32            `json:"partition"`
-	Data          []byte           `json:"data"`
-	CreatedAt     time.Time        `json:"created_at"`
-	ExpiresAt     time.Time        `json:"expires_at"`
-	State         TransactionState `json:"state"`
+	TransactionID   string           `json:"transaction_id"`
+	Topic           string           `json:"topic"`
+	Partition       int32            `json:"partition"`
+	Data            []byte           `json:"data"`
+	CallbackAddress string           `json:"callback_address"`
+	CreatedAt       time.Time        `json:"created_at"`
+	ExpiresAt       time.Time        `json:"expires_at"`
+	State           TransactionState `json:"state"`
 }
 
 // NewPebbleTransactionManager 创建基于PebbleDB的事务管理器
@@ -90,13 +91,14 @@ func (ptm *PebbleTransactionManager) PrepareTransaction(req *TransactionPrepareR
 
 	now := time.Now()
 	halfMsg := &PebbleHalfMessage{
-		TransactionID: txnID,
-		Topic:         req.Topic,
-		Partition:     req.Partition,
-		Data:          req.Value,
-		CreatedAt:     now,
-		ExpiresAt:     now.Add(timeout),
-		State:         StatePrepared,
+		TransactionID:   txnID,
+		Topic:           req.Topic,
+		Partition:       req.Partition,
+		Data:            req.Value,
+		CallbackAddress: req.CallbackAddress,
+		CreatedAt:       now,
+		ExpiresAt:       now.Add(timeout),
+		State:           StatePrepared,
 	}
 
 	// 序列化半消息
@@ -350,13 +352,13 @@ func (ptm *PebbleTransactionManager) GetStats() (map[string]interface{}, error) 
 	metrics := ptm.db.Metrics()
 
 	stats := map[string]interface{}{
-		"db_path":           ptm.dbPath,
-		"memtable_size":     metrics.MemTable.Size,
-		"cache_size":        metrics.BlockCache.Size,
-		"cache_hit_rate":    float64(metrics.BlockCache.Hits) / float64(metrics.BlockCache.Hits+metrics.BlockCache.Misses),
-		"compaction_count":  metrics.Compact.Count,
-		"flush_count":       metrics.Flush.Count,
-		"active_txn_count":  ptm.GetActiveTransactionCount(),
+		"db_path":          ptm.dbPath,
+		"memtable_size":    metrics.MemTable.Size,
+		"cache_size":       metrics.BlockCache.Size,
+		"cache_hit_rate":   float64(metrics.BlockCache.Hits) / float64(metrics.BlockCache.Hits+metrics.BlockCache.Misses),
+		"compaction_count": metrics.Compact.Count,
+		"flush_count":      metrics.Flush.Count,
+		"active_txn_count": ptm.GetActiveTransactionCount(),
 	}
 
 	return stats, nil

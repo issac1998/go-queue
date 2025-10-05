@@ -36,6 +36,11 @@ const (
 	TransactionCheckStateRequestType int32 = 33
 	OrderedProduceRequestType      int32 = 22
 
+	// Batch transaction request types
+	BatchTransactionPrepareRequestType  int32 = 34
+	BatchTransactionCommitRequestType   int32 = 35
+	BatchTransactionRollbackRequestType int32 = 36
+
 	// Consumer transaction request types
 	ConsumerBeginTransactionRequestType  int32 = 23
 	ConsumerCommitTransactionRequestType int32 = 24
@@ -88,6 +93,9 @@ const (
 	ErrorRebalanceInProgress = 32
 	ErrorGenerationMismatch  = 33
 
+	// Transaction errors
+	ErrorTransactionNotFound = 40
+
 	// Transaction states
 	TransactionStateUnknown  int16 = 0
 	TransactionStateCommit   int16 = 1
@@ -122,6 +130,9 @@ var RequestTypeNames = map[int32]string{
 	TransactionCommitRequestType:         "TRANSACTION_COMMIT",
 	TransactionRollbackRequestType:       "TRANSACTION_ROLLBACK",
 	TransactionCheckRequestType:          "TRANSACTION_CHECK",
+	BatchTransactionPrepareRequestType:   "BATCH_TRANSACTION_PREPARE",
+	BatchTransactionCommitRequestType:    "BATCH_TRANSACTION_COMMIT",
+	BatchTransactionRollbackRequestType:  "BATCH_TRANSACTION_ROLLBACK",
 	OrderedProduceRequestType:            "ORDERED_PRODUCE",
 	ConsumerBeginTransactionRequestType:  "CONSUMER_BEGIN_TRANSACTION",
 	ConsumerCommitTransactionRequestType: "CONSUMER_COMMIT_TRANSACTION",
@@ -161,6 +172,7 @@ var ErrorCodeNames = map[int16]string{
 	ErrorUnknownMember:       "UNKNOWN_MEMBER",
 	ErrorRebalanceInProgress: "REBALANCE_IN_PROGRESS",
 	ErrorGenerationMismatch:  "GENERATION_MISMATCH",
+	ErrorTransactionNotFound: "TRANSACTION_NOT_FOUND",
 }
 
 // GetErrorCodeName returns the human-readable name for an error code

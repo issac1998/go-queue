@@ -13,13 +13,25 @@ import (
 // MockTransactionListener 模拟事务监听器
 type MockTransactionListener struct{}
 
-func (m *MockTransactionListener) ExecuteLocalTransaction(transactionID transaction.TransactionID, message transaction.HalfMessage) transaction.TransactionState {
+func (m *MockTransactionListener) ExecuteLocalTransaction(transactionID transaction.TransactionID, messageID string) transaction.TransactionState {
 	// 模拟本地事务执行成功
 	return transaction.StateCommit
 }
 
-func (m *MockTransactionListener) CheckLocalTransaction(transactionID transaction.TransactionID, message transaction.HalfMessage) transaction.TransactionState {
+func (m *MockTransactionListener) CheckLocalTransaction(transactionID transaction.TransactionID, messageID string) transaction.TransactionState {
 	// 模拟检查本地事务状态
+	return transaction.StateCommit
+}
+
+// ExecuteBatchLocalTransaction 执行批量本地事务
+func (m *MockTransactionListener) ExecuteBatchLocalTransaction(transactionID transaction.TransactionID, messageIDs []string) transaction.TransactionState {
+	// 模拟批量本地事务执行成功
+	return transaction.StateCommit
+}
+
+// CheckBatchLocalTransaction 检查批量本地事务状态
+func (m *MockTransactionListener) CheckBatchLocalTransaction(transactionID transaction.TransactionID, messageIDs []string) transaction.TransactionState {
+	// 模拟检查批量本地事务状态
 	return transaction.StateCommit
 }
 

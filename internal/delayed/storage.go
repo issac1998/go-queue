@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/issac1998/go-queue/internal/utils"
 )
 
 // DelayedMessageStorage interface for delayed message storage operations
@@ -304,37 +305,43 @@ func (s *PebbleDelayedMessageStorage) CleanupDelivered(beforeTime time.Time) err
 		return fmt.Errorf("failed to get delivered messages: %w", err)
 	}
 
-	// 删除创建时间在beforeTime之前的已投递消息
-	batch := s.db.NewBatch()
-	defer batch.Close()
+	// 使用新的清理工具函数，提供重试机制和更好的错误处理
+	config := &utils.CleanupConfig{
+		MaxRetries:      3,
+		InitialDelay:    100 * time.Millisecond,
+		MaxDelay:        2 * time.Second,
+		BackoffFactor:   2.0,
+		UseSync:         false, // 使用更宽松的提交选项
+		BatchSize:       1000,
+		LogErrors:       true,
+	}
 
-	deletedCount := 0
+	cleanupManager := utils.NewCleanupManager(config)
+	
+	var expiredKeys [][]byte
+	
+	// 删除创建时间在beforeTime之前的已投递消息
 	for _, message := range deliveredMessages {
 		if message.CreateTime < beforeTime.UnixMilli() {
-			// 删除消息数据
+			// 收集需要删除的键
 			dataKey := DelayedMessagePrefix + message.ID
-			if err := batch.Delete([]byte(dataKey), pebble.Sync); err != nil {
-				continue
-			}
+			expiredKeys = append(expiredKeys, []byte(dataKey))
 
 			// 删除投递时间索引
 			deliverKey := s.buildDeliverIndexKey(message.DeliverTime, message.ID)
-			if err := batch.Delete([]byte(deliverKey), pebble.Sync); err != nil {
-				continue
-			}
+			expiredKeys = append(expiredKeys, []byte(deliverKey))
 
 			// 删除状态索引
 			statusKey := s.buildStatusIndexKey(message.Status, message.ID)
-			if err := batch.Delete([]byte(statusKey), pebble.Sync); err != nil {
-				continue
-			}
-
-			deletedCount++
+			expiredKeys = append(expiredKeys, []byte(statusKey))
 		}
 	}
 
-	if err := batch.Commit(pebble.Sync); err != nil {
-		return fmt.Errorf("failed to commit cleanup batch: %w", err)
+	if len(expiredKeys) > 0 {
+		err := cleanupManager.BatchCleanupWithRetry("delayed_cleanup", s.db, expiredKeys)
+		if err != nil {
+			return fmt.Errorf("failed to cleanup delivered delayed messages: %w", err)
+		}
 	}
 
 	return nil

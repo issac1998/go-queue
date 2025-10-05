@@ -33,19 +33,6 @@ func (c *DefaultTransactionChecker) RegisterProducerGroup(group, callbackAddr st
 	c.producerGroupBrokers[group] = callbackAddr
 }
 
-// CheckTransactionState check txn
-// ->broker->produce linstener
-func (c *DefaultTransactionChecker) CheckTransactionState(transactionID TransactionID, originalMessage HalfMessage) TransactionState {
-	log.Printf("Checking transaction state for: %s", transactionID)
-
-	callbackAddr, exists := c.producerGroupBrokers[originalMessage.ProducerGroup]
-	if !exists {
-		log.Printf("No broker registered for producer group: %s", originalMessage.ProducerGroup)
-		return StateUnknown
-	}
-
-	return c.CheckTransactionStateNet(callbackAddr, transactionID, originalMessage)
-}
 
 // CheckTransactionStateWithBroker check status
 func (c *DefaultTransactionChecker) CheckTransactionStateNet(callbackAddr string, transactionID TransactionID, originalMessage HalfMessage) TransactionState {
@@ -60,10 +47,10 @@ func (c *DefaultTransactionChecker) CheckTransactionStateNet(callbackAddr string
 	conn.SetDeadline(deadline)
 
 	request := &TransactionCheckRequest{
-		TransactionID:   transactionID,
-		Topic:           originalMessage.Topic,
-		Partition:       originalMessage.Partition,
-		OriginalMessage: originalMessage,
+		TransactionID: transactionID,
+		Topic:         originalMessage.Topic,
+		Partition:     originalMessage.Partition,
+		MessageID:     string(originalMessage.TransactionID), // 使用TransactionID作为MessageID
 	}
 
 	if err := c.sendCheckRequest(conn, request); err != nil {

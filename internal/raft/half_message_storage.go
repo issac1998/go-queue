@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/issac1998/go-queue/internal/utils"
 )
 
 // HalfMessageStorage 定义 HalfMessage 存储接口
@@ -140,7 +141,6 @@ func (s *PebbleHalfMessageStorage) Delete(transactionID string) error {
 	return nil
 }
 
-// CleanupExpired clean expired HalfMessage
 // GetExpired get expired HalfMessage
 func (s *PebbleHalfMessageStorage) GetExpired() ([]*HalfMessageRecord, error) {
 	now := time.Now()
@@ -184,19 +184,19 @@ func (s *PebbleHalfMessageStorage) GetExpired() ([]*HalfMessageRecord, error) {
 	return expiredMessages, nil
 }
 
-// Update 更新 HalfMessage
+// Update update HalfMessage
 func (s *PebbleHalfMessageStorage) Update(transactionID string, halfMessage *HalfMessageRecord) error {
-	// 更新操作与存储操作相同，会覆盖原有数据
 	return s.Store(transactionID, halfMessage)
 }
 
+// CleanupExpired clean expired HalfMessage
 func (s *PebbleHalfMessageStorage) CleanupExpired() (int, error) {
 	now := time.Now()
 	expiredCount := 0
 
 	iter := s.db.NewIter(&pebble.IterOptions{
 		LowerBound: []byte(ExpireIndexPrefix),
-		UpperBound: []byte(ExpireIndexPrefix + "~"), // ~ 是比所有数字都大的字符
+		UpperBound: []byte(ExpireIndexPrefix + "~"), 
 	})
 	defer iter.Close()
 
@@ -235,25 +235,34 @@ func (s *PebbleHalfMessageStorage) CleanupExpired() (int, error) {
 	}
 
 	if len(expiredKeys) > 0 {
-		batch := s.db.NewBatch()
-
-		for _, key := range expiredKeys {
-			batch.Delete(key, nil)
+		// 使用新的清理工具函数，提供重试机制和更好的错误处理
+		config := &utils.CleanupConfig{
+			MaxRetries:      3,
+			InitialDelay:    100 * time.Millisecond,
+			MaxDelay:        2 * time.Second,
+			BackoffFactor:   2.0,
+			UseSync:         false, // 使用更宽松的提交选项
+			BatchSize:       1000,
+			LogErrors:       true,
 		}
 
-		for _, key := range expiredIndexKeys {
-			batch.Delete(key, nil)
-		}
+		cleanupManager := utils.NewCleanupManager(config)
+		
+		// 准备要删除的键
+		allKeys := make([][]byte, 0, len(expiredKeys)+len(expiredIndexKeys))
+		allKeys = append(allKeys, expiredKeys...)
+		allKeys = append(allKeys, expiredIndexKeys...)
 
-		if err := batch.Commit(pebble.Sync); err != nil {
-			return 0, fmt.Errorf("failed to commit cleanup batch: %w", err)
+		err := cleanupManager.BatchCleanupWithRetry("half_message_cleanup", s.db, allKeys)
+		if err != nil {
+			return 0, fmt.Errorf("failed to cleanup expired half messages: %w", err)
 		}
 	}
 
 	return expiredCount, nil
 }
 
-// Close 关闭存储
+// Close close
 func (s *PebbleHalfMessageStorage) Close() error {
 	if s.db != nil {
 		if err := s.db.Close(); err != nil {
