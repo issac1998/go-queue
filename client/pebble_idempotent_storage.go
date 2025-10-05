@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/issac1998/go-queue/internal/utils"
 )
 
 // PebbleIdempotentStorage implements IdempotentStorage using PebbleDB
@@ -123,10 +124,20 @@ func (p *PebbleIdempotentStorage) CleanupExpired(expiration time.Duration) error
 	iter := p.db.NewIter(nil)
 	defer iter.Close()
 	
-	batch := p.db.NewBatch()
-	defer batch.Close()
+	// 使用新的清理工具函数，提供重试机制和更好的错误处理
+	config := &utils.CleanupConfig{
+		MaxRetries:      3,
+		InitialDelay:    100 * time.Millisecond,
+		MaxDelay:        2 * time.Second,
+		BackoffFactor:   2.0,
+		UseSync:         false, // 使用更宽松的提交选项
+		BatchSize:       1000,
+		LogErrors:       true,
+	}
+
+	cleanupManager := utils.NewCleanupManager(config)
 	
-	deletedCount := 0
+	var expiredKeys [][]byte
 	
 	for iter.First(); iter.Valid(); iter.Next() {
 		// Deserialize the record to check expiration
@@ -138,19 +149,10 @@ func (p *PebbleIdempotentStorage) CleanupExpired(expiration time.Duration) error
 		
 		// Check if record is expired
 		if record.ProcessedAt.Before(cutoffTime) {
-			if err := batch.Delete(iter.Key(), nil); err != nil {
-				return fmt.Errorf("failed to delete expired record: %w", err)
-			}
-			deletedCount++
-		}
-		
-		// Commit batch in chunks to avoid memory issues
-		if deletedCount%1000 == 0 && deletedCount > 0 {
-			if err := batch.Commit(pebble.Sync); err != nil {
-				return fmt.Errorf("failed to commit cleanup batch: %w", err)
-			}
-			batch.Close()
-			batch = p.db.NewBatch()
+			// 复制键，因为iter.Key()返回的切片在迭代器移动后可能会被修改
+			key := make([]byte, len(iter.Key()))
+			copy(key, iter.Key())
+			expiredKeys = append(expiredKeys, key)
 		}
 	}
 	
@@ -158,10 +160,10 @@ func (p *PebbleIdempotentStorage) CleanupExpired(expiration time.Duration) error
 		return fmt.Errorf("iterator error during cleanup: %w", err)
 	}
 	
-	// Commit remaining deletions
-	if deletedCount%1000 != 0 {
-		if err := batch.Commit(pebble.Sync); err != nil {
-			return fmt.Errorf("failed to commit final cleanup batch: %w", err)
+	if len(expiredKeys) > 0 {
+		err := cleanupManager.BatchCleanupWithRetry("idempotent_cleanup", p.db, expiredKeys)
+		if err != nil {
+			return fmt.Errorf("failed to cleanup expired idempotent records: %w", err)
 		}
 	}
 	

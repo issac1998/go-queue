@@ -140,7 +140,7 @@ type ProduceMessage struct {
 	SequenceNumber int64
 	AsyncIO        bool
 	Topic          string
-	Partition      int32
+	Partition      int32 //can be 0 to let client choose partition
 	Key            []byte
 	Value          []byte
 }
@@ -182,17 +182,18 @@ func (p *Producer) SendBatch(messages []ProduceMessage) (*ProduceResult, error) 
 		if err != nil {
 			return nil, fmt.Errorf("failed to select partition: %v", err)
 		}
-		producerID := p.client.GetProducerID()
-		stateManager := p.client.GetDeduplicatorManager()
 
-		for i := range messages {
-			messages[i].Partition = partition
-			messages[i].AsyncIO = p.client.config.EnableAsyncIO
-			if p.client.IsdeduplicatorEnabled() {
-				messages[i].ProducerID = producerID
-				messages[i].SequenceNumber = stateManager.GetNextSequenceNumber(producerID, messages[i].Partition)
-			}
+	}
 
+	producerID := p.client.GetProducerID()
+	stateManager := p.client.GetDeduplicatorManager()
+
+	for i := range messages {
+		messages[i].Partition = partition
+		messages[i].AsyncIO = p.client.config.EnableAsyncIO
+		if p.client.IsdeduplicatorEnabled() {
+			messages[i].ProducerID = producerID
+			messages[i].SequenceNumber = stateManager.GetNextSequenceNumber(producerID, messages[i].Partition)
 		}
 	}
 

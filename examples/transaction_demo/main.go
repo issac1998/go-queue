@@ -28,14 +28,13 @@ type MyTransactionListener struct {
 }
 
 // ExecuteLocalTransaction 执行本地事务
-func (l *MyTransactionListener) ExecuteLocalTransaction(transactionID transaction.TransactionID, message transaction.HalfMessage) transaction.TransactionState {
-	orderID := string(message.Key)
-	log.Printf("💰 执行本地事务 - 订单ID: %s, 事务ID: %s", orderID, transactionID)
+func (l *MyTransactionListener) ExecuteLocalTransaction(transactionID transaction.TransactionID, messageID string) transaction.TransactionState {
+	log.Printf("💰 执行本地事务 - 消息ID: %s, 事务ID: %s", messageID, transactionID)
 
 	// 模拟订单处理
-	order, exists := l.orderService.orders[orderID]
+	order, exists := l.orderService.orders[messageID]
 	if !exists {
-		log.Printf("❌ 订单不存在: %s", orderID)
+		log.Printf("❌ 订单不存在: %s", messageID)
 		return transaction.StateRollback
 	}
 
@@ -43,37 +42,108 @@ func (l *MyTransactionListener) ExecuteLocalTransaction(transactionID transactio
 	if rand.Float32() < 0.8 { // 80% 成功率
 		// 支付成功
 		order.Status = "paid"
-		log.Printf("✅ 订单支付成功: %s, 金额: %.2f", orderID, order.Amount)
+		log.Printf("✅ 订单支付成功: %s, 金额: %.2f", messageID, order.Amount)
 		return transaction.StateCommit
 	} else {
 		// 支付失败
 		order.Status = "cancelled"
-		log.Printf("❌ 订单支付失败: %s", orderID)
+		log.Printf("❌ 订单支付失败: %s", messageID)
 		return transaction.StateRollback
 	}
 }
 
 // CheckLocalTransaction 检查本地事务状态（用于回查）
-func (l *MyTransactionListener) CheckLocalTransaction(transactionID transaction.TransactionID, message transaction.HalfMessage) transaction.TransactionState {
-	orderID := string(message.Key)
-	log.Printf("🔍 检查本地事务状态 - 订单ID: %s, 事务ID: %s", orderID, transactionID)
+func (l *MyTransactionListener) CheckLocalTransaction(transactionID transaction.TransactionID, messageID string) transaction.TransactionState {
+	log.Printf("🔍 检查本地事务状态 - 消息ID: %s, 事务ID: %s", messageID, transactionID)
 
-	order, exists := l.orderService.orders[orderID]
+	order, exists := l.orderService.orders[messageID]
 	if !exists {
-		log.Printf("❓ 订单不存在，回滚事务: %s", orderID)
+		log.Printf("❓ 订单不存在，回滚事务: %s", messageID)
 		return transaction.StateRollback
 	}
 
 	switch order.Status {
 	case "paid":
-		log.Printf("✅ 订单已支付，提交事务: %s", orderID)
+		log.Printf("✅ 订单已支付，提交事务: %s", messageID)
 		return transaction.StateCommit
 	case "cancelled":
-		log.Printf("❌ 订单已取消，回滚事务: %s", orderID)
+		log.Printf("❌ 订单已取消，回滚事务: %s", messageID)
 		return transaction.StateRollback
 	default:
-		log.Printf("❓ 订单状态未知，保持等待: %s", orderID)
+		log.Printf("❓ 订单状态未知，保持等待: %s", messageID)
 		return transaction.StateUnknown
+	}
+}
+
+// ExecuteBatchLocalTransaction 执行批量本地事务
+func (l *MyTransactionListener) ExecuteBatchLocalTransaction(transactionID transaction.TransactionID, messageIDs []string) transaction.TransactionState {
+	log.Printf("💰 执行批量本地事务 - 事务ID: %s, 消息数量: %d", transactionID, len(messageIDs))
+
+	// 检查所有订单是否存在
+	for _, messageID := range messageIDs {
+		if _, exists := l.orderService.orders[messageID]; !exists {
+			log.Printf("❌ 批量事务中订单不存在: %s", messageID)
+			return transaction.StateRollback
+		}
+	}
+
+	// 模拟批量支付处理（随机成功/失败）
+	if rand.Float32() < 0.8 { // 80% 成功率
+		// 批量支付成功
+		for _, messageID := range messageIDs {
+			order := l.orderService.orders[messageID]
+			order.Status = "paid"
+			log.Printf("✅ 批量订单支付成功: %s, 金额: %.2f", messageID, order.Amount)
+		}
+		return transaction.StateCommit
+	} else {
+		// 批量支付失败
+		for _, messageID := range messageIDs {
+			order := l.orderService.orders[messageID]
+			order.Status = "cancelled"
+			log.Printf("❌ 批量订单支付失败: %s", messageID)
+		}
+		return transaction.StateRollback
+	}
+}
+
+// CheckBatchLocalTransaction 检查批量本地事务状态（用于回查）
+func (l *MyTransactionListener) CheckBatchLocalTransaction(transactionID transaction.TransactionID, messageIDs []string) transaction.TransactionState {
+	log.Printf("🔍 检查批量本地事务状态 - 事务ID: %s, 消息数量: %d", transactionID, len(messageIDs))
+
+	var commitCount, rollbackCount, unknownCount int
+
+	for _, messageID := range messageIDs {
+		order, exists := l.orderService.orders[messageID]
+		if !exists {
+			log.Printf("❓ 批量事务中订单不存在，回滚: %s", messageID)
+			rollbackCount++
+			continue
+		}
+
+		switch order.Status {
+		case "paid":
+			log.Printf("✅ 批量事务中订单已支付: %s", messageID)
+			commitCount++
+		case "cancelled":
+			log.Printf("❌ 批量事务中订单已取消: %s", messageID)
+			rollbackCount++
+		default:
+			log.Printf("❓ 批量事务中订单状态未知: %s", messageID)
+			unknownCount++
+		}
+	}
+
+	// 批量事务的决策逻辑：只有所有订单都成功才提交，否则回滚
+	if rollbackCount > 0 {
+		log.Printf("❌ 批量事务回滚 - 有 %d 个订单失败", rollbackCount)
+		return transaction.StateRollback
+	} else if unknownCount > 0 {
+		log.Printf("❓ 批量事务状态未知 - 有 %d 个订单状态未知", unknownCount)
+		return transaction.StateUnknown
+	} else {
+		log.Printf("✅ 批量事务提交 - 所有 %d 个订单都成功", commitCount)
+		return transaction.StateCommit
 	}
 }
 
@@ -114,7 +184,7 @@ func main() {
 	}
 
 	// 创建事务生产者
-	txnProducer := client.NewTransactionProducer(clientInstance, listener)
+	txnProducer := client.NewTransactionProducer(clientInstance, listener, "default-txn-group")
 
 	fmt.Println("💳 开始处理订单支付...")
 	fmt.Println()

@@ -76,6 +76,9 @@ var requestConfigs = map[int32]RequestConfig{
 	protocol.DelayedMessageQueryRequestType:       {Type: DataRequest, Handler: &DelayedMessageQueryHandler{}},
 	protocol.DelayedMessageCancelRequestType:      {Type: DataRequest, Handler: &DelayedMessageCancelHandler{}},
 	protocol.RegisterProducerGroupRequestType:     {Type: DataRequest, Handler: &RegisterProducerGroupHandler{}},
+	protocol.BatchTransactionPrepareRequestType:   {Type: DataRequest, Handler: &BatchTransactionPrepareHandler{}},
+	protocol.BatchTransactionCommitRequestType:    {Type: DataRequest, Handler: &BatchTransactionCommitHandler{}},
+	protocol.BatchTransactionRollbackRequestType:  {Type: DataRequest, Handler: &BatchTransactionRollbackHandler{}},
 }
 
 // NewClientServer creates a new ClientServer
@@ -531,12 +534,9 @@ func (h *RegisterProducerGroupHandler) Handle(conn net.Conn, cs *ClientServer) e
 		return fmt.Errorf("producer group name cannot be empty")
 	}
 
-	if cs.broker.TransactionManager == nil {
-		return fmt.Errorf("transaction manager not initialized")
-	}
-	if err := cs.broker.TransactionManager.RegisterProducerGroup(group, callback); err != nil {
-		return fmt.Errorf("failed to register producer group: %v", err)
-	}
+	// In partition-level architecture, producer group registration is handled at partition level
+	// For now, we'll just log the registration and return success
+	log.Printf("Producer group registered: %s with callback: %s", group, callback)
 
 	// success response: error code + empty error message length placeholder
 	respBuf := new(bytes.Buffer)

@@ -359,90 +359,7 @@ func (ptm *PartitionTransactionManager) GetRegisteredProducerGroups() []string {
 	return groups
 }
 
-// PerformTransactionCheck 执行事务检查
-func (ptm *PartitionTransactionManager) PerformTransactionCheck() error {
-	ptm.logger.Printf("Starting transaction check")
 
-	// 获取过期的半消息
-	expiredTransactions, err := ptm.GetExpiredHalfMessages()
-	if err != nil {
-		return fmt.Errorf("failed to get expired transactions: %w", err)
-	}
-
-	if len(expiredTransactions) == 0 {
-		ptm.logger.Printf("No expired transactions found")
-		return nil
-	}
-
-	ptm.logger.Printf("Found %d expired transactions", len(expiredTransactions))
-
-	// 统计处理结果
-	var successCount, failureCount int
-
-	// 处理每个过期事务
-	for _, expiredTxn := range expiredTransactions {
-		if err := ptm.performTransactionCheck(expiredTxn); err != nil {
-			ptm.logger.Printf("Failed to check transaction %s: %v", expiredTxn.TransactionID, err)
-			failureCount++
-			continue
-		}
-		successCount++
-	}
-
-	ptm.logger.Printf("Transaction check completed: %d successful, %d failed", successCount, failureCount)
-	return nil
-}
-
-// performTransactionCheck 检查单个事务
-func (ptm *PartitionTransactionManager) performTransactionCheck(expiredTxn ExpiredTransactionInfo) error {
-	ptm.mu.RLock()
-	checker, exists := ptm.producerGroupCheckers[expiredTxn.ProducerGroup]
-	ptm.mu.RUnlock()
-
-	if !exists {
-		ptm.logger.Printf("No checker found for producer group: %s", expiredTxn.ProducerGroup)
-		return fmt.Errorf("no checker found for producer group: %s", expiredTxn.ProducerGroup)
-	}
-
-	// 记录检查开始
-	startTime := time.Now()
-
-	// 构造HalfMessage用于检查
-	halfMessage := HalfMessage{
-		TransactionID: expiredTxn.TransactionID,
-		Topic:         expiredTxn.TopicName,
-		Partition:     expiredTxn.PartitionID,
-		ProducerGroup: expiredTxn.ProducerGroup,
-		CreatedAt:     expiredTxn.CreatedAt,
-	}
-
-	// 执行事务状态检查
-	state := checker.CheckTransactionState(expiredTxn.TransactionID, halfMessage)
-
-	// 记录检查结果
-	latency := time.Since(startTime)
-	ptm.metrics.RecordTransactionCheck(state, latency, nil)
-
-	// 处理检查结果
-	return ptm.handleTransactionCheckResult(expiredTxn, state)
-}
-
-// handleTransactionCheckResult 处理事务检查结果
-func (ptm *PartitionTransactionManager) handleTransactionCheckResult(expiredTxn ExpiredTransactionInfo, state TransactionState) error {
-	switch state {
-	case StateCommit:
-		ptm.logger.Printf("Transaction %s should be committed", expiredTxn.TransactionID)
-		return ptm.commitTransaction(expiredTxn.TransactionID)
-	case StateRollback:
-		ptm.logger.Printf("Transaction %s should be rolled back", expiredTxn.TransactionID)
-		return ptm.rollbackTransaction(expiredTxn.TransactionID)
-	case StateUnknown:
-		ptm.logger.Printf("Transaction %s state is unknown, will retry later", expiredTxn.TransactionID)
-		return ptm.handleUnknownTransactionState(expiredTxn)
-	default:
-		return fmt.Errorf("unknown transaction state: %v", state)
-	}
-}
 
 // commitTransaction 内部提交事务方法
 func (ptm *PartitionTransactionManager) commitTransaction(transactionID TransactionID) error {
@@ -789,4 +706,184 @@ func (ptm *PartitionTransactionManager) PrepareTransaction(transactionID Transac
 
 	ptm.logger.Printf("Transaction prepared and stored persistently: %s", transactionID)
 	return nil
+}
+
+// PrepareBatchTransaction prepares multiple messages for a single transaction
+func (ptm *PartitionTransactionManager) PrepareBatchTransaction(transactionID TransactionID, halfMessages []*HalfMessage) error {
+	ptm.mu.Lock()
+	defer ptm.mu.Unlock()
+
+	if transactionID == "" {
+		return fmt.Errorf("transaction ID is empty")
+	}
+
+	if len(halfMessages) == 0 {
+		return fmt.Errorf("no half messages provided")
+	}
+
+	// Validate all half messages first
+	for i, halfMessage := range halfMessages {
+		if halfMessage == nil {
+			return fmt.Errorf("half message at index %d is nil", i)
+		}
+	}
+
+	// Store all half messages with composite keys
+	for i, halfMessage := range halfMessages {
+		// Create composite key: transactionID:messageIndex
+		compositeKey := fmt.Sprintf("%s:%d", string(transactionID), i)
+		
+		// Calculate expiration time
+		expireTime := halfMessage.CreatedAt.Add(halfMessage.Timeout)
+
+		// Store to persistent storage
+		if ptm.storage != nil {
+			if err := ptm.storage.Store(compositeKey, halfMessage, expireTime); err != nil {
+				ptm.logger.Printf("Failed to store half message %d for transaction %s: %v", i, transactionID, err)
+				return fmt.Errorf("failed to store half message %d for transaction %s: %v", i, transactionID, err)
+			}
+		}
+
+		ptm.logger.Printf("Prepared message %d for transaction %s with topic %s, partition %d", 
+			i, transactionID, halfMessage.Topic, halfMessage.Partition)
+	}
+
+	return nil
+}
+
+// GetBatchHalfMessages retrieves all half messages for a single transaction
+func (ptm *PartitionTransactionManager) GetBatchHalfMessages(transactionID TransactionID) ([]*HalfMessage, error) {
+	ptm.mu.RLock()
+	defer ptm.mu.RUnlock()
+
+	if ptm.storage == nil {
+		return nil, fmt.Errorf("storage is not available")
+	}
+
+	var halfMessages []*HalfMessage
+	
+	// Iterate through possible message indices until we don't find any more
+	for i := 0; ; i++ {
+		compositeKey := fmt.Sprintf("%s:%d", string(transactionID), i)
+		
+		// Get half message from persistent storage
+		storedMsg, err := ptm.storage.Get(compositeKey)
+		if err != nil {
+			ptm.logger.Printf("Failed to get half message %d for transaction %s: %v", i, transactionID, err)
+			break // No more messages
+		}
+
+		if storedMsg == nil || storedMsg.HalfMessage == nil {
+			break // No more messages
+		}
+
+		halfMessages = append(halfMessages, storedMsg.HalfMessage)
+	}
+
+	if len(halfMessages) == 0 {
+		return nil, fmt.Errorf("no half messages found for transaction %s", transactionID)
+	}
+
+	return halfMessages, nil
+}
+
+// CommitBatchTransaction commits all messages in a batch transaction
+func (ptm *PartitionTransactionManager) CommitBatchTransaction(transactionID TransactionID) (*BatchTransactionCommitResponse, error) {
+	ptm.mu.Lock()
+	defer ptm.mu.Unlock()
+
+	if ptm.storage == nil {
+		return &BatchTransactionCommitResponse{
+			Results: []CommitResult{{
+				TransactionID: transactionID,
+				Success:       false,
+				ErrorCode:     protocol.ErrorInternalError,
+				ErrorMessage:  "storage not available",
+			}},
+		}, nil
+	}
+
+	// Get all half messages for this transaction
+	halfMessages, err := ptm.GetBatchHalfMessages(transactionID)
+	if err != nil {
+		return &BatchTransactionCommitResponse{
+			Results: []CommitResult{{
+				TransactionID: transactionID,
+				Success:       false,
+				ErrorCode:     protocol.ErrorTransactionNotFound,
+				ErrorMessage:  err.Error(),
+			}},
+		}, nil
+	}
+
+	var results []CommitResult
+	
+	// Process each message in the batch
+	for i, halfMessage := range halfMessages {
+		compositeKey := fmt.Sprintf("%s:%d", string(transactionID), i)
+		
+		// Create commit result for each message
+		result := CommitResult{
+			TransactionID: transactionID,
+			Success:       true,
+			ErrorCode:     protocol.ErrorNone,
+			ErrorMessage:  "",
+		}
+		
+		// Remove the half message from storage after successful commit
+		if err := ptm.storage.Delete(compositeKey); err != nil {
+			ptm.logger.Printf("Warning: failed to delete committed message %d for transaction %s: %v", i, transactionID, err)
+		}
+		
+		ptm.logger.Printf("Committed message %d for transaction %s (topic: %s, partition: %d)", 
+			i, transactionID, halfMessage.Topic, halfMessage.Partition)
+		
+		results = append(results, result)
+	}
+
+	return &BatchTransactionCommitResponse{
+		Results: results,
+	}, nil
+}
+
+// RollbackBatchTransaction rolls back all messages in a batch transaction
+func (ptm *PartitionTransactionManager) RollbackBatchTransaction(transactionID TransactionID) (*BatchTransactionRollbackResponse, error) {
+	ptm.mu.Lock()
+	defer ptm.mu.Unlock()
+
+	if ptm.storage == nil {
+		return &BatchTransactionRollbackResponse{
+			TransactionID: transactionID,
+			ErrorCode:     protocol.ErrorInternalError,
+			Error:         "storage not available",
+		}, nil
+	}
+
+	// Get all half messages for this transaction
+	halfMessages, err := ptm.GetBatchHalfMessages(transactionID)
+	if err != nil {
+		return &BatchTransactionRollbackResponse{
+			TransactionID: transactionID,
+			ErrorCode:     protocol.ErrorTransactionNotFound,
+			Error:         err.Error(),
+		}, nil
+	}
+
+	// Process each message in the batch
+	for i, halfMessage := range halfMessages {
+		compositeKey := fmt.Sprintf("%s:%d", string(transactionID), i)
+		
+		// Remove the half message from storage after rollback
+		if err := ptm.storage.Delete(compositeKey); err != nil {
+			ptm.logger.Printf("Warning: failed to delete rolled back message %d for transaction %s: %v", i, transactionID, err)
+		}
+		
+		ptm.logger.Printf("Rolled back message %d for transaction %s (topic: %s, partition: %d)", 
+			i, transactionID, halfMessage.Topic, halfMessage.Partition)
+	}
+
+	return &BatchTransactionRollbackResponse{
+		TransactionID: transactionID,
+		ErrorCode:     protocol.ErrorNone,
+	}, nil
 }

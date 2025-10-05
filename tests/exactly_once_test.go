@@ -52,7 +52,7 @@ func TestExactlyOnceSemantics(t *testing.T) {
 
 	// transactional part: implement minimal listener that always commits
 	listener := &alwaysCommitListener{}
-	txProd := client.NewTransactionProducerWithGroup(c, listener, "eos-producer-group")
+	txProd := client.NewTransactionProducer(c, listener, "eos-producer-group")
 	txMsg := &client.TransactionMessage{Topic: topic, Partition: partition, Value: []byte("tx-commit")}
 	txn, result, err := txProd.SendHalfMessageAndDoLocal(txMsg)
 	if err != nil {
@@ -133,10 +133,19 @@ func TestExactlyOnceSemantics(t *testing.T) {
 // alwaysCommitListener commits every transaction locally
 type alwaysCommitListener struct{}
 
-func (l *alwaysCommitListener) ExecuteLocalTransaction(id transaction.TransactionID, msg transaction.HalfMessage) transaction.TransactionState {
+func (l *alwaysCommitListener) ExecuteLocalTransaction(id transaction.TransactionID, messageID string) transaction.TransactionState {
 	return transaction.StateCommit
 }
-func (l *alwaysCommitListener) CheckLocalTransaction(id transaction.TransactionID, msg transaction.HalfMessage) transaction.TransactionState {
+func (l *alwaysCommitListener) CheckLocalTransaction(id transaction.TransactionID, messageID string) transaction.TransactionState {
+	return transaction.StateCommit
+}
+
+// ExecuteBatchLocalTransaction 执行批量本地事务
+func (l *alwaysCommitListener) ExecuteBatchLocalTransaction(id transaction.TransactionID, messageIDs []string) transaction.TransactionState {
+	return transaction.StateCommit
+}
+// CheckBatchLocalTransaction 检查批量本地事务状态
+func (l *alwaysCommitListener) CheckBatchLocalTransaction(id transaction.TransactionID, messageIDs []string) transaction.TransactionState {
 	return transaction.StateCommit
 }
 

@@ -78,3 +78,33 @@
 [partition-0] 2025/10/04 12:26:31 Stored half message for transaction test-tx-003
 [partition-0] 2025/10/04 12:26:31 Closing partition state machine for test-topic-0
 [partition-0] 2025/10/04 12:26:31 PartitionStateMachine stopped for test-topic-0
+[partition-0] 2025/10/04 16:10:55 Created PartitionStateMachine for test-topic-0
+[partition-0] 2025/10/04 16:10:55 Stored half message for transaction test-tx-001
+[partition-0] 2025/10/04 16:10:55 Successfully committed half message test-tx-001 to partition at offset 0
+[partition-0] 2025/10/04 16:10:55 Committed half message for transaction test-tx-001
+[partition-0] 2025/10/04 16:10:55 Closing partition state machine for test-topic-0
+[partition-0] 2025/10/04 16:10:55 PartitionStateMachine stopped for test-topic-0
+[partition-0] 2025/10/04 16:10:55 Created PartitionStateMachine for test-topic-0
+[partition-0] 2025/10/04 16:10:55 Stored half message for transaction test-tx-002
+[partition-0] 2025/10/04 16:10:55 Rolled back half message for transaction test-tx-002
+[partition-0] 2025/10/04 16:10:55 Closing partition state machine for test-topic-0
+[partition-0] 2025/10/04 16:10:55 PartitionStateMachine stopped for test-topic-0
+[partition-0] 2025/10/04 16:10:56 Created PartitionStateMachine for test-topic-0
+[partition-0] 2025/10/04 16:10:56 Stored half message for transaction test-tx-003
+[partition-0] 2025/10/04 16:10:56 Closing partition state machine for test-topic-0
+[partition-0] 2025/10/04 16:10:56 PartitionStateMachine stopped for test-topic-0
+[partition-0] 2025/10/04 16:21:04 Created PartitionStateMachine for test-topic-0
+[partition-0] 2025/10/04 16:21:04 Stored half message for transaction test-tx-001
+[partition-0] 2025/10/04 16:21:04 Successfully committed half message test-tx-001 to partition at offset 0
+[partition-0] 2025/10/04 16:21:04 Committed half message for transaction test-tx-001
+[partition-0] 2025/10/04 16:21:04 Closing partition state machine for test-topic-0
+[partition-0] 2025/10/04 16:21:04 PartitionStateMachine stopped for test-topic-0
+[partition-0] 2025/10/04 16:21:04 Created PartitionStateMachine for test-topic-0
+[partition-0] 2025/10/04 16:21:04 Stored half message for transaction test-tx-002
+[partition-0] 2025/10/04 16:21:04 Rolled back half message for transaction test-tx-002
+[partition-0] 2025/10/04 16:21:04 Closing partition state machine for test-topic-0
+[partition-0] 2025/10/04 16:21:04 PartitionStateMachine stopped for test-topic-0
+[partition-0] 2025/10/04 16:21:04 Created PartitionStateMachine for test-topic-0
+[partition-0] 2025/10/04 16:21:04 Stored half message for transaction test-tx-003
+[partition-0] 2025/10/04 16:21:04 Closing partition state machine for test-topic-0
+[partition-0] 2025/10/04 16:21:04 PartitionStateMachine stopped for test-topic-0

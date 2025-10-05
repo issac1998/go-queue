@@ -39,29 +39,31 @@ func (s TransactionState) String() string {
 
 // HalfMessage half message
 type HalfMessage struct {
-	TransactionID TransactionID     `json:"transaction_id"`
-	Topic         string            `json:"topic"`
-	Partition     int32             `json:"partition"`
-	Key           []byte            `json:"key,omitempty"`
-	Value         []byte            `json:"value"`
-	Headers       map[string]string `json:"headers,omitempty"`
-	ProducerGroup string            `json:"producer_group"`
-	CreatedAt     time.Time         `json:"created_at"`
-	Timeout       time.Duration     `json:"timeout"`
-	CheckCount    int               `json:"check_count"`
-	LastCheck     time.Time         `json:"last_check"`
-	State         TransactionState  `json:"state"`
+	TransactionID   TransactionID     `json:"transaction_id"`
+	Topic           string            `json:"topic"`
+	Partition       int32             `json:"partition"`
+	Key             []byte            `json:"key,omitempty"`
+	Value           []byte            `json:"value"`
+	Headers         map[string]string `json:"headers,omitempty"`
+	ProducerGroup   string            `json:"producer_group"`
+	CallbackAddress string            `json:"callback_address"` // 新增：客户端回调地址（IP:端口）
+	CreatedAt       time.Time         `json:"created_at"`
+	Timeout         time.Duration     `json:"timeout"`
+	CheckCount      int               `json:"check_count"`
+	LastCheck       time.Time         `json:"last_check"`
+	State           TransactionState  `json:"state"`
 }
 
 type TransactionPrepareRequest struct {
-	TransactionID TransactionID     `json:"transaction_id"`
-	Topic         string            `json:"topic"`
-	Partition     int32             `json:"partition"`
-	Key           []byte            `json:"key,omitempty"`
-	Value         []byte            `json:"value"`
-	Headers       map[string]string `json:"headers,omitempty"`
-	Timeout       int64             `json:"timeout_ms"`
-	ProducerGroup string            `json:"producer_group"`
+	TransactionID   TransactionID     `json:"transaction_id"`
+	Topic           string            `json:"topic"`
+	Partition       int32             `json:"partition"`
+	Key             []byte            `json:"key,omitempty"`
+	Value           []byte            `json:"value"`
+	Headers         map[string]string `json:"headers,omitempty"`
+	Timeout         int64             `json:"timeout_ms"`
+	ProducerGroup   string            `json:"producer_group"`
+	CallbackAddress string            `json:"callback_address"` 
 }
 
 type TransactionPrepareResponse struct {
@@ -72,6 +74,8 @@ type TransactionPrepareResponse struct {
 
 type TransactionCommitRequest struct {
 	TransactionID TransactionID `json:"transaction_id"`
+	Topic         string        `json:"topic"`
+	Partition     int32         `json:"partition"`
 }
 
 type TransactionCommitResponse struct {
@@ -84,6 +88,8 @@ type TransactionCommitResponse struct {
 
 type TransactionRollbackRequest struct {
 	TransactionID TransactionID `json:"transaction_id"`
+	Topic         string        `json:"topic"`
+	Partition     int32         `json:"partition"`
 }
 
 type TransactionRollbackResponse struct {
@@ -92,12 +98,75 @@ type TransactionRollbackResponse struct {
 	Error         string        `json:"error,omitempty"`
 }
 
+// Batch transaction request/response types
+type BatchTransactionPrepareRequest struct {
+	TransactionID   TransactionID     `json:"transaction_id"`
+	Messages        []MessageRequest  `json:"messages"`
+	Timeout         int64             `json:"timeout_ms"`
+	ProducerGroup   string            `json:"producer_group"`
+	CallbackAddress string            `json:"callback_address"`
+}
+
+type MessageRequest struct {
+	Topic     string            `json:"topic"`
+	Partition int32             `json:"partition"`
+	Key       []byte            `json:"key,omitempty"`
+	Value     []byte            `json:"value"`
+	Headers   map[string]string `json:"headers,omitempty"`
+}
+
+type BatchTransactionPrepareResponse struct {
+	TransactionID TransactionID `json:"transaction_id"`
+	ErrorCode     int16         `json:"error_code"`
+	Error         string        `json:"error,omitempty"`
+}
+
+// TopicPartition represents a topic-partition pair
+type TopicPartition struct {
+	Topic     string `json:"topic"`
+	Partition int32  `json:"partition"`
+}
+
+type BatchTransactionCommitRequest struct {
+	TransactionID    TransactionID    `json:"transaction_id"`
+	TopicPartitions  []TopicPartition `json:"topic_partitions"`
+}
+
+type BatchTransactionCommitResponse struct {
+	TransactionID TransactionID    `json:"transaction_id"`
+	Results       []CommitResult   `json:"results"`
+	ErrorCode     int16            `json:"error_code"`
+	Error         string           `json:"error,omitempty"`
+}
+
+type CommitResult struct {
+	TransactionID TransactionID `json:"transaction_id"`
+	Topic         string        `json:"topic"`
+	Partition     int32         `json:"partition"`
+	Offset        int64         `json:"offset"`
+	Timestamp     time.Time     `json:"timestamp"`
+	Success       bool          `json:"success"`
+	ErrorCode     int16         `json:"error_code"`
+	ErrorMessage  string        `json:"error_message,omitempty"`
+}
+
+type BatchTransactionRollbackRequest struct {
+	TransactionID    TransactionID    `json:"transaction_id"`
+	TopicPartitions  []TopicPartition `json:"topic_partitions"`
+}
+
+type BatchTransactionRollbackResponse struct {
+	TransactionID TransactionID `json:"transaction_id"`
+	ErrorCode     int16         `json:"error_code"`
+	Error         string        `json:"error,omitempty"`
+}
+
 type TransactionCheckRequest struct {
-	TransactionID   TransactionID `json:"transaction_id"`
-	Topic           string        `json:"topic"`
-	Partition       int32         `json:"partition"`
-	ProducerGroup   string        `json:"producer_group"`
-	OriginalMessage HalfMessage   `json:"original_message"`
+	TransactionID TransactionID `json:"transaction_id"`
+	Topic         string        `json:"topic"`
+	Partition     int32         `json:"partition"`
+	ProducerGroup string        `json:"producer_group"`
+	MessageID     string        `json:"message_id"` // 只传递消息ID，不传递完整的HalfMessage
 }
 
 type TransactionCheckResponse struct {
@@ -109,7 +178,7 @@ type TransactionCheckResponse struct {
 
 // TransactionChecker check txn
 type TransactionChecker interface {
-	CheckTransactionState(transactionID TransactionID, originalMessage HalfMessage) TransactionState
+	CheckTransactionState(transactionID TransactionID, messageID string) TransactionState
 }
 
 // RaftProposer 接口用于向Raft组提议事务命令
@@ -120,9 +189,11 @@ type RaftProposer interface {
 
 // TransactionListener listen txn
 type TransactionListener interface {
-	ExecuteLocalTransaction(transactionID TransactionID, message HalfMessage) TransactionState
-
-	CheckLocalTransaction(transactionID TransactionID, message HalfMessage) TransactionState
+	ExecuteLocalTransaction(transactionID TransactionID, messageID string) TransactionState
+	CheckLocalTransaction(transactionID TransactionID, messageID string) TransactionState
+	
+	ExecuteBatchLocalTransaction(transactionID TransactionID, messageIDs []string) TransactionState
+	CheckBatchLocalTransaction(transactionID TransactionID, messageIDs []string) TransactionState
 }
 
 // StateMachineGetter 接口用于获取状态机实例

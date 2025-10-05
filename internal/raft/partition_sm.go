@@ -171,8 +171,7 @@ type PartitionStateMachine struct {
 	delayedMessageStorage delayed.DelayedMessageStorage
 
 	// Transaction support
-	halfMessageStorage HalfMessageStorage             // 新增：存储 halfMessage
-	transactionChecker transaction.TransactionChecker // 新增：事务回查器
+	halfMessageStorage HalfMessageStorage // 新增：存储 halfMessage
 
 	// Raft integration for leader checking
 	raftManager RaftManagerInterface // 新增：Raft管理器接口
@@ -183,17 +182,33 @@ type PartitionStateMachine struct {
 	cleanupStopChan chan struct{} // 新增：停止清理任务的通道
 	cleanupInterval time.Duration // 新增：清理间隔
 
+	// Transaction check configuration
+	maxCheckCount       int           // 最大回查次数
+	checkTimeout        time.Duration // 单次回查超时时间
+	batchProcessSize    int           // 批处理大小
+	enableMetrics       bool          // 是否启用指标收集
+
 	// Metrics
 	messageCount int64
 	bytesStored  int64
 	lastWrite    time.Time
 	lastRead     time.Time
 
+	// Transaction check metrics
+	totalChecks     int64 // 总回查次数
+	successfulChecks int64 // 成功回查次数
+	failedChecks    int64 // 失败回查次数
+	commitCount     int64 // 提交次数
+	rollbackCount   int64 // 回滚次数
+
 	// State
 	isReady bool
 
 	// Logging
 	logger *log.Logger
+
+	// Transaction callback handler
+	onTransactionCheckResult func(transactionID string, state transaction.TransactionState, record *HalfMessageRecord)
 }
 
 // HalfMessageRecord 表示存储在 state machine 中的 halfMessage 记录
@@ -215,8 +230,31 @@ type HalfMessageRecord struct {
 	LastCheck       time.Time `json:"last_check"`       // 最后一次回查时间
 }
 
-// NewPartitionStateMachine creates a state machine for a partition
+// PartitionStateMachineConfig 配置选项
+type PartitionStateMachineConfig struct {
+	CleanupInterval     time.Duration // 清理间隔
+	MaxCheckCount       int           // 最大回查次数
+	CheckTimeout        time.Duration // 单次回查超时时间
+	BatchProcessSize    int           // 批处理大小
+	EnableMetrics       bool          // 是否启用指标收集
+}
+
+// DefaultPartitionStateMachineConfig 返回默认配置
+func DefaultPartitionStateMachineConfig() *PartitionStateMachineConfig {
+	return &PartitionStateMachineConfig{
+		CleanupInterval:  30 * time.Second,
+		MaxCheckCount:    3,
+		CheckTimeout:     5 * time.Second,
+		BatchProcessSize: 10,
+		EnableMetrics:    true,
+	}
+}
+
 func NewPartitionStateMachine(topicName string, partitionID int32, dataDir string, compressor compression.Compressor) (*PartitionStateMachine, error) {
+	return NewPartitionStateMachineWithConfig(topicName, partitionID, dataDir, compressor, DefaultPartitionStateMachineConfig())
+}
+
+func NewPartitionStateMachineWithConfig(topicName string, partitionID int32, dataDir string, compressor compression.Compressor, config *PartitionStateMachineConfig) (*PartitionStateMachine, error) {
 	partitionDir := filepath.Join(dataDir, "partitions", fmt.Sprintf("%s-%d", topicName, partitionID))
 
 	// Create storage partition
@@ -236,9 +274,6 @@ func NewPartitionStateMachine(topicName string, partitionID int32, dataDir strin
 		return nil, fmt.Errorf("failed to create half message storage: %w", err)
 	}
 
-	// Create transaction checker
-	transactionChecker := transaction.NewDefaultTransactionChecker()
-
 	file, err := os.OpenFile(fmt.Sprintf("partition-%d", partitionID), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open log file: %v", err)
@@ -254,12 +289,16 @@ func NewPartitionStateMachine(topicName string, partitionID int32, dataDir strin
 		deduplicatorEnabled:   true,
 		orderedMessageManager: ordering.NewOrderedMessageManager(100, 30*time.Second), // 100 message window, 30s timeout
 		halfMessageStorage:    halfMessageStorage,                                     // 使用 PebbleDB 存储
-		transactionChecker:    transactionChecker,                                     // 事务回查器
-		cleanupInterval:       30 * time.Second,                                       // 默认30秒清理间隔
+		cleanupInterval:       config.CleanupInterval,                                 // 使用配置的清理间隔
 		cleanupStopChan:       make(chan struct{}),
-		isReady:               true,
-		lastWrite:             time.Now(),
-		lastRead:              time.Now(),
+		// Transaction check configuration
+		maxCheckCount:    config.MaxCheckCount,    // 使用配置的最大回查次数
+		checkTimeout:     config.CheckTimeout,     // 使用配置的单次回查超时
+		batchProcessSize: config.BatchProcessSize, // 使用配置的批处理大小
+		enableMetrics:    config.EnableMetrics,    // 使用配置的指标收集设置
+		isReady:          true,
+		lastWrite:        time.Now(),
+		lastRead:         time.Now(),
 
 		logger: log.New(file, fmt.Sprintf("[partition-%d] ", partitionID), log.LstdFlags),
 	}
@@ -268,7 +307,6 @@ func NewPartitionStateMachine(topicName string, partitionID int32, dataDir strin
 	return psm, nil
 }
 
-// startHalfMessageCleanup 启动定时清理任务
 func (psm *PartitionStateMachine) startHalfMessageCleanup() {
 	psm.cleanupTicker = time.NewTicker(psm.cleanupInterval)
 
@@ -278,7 +316,6 @@ func (psm *PartitionStateMachine) startHalfMessageCleanup() {
 		for {
 			select {
 			case <-psm.cleanupTicker.C:
-				// 只有Leader才执行清理任务
 				if psm.raftManager != nil && psm.raftManager.IsLeader(psm.raftGroupID) {
 					psm.cleanupExpiredHalfMessages()
 				}
@@ -294,7 +331,6 @@ func (psm *PartitionStateMachine) startHalfMessageCleanup() {
 		psm.TopicName, psm.PartitionID, psm.cleanupInterval)
 }
 
-// GetHalfMessage 获取半消息记录（用于测试）
 func (psm *PartitionStateMachine) GetHalfMessage(transactionID string) (*HalfMessageRecord, bool) {
 	psm.mu.RLock()
 	defer psm.mu.RUnlock()
@@ -306,39 +342,10 @@ func (psm *PartitionStateMachine) GetHalfMessage(transactionID string) (*HalfMes
 	return record, true
 }
 
-// CleanupExpiredHalfMessages 清理过期的半消息（公共方法，用于测试）
-func (psm *PartitionStateMachine) CleanupExpiredHalfMessages() int {
-	psm.mu.Lock()
-	defer psm.mu.Unlock()
 
-	// 获取过期的半消息
-	expiredMessages, err := psm.halfMessageStorage.GetExpired()
-	if err != nil {
-		psm.logger.Printf("Failed to get expired half messages: %v", err)
-		return 0
-	}
-
-	cleanedCount := 0
-	for _, record := range expiredMessages {
-		// 删除过期的半消息
-		err := psm.halfMessageStorage.Delete(record.TransactionID)
-		if err != nil {
-			psm.logger.Printf("Failed to delete expired half message %s: %v",
-				record.TransactionID, err)
-			continue
-		}
-		cleanedCount++
-	}
-
-	return cleanedCount
-}
-
-// commitHalfMessage 提交半消息为正式消息
 func (psm *PartitionStateMachine) commitHalfMessage(record *HalfMessageRecord) error {
-	// 构造消息数据（将key和value合并为一个数据包）
 	messageData := record.Value
 
-	// 将消息写入分区存储
 	if psm.partition != nil {
 		offset, err := psm.partition.Append(messageData, time.Now())
 		if err != nil {
@@ -348,7 +355,6 @@ func (psm *PartitionStateMachine) commitHalfMessage(record *HalfMessageRecord) e
 		psm.logger.Printf("Successfully committed half message %s to partition at offset %d",
 			record.TransactionID, offset)
 
-		// 更新统计信息
 		psm.messageCount++
 		psm.bytesStored += int64(len(messageData))
 		psm.lastWrite = time.Now()
@@ -359,12 +365,10 @@ func (psm *PartitionStateMachine) commitHalfMessage(record *HalfMessageRecord) e
 	return nil
 }
 
-// cleanupExpiredHalfMessages 清理过期的半消息（私有方法，只由定时任务调用）
 func (psm *PartitionStateMachine) cleanupExpiredHalfMessages() {
 	psm.mu.Lock()
 	defer psm.mu.Unlock()
 
-	// 检查当前节点是否为Leader
 	if psm.raftManager != nil && psm.raftGroupID != 0 {
 		isLeader := psm.raftManager.IsLeader(psm.raftGroupID)
 		if !isLeader {
@@ -377,7 +381,6 @@ func (psm *PartitionStateMachine) cleanupExpiredHalfMessages() {
 		psm.logger.Printf("Warning: Raft manager or group ID not set, proceeding with cleanup")
 	}
 
-	// 获取过期的半消息
 	expiredMessages, err := psm.halfMessageStorage.GetExpired()
 	if err != nil {
 		psm.logger.Printf("Failed to get expired half messages: %v", err)
@@ -390,92 +393,139 @@ func (psm *PartitionStateMachine) cleanupExpiredHalfMessages() {
 
 	psm.logger.Printf("Found %d expired half messages to process", len(expiredMessages))
 
-	for _, record := range expiredMessages {
-		// 检查是否超过最大回查次数
-		maxCheckCount := 3 // 可以配置化
-		if record.CheckCount >= maxCheckCount {
-			psm.logger.Printf("Half message %s exceeded max check count (%d), deleting",
-				record.TransactionID, maxCheckCount)
+	// 批量处理过期消息
+	for i := 0; i < len(expiredMessages); i += psm.batchProcessSize {
+		end := i + psm.batchProcessSize
+		if end > len(expiredMessages) {
+			end = len(expiredMessages)
+		}
+		batch := expiredMessages[i:end]
+		psm.processBatchExpiredMessages(batch)
+	}
+}
+
+// processBatchExpiredMessages 批量处理过期消息
+func (psm *PartitionStateMachine) processBatchExpiredMessages(batch []*HalfMessageRecord) {
+	for _, record := range batch {
+		if psm.enableMetrics {
+			psm.totalChecks++
+		}
+
+		if record.CheckCount >= psm.maxCheckCount {
+			psm.logger.Printf("[TRANSACTION] Half message %s exceeded max check count (%d), deleting",
+				record.TransactionID, psm.maxCheckCount)
 
 			if err := psm.halfMessageStorage.Delete(record.TransactionID); err != nil {
-				psm.logger.Printf("Failed to delete expired half message %s: %v",
+				psm.logger.Printf("[ERROR] Failed to delete expired half message %s: %v",
 					record.TransactionID, err)
+				if psm.enableMetrics {
+					psm.failedChecks++
+				}
+			} else {
+				psm.logger.Printf("[TRANSACTION] Successfully deleted expired half message %s",
+					record.TransactionID)
 			}
 			continue
 		}
 
-		// 使用现有的TransactionChecker进行回查
-		if psm.transactionChecker != nil {
-			// 更新回查计数和时间
-			record.CheckCount++
-			record.LastCheck = time.Now()
+		if record.CallbackAddress == "" {
+			psm.logger.Printf("[WARN] No callback address for transaction %s, skipping check", record.TransactionID)
+			continue
+		}
 
-			// 构造HalfMessage用于回查
-			halfMessage := transaction.HalfMessage{
-				TransactionID: transaction.TransactionID(record.TransactionID),
-				Topic:         record.Topic,
-				Partition:     record.Partition,
-				Key:           record.Key,
-				Value:         record.Value,
-				Headers:       record.Headers,
-				ProducerGroup: record.ProducerGroup,
-				CreatedAt:     record.CreatedAt,
-				Timeout:       record.Timeout,
-				CheckCount:    record.CheckCount,
-				LastCheck:     record.LastCheck,
+		record.CheckCount++
+		record.LastCheck = time.Now()
+
+		halfMessage := transaction.HalfMessage{
+			TransactionID:   transaction.TransactionID(record.TransactionID),
+			Topic:           record.Topic,
+			Partition:       record.Partition,
+			Key:             record.Key,
+			Value:           record.Value,
+			Headers:         record.Headers,
+			ProducerGroup:   record.ProducerGroup,
+			CreatedAt:       record.CreatedAt,
+			Timeout:         record.Timeout,
+			CheckCount:      record.CheckCount,
+			LastCheck:       record.LastCheck,
+			CallbackAddress: record.CallbackAddress,
+		}
+
+		state := psm.checkTransactionStateWithRetry(record.CallbackAddress, record.TransactionID, halfMessage)
+
+		psm.logger.Printf("[TRANSACTION] Check result for %s (attempt %d): %v",
+			record.TransactionID, record.CheckCount, state)
+
+		// 根据回查结果处理事务
+		// 注意：这里不能直接执行commit/rollback操作，因为这些操作需要通过Raft同步
+		// 应该通过回调函数通知上层（Broker）来处理
+		switch state {
+		case transaction.StateCommit:
+			// 需要提交事务：通知上层通过Raft发送commit命令
+			psm.logger.Printf("[TRANSACTION] Transaction %s needs to be committed via Raft", record.TransactionID)
+			if psm.onTransactionCheckResult != nil {
+				psm.onTransactionCheckResult(record.TransactionID, state, record)
 			}
 
-			// 执行事务状态回查
-			state := psm.transactionChecker.CheckTransactionState(
-				transaction.TransactionID(record.TransactionID),
-				halfMessage,
-			)
+		case transaction.StateRollback:
+			// 需要回滚事务：通知上层通过Raft发送rollback命令
+			psm.logger.Printf("[TRANSACTION] Transaction %s needs to be rolled back via Raft", record.TransactionID)
+			if psm.onTransactionCheckResult != nil {
+				psm.onTransactionCheckResult(record.TransactionID, state, record)
+			}
 
-			psm.logger.Printf("Transaction check result for %s: %v",
-				record.TransactionID, state)
-
-			// 根据回查结果处理事务
-			switch state {
-			case transaction.StateCommit:
-				// 提交事务：将半消息转换为正式消息
-				psm.logger.Printf("Committing transaction %s", record.TransactionID)
-				if err := psm.commitHalfMessage(record); err != nil {
-					psm.logger.Printf("Failed to commit half message %s: %v",
-						record.TransactionID, err)
-				} else {
-					// 提交成功，删除半消息记录
-					if err := psm.halfMessageStorage.Delete(record.TransactionID); err != nil {
-						psm.logger.Printf("Failed to delete committed half message %s: %v",
-							record.TransactionID, err)
-					}
+		case transaction.StateUnknown:
+			// 状态未知：更新回查计数，等待下次检查
+			psm.logger.Printf("[TRANSACTION] Transaction %s state unknown, will retry later (attempt %d/%d)",
+				record.TransactionID, record.CheckCount, psm.maxCheckCount)
+			if updateErr := psm.halfMessageStorage.Update(record.TransactionID, record); updateErr != nil {
+				psm.logger.Printf("[ERROR] Failed to update half message record %s: %v",
+					record.TransactionID, updateErr)
+				if psm.enableMetrics {
+					psm.failedChecks++
 				}
+			}
 
-			case transaction.StateRollback:
-				// 回滚事务：直接删除半消息
-				psm.logger.Printf("Rolling back transaction %s", record.TransactionID)
-				if err := psm.halfMessageStorage.Delete(record.TransactionID); err != nil {
-					psm.logger.Printf("Failed to delete rolled back half message %s: %v",
-						record.TransactionID, err)
-				}
-
-			case transaction.StateUnknown:
-				// 状态未知：更新回查计数，等待下次检查
-				psm.logger.Printf("Transaction %s state unknown, will retry later", record.TransactionID)
-				if updateErr := psm.halfMessageStorage.Update(record.TransactionID, record); updateErr != nil {
-					psm.logger.Printf("Failed to update half message record %s: %v",
-						record.TransactionID, updateErr)
-				}
-
-			default:
-				psm.logger.Printf("Unknown transaction state %v for %s", state, record.TransactionID)
-				// 对于未知状态，也更新记录等待下次检查
-				if updateErr := psm.halfMessageStorage.Update(record.TransactionID, record); updateErr != nil {
-					psm.logger.Printf("Failed to update half message record %s: %v",
-						record.TransactionID, updateErr)
+		default:
+			psm.logger.Printf("[WARN] Unknown transaction state %v for %s", state, record.TransactionID)
+			// 对于未知状态，也更新记录等待下次检查
+			if updateErr := psm.halfMessageStorage.Update(record.TransactionID, record); updateErr != nil {
+				psm.logger.Printf("[ERROR] Failed to update half message record %s: %v",
+					record.TransactionID, updateErr)
+				if psm.enableMetrics {
+					psm.failedChecks++
 				}
 			}
 		}
 	}
+}
+
+func (psm *PartitionStateMachine) checkTransactionStateWithRetry(callbackAddress, transactionID string, halfMessage transaction.HalfMessage) transaction.TransactionState {
+	checker := transaction.NewDefaultTransactionChecker()
+	
+	halfMsg := transaction.HalfMessage{
+		TransactionID:   transaction.TransactionID(transactionID),
+		Topic:           halfMessage.Topic,
+		Partition:       halfMessage.Partition,
+		Key:             halfMessage.Key,
+		Value:           halfMessage.Value,
+		Headers:         halfMessage.Headers,
+		ProducerGroup:   halfMessage.ProducerGroup,
+		CallbackAddress: callbackAddress,
+	}
+
+	start := time.Now()
+	state := checker.CheckTransactionStateNet(callbackAddress, transaction.TransactionID(transactionID), halfMsg)
+	duration := time.Since(start)
+	
+	psm.logger.Printf("[TRANSACTION] Check for %s took %v, result: %v", transactionID, duration, state)
+	
+	if duration > psm.checkTimeout {
+		psm.logger.Printf("[WARN] Transaction check for %s took longer than expected (%v > %v)",
+			transactionID, duration, psm.checkTimeout)
+	}
+	
+	return state
 }
 
 // Stop 停止PartitionStateMachine
@@ -658,8 +708,116 @@ func (psm *PartitionStateMachine) handleRollbackHalfMessage(data map[string]inte
 
 // Lookup implements the statemachine.IStateMachine interface
 func (psm *PartitionStateMachine) Lookup(query interface{}) (interface{}, error) {
-	// TODO: Implement partition state machine lookup logic
-	return nil, nil
+	psm.mu.RLock()
+	defer psm.mu.RUnlock()
+
+	// Convert query to []byte if needed
+	var queryBytes []byte
+	switch q := query.(type) {
+	case []byte:
+		queryBytes = q
+	case string:
+		queryBytes = []byte(q)
+	default:
+		return nil, fmt.Errorf("invalid query type: %T", query)
+	}
+
+	var queryObj map[string]interface{}
+	if err := json.Unmarshal(queryBytes, &queryObj); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal query: %w", err)
+	}
+
+	queryType, ok := queryObj["type"].(string)
+	if !ok {
+		return nil, fmt.Errorf("missing or invalid query type")
+	}
+
+	switch queryType {
+	case "get_half_message":
+		return psm.handleGetHalfMessageQuery(queryObj)
+	case "get_expired_transactions":
+		return psm.handleGetExpiredTransactionsQuery(queryObj)
+	default:
+		return nil, fmt.Errorf("unsupported query type: %s", queryType)
+	}
+}
+
+// handleGetHalfMessageQuery 处理获取半消息的查询
+func (psm *PartitionStateMachine) handleGetHalfMessageQuery(queryObj map[string]interface{}) (interface{}, error) {
+	transactionID, ok := queryObj["transaction_id"].(string)
+	if !ok {
+		return nil, fmt.Errorf("missing or invalid transaction_id")
+	}
+
+	if psm.halfMessageStorage == nil {
+		return map[string]interface{}{
+			"exists": false,
+			"error":  "half message storage not available",
+		}, nil
+	}
+
+	// 查询半消息
+	record, exists, err := psm.halfMessageStorage.Get(transactionID)
+	if err != nil {
+		return map[string]interface{}{
+			"exists": false,
+			"error":  err.Error(),
+		}, nil
+	}
+	if !exists {
+		return map[string]interface{}{
+			"exists": false,
+		}, nil
+	}
+
+	return map[string]interface{}{
+		"exists": true,
+		"half_message": map[string]interface{}{
+			"transaction_id":   record.TransactionID,
+			"topic":           record.Topic,
+			"partition":       record.Partition,
+			"key":             record.Key,
+			"value":           record.Value,
+			"headers":         record.Headers,
+			"created_at":      record.CreatedAt,
+			"timeout":         record.Timeout,
+			"state":           record.State,
+			"expires_at":      record.ExpiresAt,
+			"producer_group":  record.ProducerGroup,
+			"callback_address": record.CallbackAddress,
+			"check_count":     record.CheckCount,
+			"last_check":      record.LastCheck,
+		},
+	}, nil
+}
+
+// handleGetExpiredTransactionsQuery 处理获取过期事务的查询
+func (psm *PartitionStateMachine) handleGetExpiredTransactionsQuery(queryObj map[string]interface{}) (interface{}, error) {
+	if psm.halfMessageStorage == nil {
+		return []interface{}{}, nil
+	}
+
+	expiredMessages, err := psm.halfMessageStorage.GetExpired()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get expired messages: %w", err)
+	}
+
+	var result []interface{}
+	for _, record := range expiredMessages {
+		result = append(result, map[string]interface{}{
+			"transaction_id":   record.TransactionID,
+			"topic":           record.Topic,
+			"partition":       record.Partition,
+			"created_at":      record.CreatedAt,
+			"expires_at":      record.ExpiresAt,
+			"producer_group":  record.ProducerGroup,
+			"callback_address": record.CallbackAddress,
+			"check_count":     record.CheckCount,
+			"last_check":      record.LastCheck,
+		})
+	}
+
+	return result, nil
 }
 
 // SaveSnapshot implements the statemachine.IStateMachine interface
@@ -718,8 +876,12 @@ func (psm *PartitionStateMachine) SetRaftManager(raftManager RaftManagerInterfac
 	psm.raftManager = raftManager
 	psm.raftGroupID = raftGroupID
 
-	// 启动半消息清理任务
 	go psm.startHalfMessageCleanup()
+}
+
+// SetTransactionCheckResultHandler sets the callback function for transaction check results
+func (psm *PartitionStateMachine) SetTransactionCheckResultHandler(handler func(transactionID string, state transaction.TransactionState, record *HalfMessageRecord)) {
+	psm.onTransactionCheckResult = handler
 }
 
 // GetMetrics returns partition metrics
@@ -727,13 +889,35 @@ func (psm *PartitionStateMachine) GetMetrics() map[string]interface{} {
 	psm.mu.RLock()
 	defer psm.mu.RUnlock()
 
-	return map[string]interface{}{
+	metrics := map[string]interface{}{
 		"message_count": psm.messageCount,
 		"bytes_stored":  psm.bytesStored,
 		"last_write":    psm.lastWrite,
 		"last_read":     psm.lastRead,
 		"is_ready":      psm.isReady,
 	}
+
+	// 添加事务检查相关指标
+	if psm.enableMetrics {
+		metrics["transaction_checks"] = map[string]interface{}{
+			"total_checks":     psm.totalChecks,
+			"successful_checks": psm.successfulChecks,
+			"failed_checks":    psm.failedChecks,
+			"commit_count":     psm.commitCount,
+			"rollback_count":   psm.rollbackCount,
+			"max_check_count":  psm.maxCheckCount,
+			"check_timeout":    psm.checkTimeout.String(),
+			"batch_size":       psm.batchProcessSize,
+		}
+		
+		// 计算成功率
+		if psm.totalChecks > 0 {
+			successRate := float64(psm.successfulChecks) / float64(psm.totalChecks) * 100
+			metrics["transaction_checks"].(map[string]interface{})["success_rate"] = fmt.Sprintf("%.2f%%", successRate)
+		}
+	}
+
+	return metrics
 }
 
 // handleStoreDelayedMessage handles storing a delayed message
@@ -933,4 +1117,46 @@ func (psm *PartitionStateMachine) handleBatchUpdateDelayedMessages(data map[stri
 	}
 	respBytes, _ := json.Marshal(resp)
 	return statemachine.Result{Value: uint64(len(respBytes)), Data: respBytes}, nil
+}
+
+// GetTotalChecks 获取总回查次数
+func (psm *PartitionStateMachine) GetTotalChecks() int64 {
+	psm.mu.RLock()
+	defer psm.mu.RUnlock()
+	return psm.totalChecks
+}
+
+// GetFailedChecks 获取失败回查次数
+func (psm *PartitionStateMachine) GetFailedChecks() int64 {
+	psm.mu.RLock()
+	defer psm.mu.RUnlock()
+	return psm.failedChecks
+}
+
+// StoreHalfMessage 存储半消息
+func (psm *PartitionStateMachine) StoreHalfMessage(storeData HalfMessageStoreData) error {
+	record := &HalfMessageRecord{
+		TransactionID:   storeData.ID,
+		Topic:           storeData.Topic,
+		Partition:       storeData.Partition,
+		Value:           storeData.Data,
+		CallbackAddress: storeData.CallbackAddress,
+		CreatedAt:       storeData.Timestamp,
+		ExpiresAt:       storeData.Timestamp.Add(30 * time.Second), // 默认30秒过期
+		CheckCount:      storeData.CheckCount,
+		State:           "prepared",
+	}
+
+	return psm.halfMessageStorage.Store(storeData.ID, record)
+}
+
+// HalfMessageStoreData 存储半消息的数据结构
+type HalfMessageStoreData struct {
+	ID              string
+	Topic           string
+	Partition       int32
+	Data            []byte
+	CallbackAddress string
+	Timestamp       time.Time
+	CheckCount      int
 }

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/issac1998/go-queue/internal/utils"
 )
 
 // HalfMessageStorage interface for half message storage operations
@@ -197,23 +198,32 @@ func (s *PebbleHalfMessageStorage) CleanupExpired(before time.Time) error {
 		return nil
 	}
 	
-	batch := s.db.NewBatch()
-	defer batch.Close()
+	// 使用新的清理工具函数，提供重试机制和更好的错误处理
+	config := &utils.CleanupConfig{
+		MaxRetries:      3,
+		InitialDelay:    100 * time.Millisecond,
+		MaxDelay:        2 * time.Second,
+		BackoffFactor:   2.0,
+		UseSync:         false, // 使用更宽松的提交选项
+		BatchSize:       1000,
+		LogErrors:       true,
+	}
+
+	cleanupManager := utils.NewCleanupManager(config)
 	
+	// 准备要删除的键
+	var allKeys [][]byte
 	for _, msg := range expiredMessages {
 		dataKey := HalfMessagePrefix + msg.TransactionID
-		if err := batch.Delete([]byte(dataKey), pebble.NoSync); err != nil {
-			continue
-		}
+		allKeys = append(allKeys, []byte(dataKey))
 		
 		expireKey := s.buildExpireIndexKey(msg.ExpireTime, msg.TransactionID)
-		if err := batch.Delete([]byte(expireKey), pebble.NoSync); err != nil {
-			continue
-		}
+		allKeys = append(allKeys, []byte(expireKey))
 	}
-	
-	if err := batch.Commit(pebble.Sync); err != nil {
-		return fmt.Errorf("failed to commit cleanup batch: %w", err)
+
+	err = cleanupManager.BatchCleanupWithRetry("transaction_cleanup", s.db, allKeys)
+	if err != nil {
+		return fmt.Errorf("failed to cleanup expired transactions: %w", err)
 	}
 	
 	return nil
