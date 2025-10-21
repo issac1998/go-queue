@@ -327,7 +327,7 @@ func (rm *RaftManager) WaitForLeadershipReady(groupID uint64, timeout time.Durat
 			rm.logger.Printf("find Raft group %d leader: %d", groupID, leaderID)
 			return nil
 		}
-		rm.logger.Printf("not found , retry")
+		rm.logger.Printf("not found, retry")
 		// Sleep to avoid busy waiting and reduce CPU usage
 		time.Sleep(checkInterval)
 	}

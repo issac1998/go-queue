@@ -566,6 +566,7 @@ func (pa *PartitionAssigner) BrokerIDToNodeID(brokerID string) (uint64, error) {
 // Reuse helper functions from the original assigner
 func (pa *PartitionAssigner) generateRaftGroupID(topicName string, partitionID int32) uint64 {
 	h := fnv.New64a()
+	// TODO: ensure no collisions across topics/partitions
 	h.Write([]byte(fmt.Sprintf("%s-%d", topicName, partitionID)))
 	return h.Sum64()
 }

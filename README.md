@@ -3,6 +3,7 @@
 请参考 USAGE_GUIDE.md
 
 整体架构如图
+![queue](queue1.drawio.png)
 客户端通过TCP连接Broker
 
 ## Producer事务

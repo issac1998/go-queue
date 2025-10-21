@@ -5,13 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
-	"log"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/issac1998/go-queue/internal/discovery"
 	"github.com/issac1998/go-queue/internal/errors"
+	"github.com/issac1998/go-queue/internal/logging"
 	"github.com/issac1998/go-queue/internal/protocol"
 	"github.com/issac1998/go-queue/internal/raft"
 )
@@ -19,6 +21,7 @@ import (
 // ControllerManager manages Controller-related functionality
 type ControllerManager struct {
 	broker *Broker
+	logger *logging.Logger
 
 	stateMachine *raft.ControllerStateMachine
 
@@ -42,6 +45,7 @@ type ControllerManager struct {
 // HealthChecker performs health checks on brokers
 type HealthChecker struct {
 	controller       *ControllerManager
+	logger           *logging.Logger
 	checkInterval    time.Duration
 	timeout          time.Duration
 	failureThreshold int
@@ -50,21 +54,25 @@ type HealthChecker struct {
 // LeaderScheduler handles leader migration and load balancing
 type LeaderScheduler struct {
 	controller *ControllerManager
+	logger     *logging.Logger
 }
 
 // LoadMonitor monitors cluster load and performance
 type LoadMonitor struct {
 	controller *ControllerManager
+	logger     *logging.Logger
 }
 
 // FailureDetector detects broker failures and triggers recovery
 type FailureDetector struct {
 	controller *ControllerManager
+	logger     *logging.Logger
 }
 
 // RebalanceScheduler handles periodic partition rebalancing
 type RebalanceScheduler struct {
 	controller *ControllerManager
+	logger     *logging.Logger
 	interval   time.Duration
 }
 
@@ -72,8 +80,29 @@ type RebalanceScheduler struct {
 func NewControllerManager(broker *Broker) (*ControllerManager, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// Create controller logger in a subdirectory of broker logger
+	// Since broker.logger is *log.Logger, we need to create our own logging config
+	controllerLogDir := filepath.Join(broker.Config.LogDir, "controller")
+	if err := os.MkdirAll(controllerLogDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create controller log directory: %v", err)
+	}
+
+	controllerLogFile := filepath.Join(controllerLogDir, "controller.log")
+	controllerLogConfig := logging.Config{
+		Level:         logging.LevelInfo,
+		Format:        logging.FormatText,
+		OutputFile:    controllerLogFile,
+		EnableConsole: false, // Only log to file, not console
+	}
+
+	controllerLogger, err := logging.New(controllerLogConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create controller logger: %v", err)
+	}
+
 	cm := &ControllerManager{
 		broker: broker,
+		logger: controllerLogger,
 		ctx:    ctx,
 		cancel: cancel,
 	}
@@ -82,6 +111,7 @@ func NewControllerManager(broker *Broker) (*ControllerManager, error) {
 
 	cm.healthChecker = &HealthChecker{
 		controller:       cm,
+		logger:           controllerLogger,
 		checkInterval:    5 * time.Second,
 		timeout:          10 * time.Second,
 		failureThreshold: 3,
@@ -89,18 +119,22 @@ func NewControllerManager(broker *Broker) (*ControllerManager, error) {
 
 	cm.leaderScheduler = &LeaderScheduler{
 		controller: cm,
+		logger:     controllerLogger,
 	}
 
 	cm.loadMonitor = &LoadMonitor{
 		controller: cm,
+		logger:     controllerLogger,
 	}
 
 	cm.failureDetector = &FailureDetector{
 		controller: cm,
+		logger:     controllerLogger,
 	}
 
 	cm.rebalanceScheduler = &RebalanceScheduler{
 		controller: cm,
+		logger:     controllerLogger,
 		interval:   5 * time.Minute,
 	}
 
@@ -112,13 +146,13 @@ func (cm *ControllerManager) Start() error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	log.Printf("Starting Controller Manager for broker %s", cm.broker.ID)
+	cm.logger.Info("Starting Controller Manager", "broker_id", cm.broker.ID)
 
 	if err := cm.initControllerRaftGroup(); err != nil {
 		return fmt.Errorf("failed to initialize controller raft group: %v", err)
 	}
 
-	log.Printf("Controller Manager started successfully")
+	cm.logger.Info("Controller Manager started successfully")
 	return nil
 }
 
@@ -127,18 +161,18 @@ func (cm *ControllerManager) Stop() error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	log.Printf("Stopping Controller Manager...")
+	cm.logger.Info("Stopping Controller Manager...")
 
 	cm.cancel()
 	cm.wg.Wait()
 
 	if cm.broker.raftManager != nil {
 		if err := cm.broker.raftManager.StopRaftGroup(raft.ControllerGroupID); err != nil {
-			log.Printf("Error stopping controller raft group: %v", err)
+			cm.logger.Error("Error stopping controller raft group", "error", err)
 		}
 	}
 
-	log.Printf("Controller Manager stopped")
+	cm.logger.Info("Controller Manager stopped")
 	return nil
 }
 
@@ -153,7 +187,7 @@ func (cm *ControllerManager) initControllerRaftGroup() error {
 		return fmt.Errorf("broker discovery failed: %v", err)
 	}
 
-	log.Printf("Discovered %d broker(s) for controller initialization", len(brokers))
+	cm.logger.Info("Discovered brokers for controller initialization", "count", len(brokers))
 
 	members := make(map[uint64]string)
 
@@ -169,7 +203,7 @@ func (cm *ControllerManager) initControllerRaftGroup() error {
 		members[currentNodeID] = cm.broker.Config.RaftConfig.RaftAddr
 	}
 
-	log.Printf("Initializing Controller Raft Group with members: %v", members)
+	cm.logger.Info("Initializing Controller Raft Group", "members", members)
 
 	// Determine cluster initialization strategy based on broker ID
 	// The broker with the smallest ID creates the full cluster
@@ -183,7 +217,7 @@ func (cm *ControllerManager) initControllerRaftGroup() error {
 		shouldJoin = true
 	}
 
-	log.Printf("Starting Controller Raft Group with members %v (join=%t)", raftMembers, shouldJoin)
+	cm.logger.Info("Starting Controller Raft Group", "members", raftMembers, "join", shouldJoin)
 
 	err = cm.broker.raftManager.StartRaftGroup(
 		raft.ControllerGroupID,
@@ -251,7 +285,7 @@ func (cm *ControllerManager) monitorLeadership() {
 
 // StartLeaderTasks starts tasks that only the leader should perform
 func (cm *ControllerManager) StartLeaderTasks() {
-	log.Printf("Starting leader tasks for broker %s", cm.broker.ID)
+	cm.logger.Info("Starting leader tasks", "broker_id", cm.broker.ID)
 
 	// Create a new context for leader tasks
 	cm.leaderCtx, cm.leaderCancel = context.WithCancel(cm.ctx)
@@ -263,12 +297,12 @@ func (cm *ControllerManager) StartLeaderTasks() {
 	go cm.healthChecker.startHealthCheck()
 	go cm.rebalanceScheduler.startRebalancing()
 
-	log.Printf("Leader tasks started for broker %s", cm.broker.ID)
+	cm.logger.Info("Leader tasks started", "broker_id", cm.broker.ID)
 }
 
 // StopLeaderTasks stops leader-specific tasks
 func (cm *ControllerManager) StopLeaderTasks() {
-	log.Printf("Stopping leader tasks for broker %s", cm.broker.ID)
+	cm.logger.Info("Stopping leader tasks", "broker_id", cm.broker.ID)
 
 	if cm.leaderCancel != nil {
 		cm.leaderCancel()
@@ -276,42 +310,42 @@ func (cm *ControllerManager) StopLeaderTasks() {
 
 	cm.leaderWg.Wait()
 
-	log.Printf("All leader tasks stopped for broker %s", cm.broker.ID)
+	cm.logger.Info("All leader tasks stopped", "broker_id", cm.broker.ID)
 }
 
 // startExistingPartitionGroups starts Raft groups for existing partitions during leader recovery
 func (cm *ControllerManager) startExistingPartitionGroups() {
-	log.Printf("Starting existing partition Raft groups for leader recovery")
+	cm.logger.Info("Starting existing partition Raft groups for leader recovery")
 
 	// Get all existing partition assignments from metadata
 	allAssignments, err := cm.getAllPartitionAssignments()
 	if err != nil {
-		log.Printf("Failed to get existing partition assignments: %v", err)
+		cm.logger.Error("Failed to get existing partition assignments", "error", err)
 		return
 	}
 
 	if len(allAssignments) == 0 {
-		log.Printf("No existing partitions found")
+		cm.logger.Info("No existing partitions found")
 		return
 	}
 
-	log.Printf("Found %d existing partition assignments to recover", len(allAssignments))
+	cm.logger.Info("Found existing partition assignments to recover", "count", len(allAssignments))
 
 	// Get partition assigner
 	partitionAssigner, err := cm.getPartitionAssigner()
 	if err != nil {
-		log.Printf("Failed to get partition assigner: %v", err)
+		cm.logger.Error("Failed to get partition assigner", "error", err)
 		return
 	}
 
 	// Start Raft groups for existing partitions
 	err = partitionAssigner.StartPartitionRaftGroups(allAssignments)
 	if err != nil {
-		log.Printf("Failed to start existing partition Raft groups: %v", err)
+		cm.logger.Error("Failed to start existing partition Raft groups", "error", err)
 		return
 	}
 
-	log.Printf("Successfully started %d existing partition Raft groups", len(allAssignments))
+	cm.logger.Info("Successfully started existing partition Raft groups", "count", len(allAssignments))
 }
 
 // getAllPartitionAssignments gets all partition assignments from the state machine
@@ -322,7 +356,7 @@ func (cm *ControllerManager) getAllPartitionAssignments() ([]*raft.PartitionAssi
 		return nil, fmt.Errorf("failed to query partition assignments: %w", err)
 	}
 
-	log.Printf("Query result type: %T, length: %d", result, len(result))
+	cm.logger.Debug("Query result", "type", fmt.Sprintf("%T", result), "length", len(result))
 
 	// The QueryMetadata returns []byte, so we need to unmarshal it
 	var assignmentsMap map[string]*raft.PartitionAssignment
@@ -330,7 +364,7 @@ func (cm *ControllerManager) getAllPartitionAssignments() ([]*raft.PartitionAssi
 		return nil, fmt.Errorf("failed to unmarshal partition assignments: %w", err)
 	}
 
-	log.Printf("Unmarshaled %d partition assignments", len(assignmentsMap))
+	cm.logger.Debug("Unmarshaled partition assignments", "count", len(assignmentsMap))
 
 	// Convert map to slice
 	var allAssignments []*raft.PartitionAssignment
@@ -338,7 +372,7 @@ func (cm *ControllerManager) getAllPartitionAssignments() ([]*raft.PartitionAssi
 		allAssignments = append(allAssignments, assignment)
 	}
 
-	log.Printf("Found %d partition assignments", len(allAssignments))
+	cm.logger.Info("Found partition assignments", "count", len(allAssignments))
 	return allAssignments, nil
 }
 
@@ -364,7 +398,7 @@ func (cm *ControllerManager) ExecuteRaftCommandWithRetry(cmd *raft.ControllerCom
 		}
 
 		lastErr = err
-		log.Printf("Raft command execution failed (attempt %d/%d): %v", attempt+1, maxRetries, err)
+		cm.logger.Warn("Raft command execution failed", "attempt", attempt+1, "max_retries", maxRetries, "error", err)
 
 		if attempt < maxRetries-1 {
 			time.Sleep(time.Millisecond * 100)
@@ -477,20 +511,19 @@ func (cm *ControllerManager) CreateTopic(topicName string, partitions int32, rep
 		}
 	}
 
-	log.Printf("Controller Leader creating topic %s with %d partitions (replication factor: %d)",
-		topicName, partitions, replicationFactor)
+	cm.logger.Info("Controller Leader creating topic", "topic", topicName, "partitions", partitions, "replication_factor", replicationFactor)
 
 	availableBrokers, err := cm.getAvailableBrokers()
 	if err != nil {
-		log.Printf("DEBUG: Failed to get available brokers: %v", err)
+		cm.logger.Error("Failed to get available brokers", "error", err)
 		return fmt.Errorf("failed to get available brokers: %w", err)
 	}
-	log.Printf("DEBUG: Found %d available brokers", len(availableBrokers))
+	cm.logger.Info("Found available brokers", "count", len(availableBrokers))
 	for i, broker := range availableBrokers {
-		log.Printf("DEBUG: Broker %d - ID: %s, Address: %s, Status: %s", i, broker.ID, broker.Address, broker.Status)
+		cm.logger.Debug("Available broker", "index", i, "id", broker.ID, "address", broker.Address, "status", broker.Status)
 	}
 	if len(availableBrokers) == 0 {
-		log.Printf("DEBUG: No available brokers for topic creation")
+		cm.logger.Error("No available brokers for topic creation")
 		return fmt.Errorf("no available brokers for topic creation")
 	}
 
@@ -504,19 +537,19 @@ func (cm *ControllerManager) CreateTopic(topicName string, partitions int32, rep
 		return fmt.Errorf("failed to allocate partitions: %w", err)
 	}
 
-	log.Printf("Allocated %d partitions for topic %s", len(assignments), topicName)
+	cm.logger.Info("Allocated partitions for topic", "count", len(assignments), "topic", topicName)
 
 	// Start Raft groups for the pre-allocated assignments
-	log.Printf("Starting Raft groups for topic %s", topicName)
+	cm.logger.Info("Starting Raft groups for topic", "topic", topicName)
 
 	err = partitionAssigner.StartPartitionRaftGroups(assignments)
 	if err != nil {
-		log.Printf("Failed to start Raft groups for topic %s, attempting cleanup: %v", topicName, err)
+		cm.logger.Error("Failed to start Raft groups for topic", "topic", topicName, "error", err)
 		return fmt.Errorf("failed to start partition Raft groups: %w", err)
 	}
 
-	log.Printf("update topic to statemachine %s", topicName)
-	log.Printf("send:%v", assignments)
+	cm.logger.Info("Updating topic to state machine", "topic", topicName)
+	cm.logger.Debug("Sending assignments", "assignments", assignments)
 
 	cmd := &raft.ControllerCommand{
 		Type:      protocol.RaftCmdCreateTopic,
@@ -535,7 +568,7 @@ func (cm *ControllerManager) CreateTopic(topicName string, partitions int32, rep
 		return fmt.Errorf("failed to update topic metadata: %w", err)
 	}
 
-	log.Printf("Topic %s created successfully with %d partitions", topicName, len(assignments))
+	cm.logger.Info("Topic created successfully", "topic", topicName, "partitions", len(assignments))
 	return nil
 }
 
@@ -548,7 +581,7 @@ func (cm *ControllerManager) DeleteTopic(topicName string) error {
 		}
 	}
 
-	log.Printf("Controller Leader deleting topic %s", topicName)
+	cm.logger.Info("Controller Leader deleting topic", "topic", topicName)
 
 	topicAssignments, err := cm.getTopicAssignments(topicName)
 	if err != nil {
@@ -564,13 +597,13 @@ func (cm *ControllerManager) DeleteTopic(topicName string) error {
 		return fmt.Errorf("failed to get partition assigner: %w", err)
 	}
 
-	log.Printf("Stopping %d Raft groups for topic %s", len(topicAssignments), topicName)
+	cm.logger.Info("Stopping Raft groups for topic", "count", len(topicAssignments), "topic", topicName)
 	err = partitionAssigner.StopPartitionRaftGroups(topicAssignments)
 	if err != nil {
-		log.Printf("Warning: failed to stop some Raft groups for topic %s: %v", topicName, err)
+		cm.logger.Warn("Failed to stop some Raft groups for topic", "topic", topicName, "error", err)
 	}
 
-	log.Printf("Stopped Raft groups for topic %s", topicName)
+	cm.logger.Info("Stopped Raft groups for topic", "topic", topicName)
 
 	cmd := &raft.ControllerCommand{
 		Type:      protocol.RaftCmdDeleteTopic,
@@ -588,7 +621,7 @@ func (cm *ControllerManager) DeleteTopic(topicName string) error {
 		return fmt.Errorf("failed to update topic metadata: %w", err)
 	}
 
-	log.Printf("Topic %s deleted successfully", topicName)
+	cm.logger.Info("Topic deleted successfully", "topic", topicName)
 	return nil
 }
 
@@ -752,9 +785,10 @@ func (cm *ControllerManager) executeDirectLeaderTransfer(assignment *raft.Partit
 		}
 	}
 
-	log.Printf("Successfully initiated leader transfer for partition %s (group %d) to broker %s",
-		fmt.Sprintf("%s-%d", assignment.TopicName, assignment.PartitionID),
-		assignment.RaftGroupID, newLeader)
+	cm.logger.Info("Successfully initiated leader transfer", 
+		"partition", fmt.Sprintf("%s-%d", assignment.TopicName, assignment.PartitionID),
+		"raft_group_id", assignment.RaftGroupID, 
+		"new_leader", newLeader)
 
 	return nil
 }
@@ -814,7 +848,7 @@ func (cm *ControllerManager) requestAddToCluster(leaderBrokerID string, members 
 	currentNodeID := cm.brokerIDToNodeID(cm.broker.ID)
 	currentRaftAddr := cm.broker.Config.RaftConfig.RaftAddr
 
-	log.Printf("Requesting leader %s to add node %d (%s) to cluster", leaderBrokerID, currentNodeID, currentRaftAddr)
+	cm.logger.Info("Requesting leader to add node to cluster", "leader", leaderBrokerID, "node_id", currentNodeID, "raft_addr", currentRaftAddr)
 
 	// Note: In a real implementation, we would need to communicate with the leader
 	// to request addition. For now, we'll assume the leader will discover and add us
@@ -833,7 +867,7 @@ func (hc *HealthChecker) startHealthCheck() {
 	for {
 		select {
 		case <-hc.controller.leaderCtx.Done():
-			log.Printf("Health checker stopped due to leadership change")
+			hc.logger.Info("Health checker stopped due to leadership change")
 			return
 		case <-ticker.C:
 			if hc.controller.isLeader() {
@@ -846,13 +880,13 @@ func (hc *HealthChecker) startHealthCheck() {
 func (hc *HealthChecker) performHealthCheck() {
 	result, err := hc.controller.QueryMetadata(protocol.RaftQueryGetBrokers, nil)
 	if err != nil {
-		log.Printf("Failed to get brokers for health check: %v", err)
+		hc.logger.Error("Failed to get brokers for health check", "error", err)
 		return
 	}
 
 	var brokers map[string]*raft.BrokerInfo
 	if err := json.Unmarshal(result, &brokers); err != nil {
-		log.Printf("Failed to unmarshal brokers: %v", err)
+		hc.logger.Error("Failed to unmarshal brokers", "error", err)
 		return
 	}
 
@@ -875,7 +909,7 @@ func (hc *HealthChecker) performHealthCheck() {
 
 		// Check if broker hasn't sent heartbeat in too long
 		if time.Since(broker.LastSeen) > graceTime {
-			log.Printf("Broker %s appears to be unhealthy, last seen: %v", brokerID, broker.LastSeen)
+			hc.logger.Warn("Broker appears to be unhealthy", "broker_id", brokerID, "last_seen", broker.LastSeen)
 			hc.handleBrokerFailure(brokerID)
 		}
 	}
@@ -892,7 +926,7 @@ func (hc *HealthChecker) handleBrokerFailure(brokerID string) {
 	}
 
 	if err := hc.controller.ExecuteCommand(cmd); err != nil {
-		log.Printf("Failed to mark broker %s as failed: %v", brokerID, err)
+		hc.logger.Error("Failed to mark broker as failed", "broker_id", brokerID, "error", err)
 	}
 }
 
@@ -900,14 +934,14 @@ func (hc *HealthChecker) checkForNewNodes(currentBrokers map[string]*raft.Broker
 	// Get all brokers from service discovery
 	discoveredBrokers, err := hc.controller.broker.discovery.DiscoverBrokers()
 	if err != nil {
-		log.Printf("Failed to get brokers from service discovery: %v", err)
+		hc.logger.Error("Failed to get brokers from service discovery", "error", err)
 		return
 	}
 
 	// Find brokers that are in service discovery but not in current Raft cluster
 	for _, discoveredBroker := range discoveredBrokers {
 		if _, exists := currentBrokers[discoveredBroker.ID]; !exists {
-			log.Printf("Found new broker %s, adding to Controller Raft cluster", discoveredBroker.ID)
+			hc.logger.Info("Found new broker, adding to Controller Raft cluster", "broker_id", discoveredBroker.ID)
 			hc.addNewNodeToCluster(discoveredBroker)
 		}
 	}
@@ -917,14 +951,27 @@ func (hc *HealthChecker) addNewNodeToCluster(broker *discovery.BrokerInfo) {
 	// Convert broker ID to node ID
 	nodeID := hc.controller.brokerIDToNodeID(broker.ID)
 
-	// Add node to Controller Raft group
-	_, err := hc.controller.broker.raftManager.RequestAddNode(1, nodeID, broker.RaftAddress, 0, 30*time.Second)
-	if err != nil {
-		log.Printf("Failed to add node %s to Controller Raft cluster: %v", broker.ID, err)
-		return
+	// Add node to Controller Raft group with retry logic
+	maxRetries := 5
+	retryDelay := 5 * time.Second
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		_, err := hc.controller.broker.raftManager.RequestAddNode(1, nodeID, broker.RaftAddress, 0, 30*time.Second)
+		if err == nil {
+			hc.logger.Info("Successfully added node to Controller Raft cluster", "broker_id", broker.ID, "attempts", attempt)
+			return
+		}
+
+		hc.logger.Warn("Failed to add node to Controller Raft cluster", "broker_id", broker.ID, "attempt", attempt, "max_retries", maxRetries, "error", err)
+
+		// If this is not the last attempt, wait before retrying
+		if attempt < maxRetries {
+			hc.logger.Info("Retrying to add node", "broker_id", broker.ID, "delay", retryDelay)
+			time.Sleep(retryDelay)
+		}
 	}
 
-	log.Printf("Successfully added node %s to Controller Raft cluster", broker.ID)
+	hc.logger.Error("Failed to add node to Controller Raft cluster after all attempts", "broker_id", broker.ID, "max_retries", maxRetries)
 }
 
 // getAvailableBrokers returns list of available brokers
@@ -962,9 +1009,9 @@ func (cm *ControllerManager) getAvailableBrokers() ([]*raft.BrokerInfo, error) {
 		return nil, fmt.Errorf("unexpected result type: %T", result)
 	}
 
-	fmt.Printf("DEBUG: brokersMap contains %d brokers\n", len(brokersMap))
+	cm.logger.Debug("BrokersMap contains brokers", "count", len(brokersMap))
 	for id, broker := range brokersMap {
-		fmt.Printf("DEBUG: Broker %s - Status: %s, Address: %s\n", id, broker.Status, broker.Address)
+		cm.logger.Debug("Broker info", "id", id, "status", broker.Status, "address", broker.Address)
 	}
 
 	var available []*raft.BrokerInfo
@@ -974,7 +1021,7 @@ func (cm *ControllerManager) getAvailableBrokers() ([]*raft.BrokerInfo, error) {
 		}
 	}
 
-	fmt.Printf("DEBUG: Found %d active brokers\n", len(available))
+	cm.logger.Debug("Found active brokers", "count", len(available))
 	return available, nil
 }
 
@@ -1053,7 +1100,7 @@ func (rs *RebalanceScheduler) startRebalancing() {
 	for {
 		select {
 		case <-rs.controller.leaderCtx.Done():
-			log.Printf("Rebalance scheduler stopped due to leadership change")
+			rs.logger.Info("Rebalance scheduler stopped due to leadership change")
 			return
 		case <-ticker.C:
 			if rs.controller.isLeader() {
@@ -1065,53 +1112,53 @@ func (rs *RebalanceScheduler) startRebalancing() {
 
 // performRebalance performs the actual rebalancing logic
 func (rs *RebalanceScheduler) performRebalance() {
-	log.Printf("Starting periodic partition rebalancing")
+	rs.logger.Info("Starting periodic partition rebalancing")
 
 	// Get available brokers
 	availableBrokers, err := rs.controller.getAvailableBrokers()
 	if err != nil {
-		log.Printf("Failed to get available brokers for rebalancing: %v", err)
+		rs.logger.Error("Failed to get available brokers for rebalancing", "error", err)
 		return
 	}
 
 	if len(availableBrokers) == 0 {
-		log.Printf("No available brokers for rebalancing")
+		rs.logger.Warn("No available brokers for rebalancing")
 		return
 	}
 
 	currentAssignments, err := rs.getCurrentPartitionAssignments()
 	if err != nil {
-		log.Printf("Failed to get current partition assignments: %v", err)
+		rs.logger.Error("Failed to get current partition assignments", "error", err)
 		return
 	}
 
 	if len(currentAssignments) == 0 {
-		log.Printf("No partition assignments to rebalance")
+		rs.logger.Info("No partition assignments to rebalance")
 		return
 	}
 
 	partitionAssigner, err := rs.controller.getPartitionAssigner()
 	if err != nil {
-		log.Printf("Failed to get partition assigner: %v", err)
+		rs.logger.Error("Failed to get partition assigner", "error", err)
 		return
 	}
 
 	newAssignments, err := partitionAssigner.RebalancePartitions(currentAssignments, availableBrokers)
 	if err != nil {
-		log.Printf("Failed to rebalance partitions: %v", err)
+		rs.logger.Error("Failed to rebalance partitions", "error", err)
 		return
 	}
 
 	changedAssignments := rs.countChangedAssignments(currentAssignments, newAssignments)
 	if changedAssignments == 0 {
-		log.Printf("No partition changes needed during rebalancing")
+		rs.logger.Info("No partition changes needed during rebalancing")
 		return
 	}
 
-	log.Printf("Rebalancing will change %d partition assignments", changedAssignments)
+	rs.logger.Info("Rebalancing will change partition assignments", "count", changedAssignments)
 
 	// TODO: Implement partition assignment update mechanism
-	log.Printf("Partition rebalancing completed successfully. %d assignments changed", changedAssignments)
+	rs.logger.Info("Partition rebalancing completed successfully", "changed_assignments", changedAssignments)
 }
 
 // getCurrentPartitionAssignments gets current partition assignments
@@ -1169,12 +1216,12 @@ func (cm *ControllerManager) CommitConsumerTransaction(transactionID, consumerID
 		"consumer_id":    consumerID,
 		"group_id":       groupID,
 	}
-	
+
 	// Add offset commits if provided
 	if offsetCommits != nil && len(offsetCommits) > 0 {
 		data["offset_commits"] = offsetCommits
 	}
-	
+
 	cmd := &raft.ControllerCommand{
 		Type:      protocol.RaftCmdCommitConsumerTransaction,
 		ID:        uuid.New().String(),
