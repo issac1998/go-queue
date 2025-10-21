@@ -1,12 +1,28 @@
-
-# 使用方式
-请参考 USAGE_GUIDE.md
-
 整体架构如图
 ![queue](queue1.drawio.png)
 客户端通过TCP连接Broker
 
-## Producer事务
+# TODO list
+1.controller分离架构，非每一台broker都要参与竞选
+2.完善测试
+3.use round robin to select broker
+4.证明客户端缓存Raft信息、topic信息正确性
+5.Raft groupID、TxnID有没有能保证唯一ID的方法，哈希冲突怎么办？
+6.是否每次commit都要提交offset，其他消息队列是怎么做的 
+# 使用方式
+请参考 USAGE_GUIDE.md
+
+# 实现
+## 网络
+使用TCP连接Broker，优化长连接，使用连接池
+Producer 支持Async  IO
+Consumer 支持 poll模式
+
+## delay message
+## dlq
+## 
+## exact-once
+### producer
 以下两种方法都能实现producer的exact-once
 1.依靠sequence number实现，由于每个producer都会有唯一的producerID以及原子改变的seq，因此只需要判断producerID+seq，就可以判断消息是否重复
 
@@ -16,7 +32,7 @@ a.首先生成事务ID，
 b.向broker发送half message，存储到broker的pebbleDB，同时写入时间索引供后续过期查询
 c.执行本地事务，根据事务完成情况决定提交/回滚 half message
 d.本地事务迟迟未返回，broker根据事务ID查询过期的half message，回查本地事务状态
-## Consumer事务
+### Consumer事务
 客户端需提供三种handler: 1.处理消息handler 2.回滚Handler 3.提交Handler
 若处理消息handler包含了超时回滚/提交操作，则回滚Handler/提交Handler可以省略
 

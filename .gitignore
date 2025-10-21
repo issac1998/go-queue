@@ -17,7 +17,7 @@ broker
 go-queue
 quick_start_create_topic
 simple_test
-
+design/
 data*/
 test-data/
 *.db
