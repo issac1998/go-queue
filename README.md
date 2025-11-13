@@ -3,24 +3,32 @@
 客户端通过TCP连接Broker
 
 # TODO list
+
 1.controller分离架构，非每一台broker都要参与竞选
-2.完善测试
-3.use round robin to select broker
-4.证明客户端缓存Raft信息、topic信息正确性
-5.Raft groupID、TxnID有没有能保证唯一ID的方法，哈希冲突怎么办？
-6.是否每次commit都要提交offset，其他消息队列是怎么做的 
+
+2.use round robin to select broker
+
+3.证明客户端缓存Raft信息、topic信息正确性
+
+4.Raft groupID、TxnID要不要改成Controller全局唯一，哈希冲突怎么办？
+
+5.是否每次commit都要提交offset
+
 # 使用方式
+
 请参考 USAGE_GUIDE.md
 
 # 实现
 ## 网络
 使用TCP连接Broker，优化长连接，使用连接池
-Producer 支持Async  IO
-Consumer 支持 poll模式
+Producer 支持 同步等待、Async IO模式
+Consumer 支持 poll\subscribe模式
 
 ## delay message
-## dlq
-## 
+通过时间轮调度器实现延迟消息的投递
+
+## order message
+单生产者模式下，通过MessageGroup路由到相同partition，顺序读取即可
 ## exact-once
 ### producer
 以下两种方法都能实现producer的exact-once
